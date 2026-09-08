@@ -182,3 +182,12 @@ def test_training_config_validation_errors() -> None:
 
     with pytest.raises(ConfigurationError, match="lr_scheduler_type"):
         TrainingConfig(lr_scheduler_type="exponential").validate()
+
+
+def test_configure_optimizer_honors_resolved_optimizer_override() -> None:
+    model = SimpleModel()
+    config = TrainingConfig(optimizer_type="8bit_adamw")
+
+    optimizer = configure_optimizer(model, config, optimizer_type="adamw")
+
+    assert isinstance(optimizer, torch.optim.AdamW)

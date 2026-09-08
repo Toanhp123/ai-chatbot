@@ -11,6 +11,7 @@ Hỗ trợ các lệnh:
 """
 
 import argparse
+import logging
 import os
 import sys
 
@@ -30,7 +31,8 @@ if sys.platform == "win32":
 from src.core.config import EngineConfig, GenerationConfig, ModelConfig
 from src.core.diagnostics import print_diagnostic_report
 from src.core.exceptions import AIEngineError
-from src.core.logging import setup_logger
+from src.core.logging import configure_logging_from_system, setup_logger
+from src.core.runtime import resolve_training_plan
 from src.data.batch_provider import get_batch_provider
 from src.data.cleaners import get_cleaner
 from src.data.pipeline import DataPipeline
@@ -49,10 +51,11 @@ from src.utils.device import resolve_device
 from src.utils.seed import set_seed
 from src.utils.tensor_inspector import print_model_summary
 
-logger = setup_logger()
+logger = logging.getLogger("ai-train")
 
 
 def cmd_check(args: argparse.Namespace) -> None:
+    setup_logger()
     print_diagnostic_report()
 
 
@@ -62,9 +65,11 @@ def cmd_estimate(args: argparse.Namespace) -> None:
     logger.info(f"Phân tích ngân sách VRAM cho cấu hình: {args.config}")
     overrides = getattr(args, "override", None)
     config = EngineConfig.from_yaml(args.config, overrides=overrides)
+    configure_logging_from_system(config.system, name="ai-train")
     scenarios = analyze_vram_scenarios(
         model_config=config.model,
         training_config=config.training,
+        system_config=config.system,
     )
     print_vram_scenarios_table(scenarios)
 
@@ -72,6 +77,7 @@ def cmd_estimate(args: argparse.Namespace) -> None:
 def cmd_inspect(args: argparse.Namespace) -> None:
     overrides = getattr(args, "override", None)
     config = EngineConfig.from_yaml(args.config, overrides=overrides)
+    configure_logging_from_system(config.system, name="ai-train")
     model = ModelRegistry.create(config.model.name, config.model)
     print_model_summary(model)
 
@@ -80,13 +86,17 @@ def cmd_train(args: argparse.Namespace) -> None:
     logger.info(f"Nạp cấu hình từ: {args.config}")
     overrides = getattr(args, "override", None)
     config = EngineConfig.from_yaml(args.config, overrides=overrides)
+    configure_logging_from_system(config.system, name="ai-train")
 
     # Pre-flight Memory Check
     from src.core.diagnostics import check_memory_feasibility
 
+    runtime_plan = resolve_training_plan(config)
+
     feasible, mem_msg, _ = check_memory_feasibility(
         model_config=config.model,
         training_config=config.training,
+        runtime_plan=runtime_plan,
     )
     if not feasible:
         logger.warning(f"⚠️ {mem_msg}")
@@ -95,9 +105,13 @@ def cmd_train(args: argparse.Namespace) -> None:
 
     # Tùy chọn kiểm tra nhanh (quick check)
     if args.quick_check:
-        config.training.max_iters = 50
-        config.training.eval_interval = 25
-        config.training.eval_iters = 10
+        config = config.copy(
+            training=config.training.copy(
+                max_iters=50,
+                eval_interval=25,
+                eval_iters=10,
+            )
+        )
         logger.info("⚡ Chế độ Quick Check: Huấn luyện nhanh 50 bước kiểm tra hệ thống.")
 
     set_seed(config.system.seed)
@@ -128,16 +142,15 @@ def cmd_train(args: argparse.Namespace) -> None:
     )
 
     # Cập nhật kích thước từ vựng thực tế vào model config
-    config.model.vocab_size = tokenizer.vocab_size
+    config = config.copy(model=config.model.copy(vocab_size=tokenizer.vocab_size))
 
     # 4. Khởi tạo mô hình qua ModelRegistry
     model = ModelRegistry.create(config.model.name, config.model)
     logger.info(f"Khởi tạo mô hình '{config.model.name}' với {model.get_num_params():,} tham số.")
 
     # 5. Thiết lập Callbacks (Dependency Injection: sample_fn được truyền vào từ Composition Root)
-    device_str = resolve_device(config.system.device)
     sample_generator: BaseGenerator = get_generator(
-        "local", model=model, tokenizer=tokenizer, device=device_str
+        "local", model=model, tokenizer=tokenizer, device=runtime_plan.device
     )
     sample_gen_config = GenerationConfig(
         max_new_tokens=50 if args.quick_check else 100,
@@ -176,6 +189,7 @@ def cmd_train(args: argparse.Namespace) -> None:
         config=config,
         callbacks=callbacks,
         tokenizer=tokenizer,
+        runtime_plan=runtime_plan,
     )
     trainer.train()
 
@@ -220,6 +234,7 @@ def load_generator_from_checkpoint(
 
 
 def cmd_generate(args: argparse.Namespace) -> None:
+    setup_logger()
     checkpoint_path = args.checkpoint
     vocab_path = args.vocab
     backend = getattr(args, "backend", "local")
@@ -267,12 +282,14 @@ def cmd_generate(args: argparse.Namespace) -> None:
 
 
 def cmd_gate(args: argparse.Namespace) -> None:
+    setup_logger()
     from scripts.check_all import main as run_quality_gates
 
     sys.exit(run_quality_gates())
 
 
 def cmd_ui(args: argparse.Namespace) -> None:
+    setup_logger()
     try:
         import uvicorn
     except ImportError:

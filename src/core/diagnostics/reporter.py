@@ -106,10 +106,15 @@ def print_diagnostic_report(report: Optional[DiagnosticReport] = None) -> None:
             f"{cpu.get('physical_cores')} nhân vật lý, {cpu.get('logical_cores')} luồng",
             f"Tải: {cpu.get('cpu_usage_percent', 'N/A')}%",
         )
+        mem_percent = mem.get("percent_used")
+        if isinstance(mem_percent, (int, float)):
+            mem_available = f"Trống: {mem.get('available_gb')} GB ({100 - mem_percent:.1f}% rảnh)"
+        else:
+            mem_available = "Trống: chưa xác định (probe thất bại)"
         t_hw.add_row(
             "RAM Hệ thống",
-            f"Tổng: {mem.get('total_gb')} GB",
-            f"Trống: {mem.get('available_gb')} GB ({100 - mem.get('percent_used', 0):.1f}% rảnh)",
+            f"Tổng: {mem.get('total_gb') if mem.get('total_gb') is not None else 'N/A'} GB",
+            mem_available,
         )
 
         if gpu.get("cuda_available"):
@@ -185,10 +190,18 @@ def print_diagnostic_report(report: Optional[DiagnosticReport] = None) -> None:
         t_io.add_column("Dung Lượng / Trạng Thái", style="green")
         t_io.add_column("Quyền Truy Cập (I/O)", style="yellow")
 
+        free_storage = storage.get("free_gb")
+        storage_assessment = (
+            "✅ Đủ an toàn"
+            if isinstance(free_storage, (int, float)) and free_storage >= 5
+            else "⚠️ Cần giải phóng"
+            if isinstance(free_storage, (int, float))
+            else "⚠️ Chưa xác định"
+        )
         t_io.add_row(
             "Ổ đĩa làm việc",
-            f"Trống: {storage.get('free_gb')} GB / Tổng: {storage.get('total_gb')} GB",
-            "✅ Đủ an toàn" if storage.get("free_gb", 0) >= 5 else "⚠️ Cần giải phóng",
+            f"Trống: {free_storage if free_storage is not None else 'N/A'} GB / Tổng: {storage.get('total_gb') if storage.get('total_gb') is not None else 'N/A'} GB",
+            storage_assessment,
         )
 
         for d_name, d_status in perms.items():

@@ -1,3 +1,11 @@
+export type ProbeStatus = "OK" | "UNSUPPORTED" | "FAILED";
+
+export interface ProbeMetadata {
+	status: ProbeStatus;
+	value?: unknown;
+	error?: string | null;
+}
+
 export interface GpuDevice {
 	id: number;
 	name: string;
@@ -12,6 +20,7 @@ export interface AttentionBackends {
 	flash_attention: boolean;
 	memory_efficient: boolean;
 	math_attention: boolean;
+	probe?: ProbeMetadata;
 }
 
 export interface HardwareRecommendations {
@@ -24,6 +33,7 @@ export interface HardwareRecommendations {
 }
 
 export interface GpuInfo {
+	probe?: ProbeMetadata;
 	cuda_available: boolean;
 	device_count: number;
 	devices: GpuDevice[];
@@ -35,16 +45,18 @@ export interface GpuInfo {
 
 export interface DiskInfo {
 	path: string;
-	total_gb: number;
-	used_gb: number;
-	free_gb: number;
-	percent_used: number;
+	total_gb: number | null;
+	used_gb: number | null;
+	free_gb: number | null;
+	percent_used: number | null;
+	probe: ProbeMetadata;
 }
 
 export interface DirectoryPermission {
 	exists: boolean;
 	readable: boolean;
 	writable: boolean;
+	probe?: ProbeMetadata;
 }
 
 export interface HardwareAdvisorData {
@@ -71,8 +83,13 @@ export interface VramScenarioItem {
 	name: string;
 	description: string;
 	precision: string;
+	effective_precision: string;
 	optimizer: string;
+	effective_optimizer: string;
+	effective_device: string;
+	fallback_reasons: string[];
 	gradient_checkpointing: boolean;
+	batch_size: number;
 	estimated_mb: number;
 	estimated_gb: number;
 	feasible: boolean;
@@ -88,12 +105,17 @@ export interface VramScenariosResponse {
 }
 
 export interface VRAMEstimateRequest {
+	model_name?: string;
 	batch_size?: number;
 	block_size?: number;
 	n_embd?: number;
 	n_layer?: number;
 	n_head?: number;
 	vocab_size?: number;
+	intermediate_size?: number | null;
+	multiple_of?: number;
+	tie_word_embeddings?: boolean;
+	bias?: boolean;
 	precision?: string;
 	optimizer_type?: string;
 	gradient_checkpointing?: boolean;
@@ -101,6 +123,15 @@ export interface VRAMEstimateRequest {
 }
 
 export interface VramEstimateBudget {
+	requested_device?: string;
+	device?: string;
+	requested_precision?: string;
+	precision?: string;
+	requested_optimizer_type?: string;
+	optimizer_type?: string;
+	fallback_reasons?: string[];
+	micro_batch_size?: number;
+	effective_batch_size?: number;
 	peak_vram_mb: number;
 	peak_vram_gb: number;
 	model_weights_mb: number;

@@ -23,6 +23,7 @@ from src.core.diagnostics.hardware import (
     get_memory_info,
     probe_cuda_device,
 )
+from src.core.diagnostics.probe import ProbeResult, ProbeStatus
 from src.core.diagnostics.reporter import (
     export_diagnostic_json,
     print_diagnostic_report,
@@ -64,4 +65,6 @@ __all__ = [
     "print_diagnostic_report",
     "print_vram_scenarios_table",
     "export_diagnostic_json",
+    "ProbeStatus",
+    "ProbeResult",
 ]

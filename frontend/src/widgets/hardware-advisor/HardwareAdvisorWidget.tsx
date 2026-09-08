@@ -281,13 +281,13 @@ export const HardwareAdvisorWidget: React.FC = () => {
 								</span>
 							</div>
 							<div className="mt-2 space-y-2">
-								{data?.disk?.percent_used !== undefined && (
+								{typeof data?.disk?.percent_used === "number" && (
 									<ProgressBar
 										value={data.disk.percent_used}
 										label="Mức dùng đĩa"
 										valueText={
-											data.disk.total_gb &&
-											data.disk.free_gb
+											typeof data.disk.total_gb === "number" &&
+											typeof data.disk.free_gb === "number"
 												? `${(data.disk.total_gb - data.disk.free_gb).toFixed(1)} / ${data.disk.total_gb} GB (${data.disk.percent_used}%)`
 												: `${data.disk.percent_used}%`
 										}

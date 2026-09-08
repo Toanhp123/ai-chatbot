@@ -8,7 +8,7 @@ from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
-from src.core.exceptions import ConfigurationError
+from src.core.exceptions import AIEngineError
 
 router = APIRouter(prefix="/api/training", tags=["Training"])
 
@@ -103,6 +103,7 @@ async def check_feasibility_endpoint(req: CheckFeasibilityRequest):
     """Kiểm tra tính khả thi của bộ nhớ VRAM trước khi huấn luyện để chủ động phòng tránh lỗi OOM."""
     from src.core.config import EngineConfig
     from src.core.diagnostics.estimator import check_memory_feasibility
+    from src.core.runtime import resolve_training_plan
 
     overrides = []
     if req.batch_size is not None:
@@ -126,14 +127,13 @@ async def check_feasibility_endpoint(req: CheckFeasibilityRequest):
     if req.block_size is not None:
         overrides.append(f"model.block_size={req.block_size}")
 
-    try:
-        config = EngineConfig.from_yaml(req.config_path, overrides=overrides if overrides else None)
-        feasible, msg, budget = check_memory_feasibility(
-            model_config=config.model,
-            training_config=config.training,
-        )
-    except ConfigurationError as e:
-        raise HTTPException(status_code=400, detail=str(e)) from e
+    config = EngineConfig.from_yaml(req.config_path, overrides=overrides if overrides else None)
+    runtime_plan = resolve_training_plan(config)
+    feasible, msg, budget = check_memory_feasibility(
+        model_config=config.model,
+        training_config=config.training,
+        runtime_plan=runtime_plan,
+    )
 
     return {
         "feasible": feasible,
@@ -225,17 +225,15 @@ async def start_training_endpoint(req: StartTrainingRequest, request: Request):
     # Pre-flight Memory Feasibility Check
     from src.core.config import EngineConfig
     from src.core.diagnostics.estimator import check_memory_feasibility
+    from src.core.runtime import resolve_training_plan
 
-    try:
-        chk_config = EngineConfig.from_yaml(
-            req.config_path, overrides=overrides if overrides else None
-        )
-        feasible, mem_msg, budget = check_memory_feasibility(
-            model_config=chk_config.model,
-            training_config=chk_config.training,
-        )
-    except ConfigurationError as e:
-        raise HTTPException(status_code=400, detail=str(e)) from e
+    chk_config = EngineConfig.from_yaml(req.config_path, overrides=overrides if overrides else None)
+    runtime_plan = resolve_training_plan(chk_config)
+    feasible, mem_msg, budget = check_memory_feasibility(
+        model_config=chk_config.model,
+        training_config=chk_config.training,
+        runtime_plan=runtime_plan,
+    )
 
     try:
         training_service.start_training(
@@ -243,6 +241,7 @@ async def start_training_endpoint(req: StartTrainingRequest, request: Request):
             overrides=overrides if overrides else None,
             quick_check=req.quick_check,
             resume_checkpoint=req.resume_checkpoint,
+            runtime_plan=runtime_plan,
         )
         request.app.state.inference_service.set_checkpoint_dir(chk_config.training.checkpoint_dir)
         request.app.state.inference_service.set_vocab_path(chk_config.data.vocab_file)
@@ -256,6 +255,8 @@ async def start_training_endpoint(req: StartTrainingRequest, request: Request):
             },
             "state": training_service.get_state(),
         }
+    except AIEngineError:
+        raise
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 

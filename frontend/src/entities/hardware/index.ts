@@ -1,5 +1,7 @@
 export { hardwareApi } from "./api/hardwareApi";
 export type {
+	ProbeStatus,
+	ProbeMetadata,
 	GpuDevice,
 	AttentionBackends,
 	HardwareRecommendations,

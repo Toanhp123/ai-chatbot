@@ -9,7 +9,7 @@ import difflib
 import os
 import re
 from dataclasses import dataclass, field
-from typing import Any, Dict, Optional, Sequence
+from typing import Any, Dict, Optional, Sequence, Type, TypeVar
 
 import yaml
 
@@ -20,6 +20,40 @@ from src.core.config.model import ModelConfig
 from src.core.config.system import SystemConfig
 from src.core.config.training import TrainingConfig
 from src.core.exceptions import ConfigurationError
+
+ConfigT = TypeVar("ConfigT", bound=BaseConfig)
+
+
+def _parse_domain_config(
+    domain: str,
+    config_type: Type[ConfigT],
+    raw_value: Any,
+) -> ConfigT:
+    """Build one config domain and normalize malformed input to ConfigurationError."""
+    if raw_value is None:
+        raw_value = {}
+    if not isinstance(raw_value, dict):
+        raise ConfigurationError(
+            f"Domain '{domain}' phải là dictionary/mapping, nhận được {type(raw_value).__name__}.",
+            {"domain": domain, "actual_type": type(raw_value).__name__},
+        )
+    try:
+        return config_type.from_kwargs_safe(raw_value)
+    except ConfigurationError:
+        raise
+    except (AttributeError, TypeError, ValueError) as exc:
+        field_name = "unknown"
+        if len(raw_value) == 1:
+            field_name = next(iter(raw_value))
+        raise ConfigurationError(
+            f"Giá trị cấu hình '{domain}.{field_name}' không hợp lệ: {exc}",
+            {
+                "domain": domain,
+                "field": field_name,
+                "value": raw_value.get(field_name),
+                "cause": type(exc).__name__,
+            },
+        ) from exc
 
 
 def interpolate_env_vars(text: str) -> str:
@@ -103,7 +137,11 @@ class EngineConfig(BaseConfig):
         self.generation.validate()
 
     @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> "EngineConfig":
+    def from_dict(cls, data: Any) -> "EngineConfig":
+        if not isinstance(data, dict):
+            raise ConfigurationError(
+                f"EngineConfig phải được tạo từ dictionary/mapping, nhận được {type(data).__name__}."
+            )
         valid_domains = {"system", "data", "model", "training", "generation"}
         unknown_domains = [k for k in data if k not in valid_domains]
         if unknown_domains:
@@ -122,19 +160,31 @@ class EngineConfig(BaseConfig):
                 {"unknown_domains": unknown_domains},
             )
 
-        system_data = dict(data.get("system", {}) or {})
-        training_data = dict(data.get("training", {}) or {})
+        raw_system = data.get("system", {})
+        raw_training = data.get("training", {})
+        if raw_system is not None and not isinstance(raw_system, dict):
+            raise ConfigurationError(
+                f"Domain 'system' phải là dictionary/mapping, nhận được {type(raw_system).__name__}.",
+                {"domain": "system", "actual_type": type(raw_system).__name__},
+            )
+        if raw_training is not None and not isinstance(raw_training, dict):
+            raise ConfigurationError(
+                f"Domain 'training' phải là dictionary/mapping, nhận được {type(raw_training).__name__}.",
+                {"domain": "training", "actual_type": type(raw_training).__name__},
+            )
+        system_data = dict(raw_system or {})
+        training_data = dict(raw_training or {})
         legacy_mixed_precision = system_data.pop("mixed_precision", None)
         if legacy_mixed_precision is not None and not isinstance(legacy_mixed_precision, bool):
             raise ConfigurationError("system.mixed_precision legacy phải là boolean.")
         if legacy_mixed_precision is True and "precision" not in training_data:
             training_data["precision"] = "amp_fp16"
 
-        system_cfg = SystemConfig.from_kwargs_safe(system_data)
-        data_cfg = DataConfig.from_kwargs_safe(data.get("data", {}) or {})
-        model_cfg = ModelConfig.from_kwargs_safe(data.get("model", {}) or {})
-        train_cfg = TrainingConfig.from_kwargs_safe(training_data)
-        gen_cfg = GenerationConfig.from_kwargs_safe(data.get("generation", {}) or {})
+        system_cfg = _parse_domain_config("system", SystemConfig, system_data)
+        data_cfg = _parse_domain_config("data", DataConfig, data.get("data", {}))
+        model_cfg = _parse_domain_config("model", ModelConfig, data.get("model", {}))
+        train_cfg = _parse_domain_config("training", TrainingConfig, training_data)
+        gen_cfg = _parse_domain_config("generation", GenerationConfig, data.get("generation", {}))
 
         cfg = cls(
             system=system_cfg,

@@ -143,3 +143,12 @@ def test_diagnostics_exceptions():
     assert vram_err.severity == ErrorSeverity.WARNING
     assert "12.50 GB" in str(vram_err)
     assert "8.00 GB" in str(vram_err)
+
+
+def test_unknown_generator_has_stable_typed_error_code():
+    from src.core.exceptions import GeneratorBackendNotFoundError
+
+    error = GeneratorBackendNotFoundError("missing", ["local"])
+
+    assert str(error.error_code) == "ERR_GEN_BACKEND_NOT_FOUND"
+    assert error.details == {"requested": "missing", "available": ["local"]}

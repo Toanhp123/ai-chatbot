@@ -51,6 +51,9 @@ class ModelRegistry:
     @classmethod
     def create(cls, name: str, config: ModelConfig) -> BaseModel:
         """Tạo instance của mô hình dựa theo tên và cấu hình."""
+        # ModelConfig stays mutable for backward compatibility, so construction is
+        # the last trusted boundary that must re-check its invariants.
+        config.validate()
         name_lower = name.lower().strip()
         if name_lower not in cls._registry:
             cls._ensure_builtins()

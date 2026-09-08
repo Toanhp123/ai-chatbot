@@ -5,7 +5,7 @@ import torch
 import torch.nn as nn
 
 from src.core.config import ModelConfig
-from src.core.exceptions import ContextLengthExceededError, ModelNotFoundError
+from src.core.exceptions import ConfigurationError, ContextLengthExceededError, ModelNotFoundError
 from src.models.architectures.llama import LlamaNano
 from src.models.architectures.minigpt import MiniGPT
 from src.models.base import BaseModel
@@ -88,6 +88,23 @@ def test_model_registry_auto_discovery_and_error():
     with pytest.raises(ModelNotFoundError) as exc_info:
         ModelRegistry.create("non_existent_arch_xyz", ModelConfig())
     assert "non_existent_arch_xyz" in str(exc_info.value)
+
+
+def test_model_registry_revalidates_config_at_construction_boundary() -> None:
+    cfg = ModelConfig(
+        name="minigpt",
+        vocab_size=32,
+        block_size=16,
+        n_embd=32,
+        n_head=2,
+        n_layer=1,
+    )
+    # Dataclasses remain mutable for backward compatibility, so the construction
+    # boundary must not trust that a previously-valid object is still valid.
+    cfg.n_head = 3
+
+    with pytest.raises(ConfigurationError, match="chia hết"):
+        ModelRegistry.create("minigpt", cfg)
 
 
 def test_llama_nano_architecture_and_forward():

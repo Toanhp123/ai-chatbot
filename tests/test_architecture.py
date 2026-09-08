@@ -109,3 +109,104 @@ def test_architecture_guardian_does_not_claim_more_than_it_checks() -> None:
 
     source = Path("scripts/check_architecture.py").read_text(encoding="utf-8")
     assert "CLEAN ARCHITECTURE 100% OK" not in source
+
+
+def test_importing_core_config_is_side_effect_free(tmp_path) -> None:
+    import json
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    project_root = Path.cwd()
+    script = (
+        "import json, os, sys; "
+        "from src.core.config import ModelConfig; "
+        "print(json.dumps({"
+        "'torch_loaded': 'torch' in sys.modules, "
+        "'rich_loaded': any(name == 'rich' or name.startswith('rich.') for name in sys.modules), "
+        "'log_created': os.path.exists('logs/train.log')"
+        "}))"
+    )
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(project_root)
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=tmp_path,
+        env=env,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    payload = json.loads(result.stdout.strip())
+
+    assert payload == {
+        "torch_loaded": False,
+        "rich_loaded": False,
+        "log_created": False,
+    }
+
+
+def test_training_composition_roots_do_not_mutate_nested_config_in_place() -> None:
+    import ast
+    from pathlib import Path
+
+    paths = [
+        Path("main.py"),
+        Path("src/ui/services/training_service.py"),
+        Path("src/ui/routes/diagnostics.py"),
+    ]
+    domains = {"system", "data", "model", "training", "generation"}
+    violations = []
+
+    def attribute_chain(node: ast.AST) -> list[str]:
+        parts: list[str] = []
+        current = node
+        while isinstance(current, ast.Attribute):
+            parts.append(current.attr)
+            current = current.value
+        if isinstance(current, ast.Name):
+            parts.append(current.id)
+        return list(reversed(parts))
+
+    for path in paths:
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for node in ast.walk(tree):
+            targets = []
+            if isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+                if isinstance(node, ast.Assign):
+                    targets = node.targets
+                else:
+                    targets = [node.target]
+            for target in targets:
+                chain = attribute_chain(target)
+                if len(chain) >= 3 and chain[0] == "config" and chain[1] in domains:
+                    violations.append(f"{path}:{getattr(node, 'lineno', 0)} -> {'.'.join(chain)}")
+
+    assert violations == []
+
+
+def test_training_composition_roots_use_runtime_plan_for_training_device() -> None:
+    from pathlib import Path
+
+    main_source = Path("main.py").read_text(encoding="utf-8")
+    service_source = Path("src/ui/services/training_service.py").read_text(encoding="utf-8")
+
+    assert "resolve_device(config.system.device)" not in main_source
+    assert "resolve_device(config.system.device)" not in service_source
+
+
+def test_frontend_vram_budget_type_uses_backend_runtime_field_names() -> None:
+    from pathlib import Path
+
+    source = Path("frontend/src/entities/hardware/model/types.ts").read_text(encoding="utf-8")
+
+    assert "device?: string;" in source
+    assert "precision?: string;" in source
+    assert "optimizer_type?: string;" in source
+    assert "effective_device?: string;" not in source
+    assert "effective_precision?: string;" not in source
+    assert "effective_optimizer_type?: string;" not in source
+    assert "effective_device: string;" in source
+    assert "effective_precision: string;" in source
+    assert "effective_optimizer: string;" in source
+    assert "fallback_reasons: string[];" in source

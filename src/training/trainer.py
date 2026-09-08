@@ -22,13 +22,13 @@ from torch.amp import GradScaler, autocast  # pyright: ignore[reportPrivateImpor
 from src.core.config import EngineConfig
 from src.core.exceptions import CheckpointNotFoundError
 from src.core.logging import get_logger
+from src.core.runtime import ResolvedTrainingPlan, resolve_training_plan, validate_training_plan
 from src.data.batch_provider import BaseBatchProvider, TensorBatchProvider
 from src.data.tokenizers import load_tokenizer_state
 from src.data.tokenizers.base import BaseTokenizer, get_tokenizer_identity
 from src.models.base import BaseModel
 from src.training.callbacks import BaseCallback
 from src.training.optimizers import compute_scheduled_lr, configure_optimizer
-from src.utils.device import resolve_device
 from src.utils.seed import capture_rng_state, restore_rng_state
 from src.utils.tensor_inspector import assert_valid_tensor, check_model_gradients
 
@@ -62,10 +62,12 @@ class Trainer:
         optimizer: Optional[torch.optim.Optimizer] = None,
         device: Optional[str] = None,
         tokenizer: Optional[BaseTokenizer] = None,
+        runtime_plan: Optional[ResolvedTrainingPlan] = None,
         **kwargs: Any,
     ) -> None:
         if config is None:
             raise ValueError("Cần cung cấp config (EngineConfig) cho Trainer.")
+        config.validate()
         self.config = config
         self.model = model
         self.callbacks = callbacks or []
@@ -79,22 +81,28 @@ class Trainer:
         else:
             raise ValueError("Cần cung cấp batch_provider hoặc cặp (train_data, val_data).")
 
-        # Xác định thiết bị
-        self.device = resolve_device(device if device is not None else config.system.device)
-
-        self.device_type = (
-            "cuda" if "cuda" in self.device else ("mps" if "mps" in self.device else "cpu")
-        )
-        self.precision = config.training.precision.lower().strip()
+        # Resolve one effective runtime contract shared with diagnostics/preflight.
+        if runtime_plan is not None and device is not None:
+            raise ValueError(
+                "Không thể truyền đồng thời runtime_plan và device override cho Trainer."
+            )
+        if runtime_plan is not None:
+            validate_training_plan(config, runtime_plan)
+            self.runtime_plan = runtime_plan
+        else:
+            self.runtime_plan = resolve_training_plan(config, device_override=device)
+        self.device = self.runtime_plan.device
+        self.device_type = self.runtime_plan.device_type
+        self.precision = self.runtime_plan.precision
 
         # Cấu hình Automatic Mixed Precision (AMP)
         if self.precision in ("amp_fp16", "float16"):
             self.amp_dtype = torch.float16
-            self.use_amp = self.device_type == "cuda"
+            self.use_amp = self.runtime_plan.use_amp
             self.scaler = GradScaler(self.device_type, enabled=self.use_amp)
         elif self.precision in ("amp_bf16", "bfloat16"):
             self.amp_dtype = torch.bfloat16
-            self.use_amp = (self.device_type == "cuda") and torch.cuda.is_bf16_supported()
+            self.use_amp = self.runtime_plan.use_amp
             self.scaler = GradScaler(self.device_type, enabled=False)
         else:
             self.amp_dtype = torch.float32
@@ -116,7 +124,11 @@ class Trainer:
         if optimizer is not None:
             self.optimizer = optimizer
         else:
-            self.optimizer = configure_optimizer(self.model, config.training)
+            self.optimizer = configure_optimizer(
+                self.model,
+                config.training,
+                optimizer_type=self.runtime_plan.optimizer_type,
+            )
 
         self.current_lr = config.training.learning_rate
         self.should_stop = False

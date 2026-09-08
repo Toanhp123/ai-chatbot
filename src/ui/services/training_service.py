@@ -12,7 +12,8 @@ from typing import Any, Dict, Iterator, List, Optional
 import torch
 
 from src.core.config import EngineConfig, GenerationConfig
-from src.core.logging import get_logger
+from src.core.logging import configure_logging_from_system, get_logger
+from src.core.runtime import ResolvedTrainingPlan, resolve_training_plan, validate_training_plan
 from src.data.batch_provider import get_batch_provider
 from src.data.cleaners import get_cleaner
 from src.data.pipeline import DataPipeline
@@ -26,7 +27,6 @@ from src.training.callbacks import (
     TrainerProtocol,
 )
 from src.training.trainer import Trainer, TrainOutput
-from src.utils.device import resolve_device
 from src.utils.seed import set_seed
 
 logger = get_logger("TrainingService")
@@ -166,9 +166,23 @@ class TrainingService:
         }
 
     def clear_state(self) -> None:
-        """Làm mới toàn bộ trạng thái số liệu huấn luyện về IDLE ban đầu."""
+        """Làm mới trạng thái sau khi worker cũ đã hoàn tất cleanup."""
+        cleanup_thread: Optional[threading.Thread] = None
         with self._lock:
             if self.status in ("RUNNING", "STARTING"):
+                raise RuntimeError("Không thể làm mới khi tiến trình huấn luyện đang chạy.")
+            if self._thread and self._thread.is_alive():
+                cleanup_thread = self._thread
+
+        if cleanup_thread is threading.current_thread():
+            raise RuntimeError("Không thể clear trạng thái từ chính worker huấn luyện đang chạy.")
+        if cleanup_thread is not None:
+            cleanup_thread.join(timeout=3.5)
+            if cleanup_thread.is_alive():
+                raise RuntimeError("Worker huấn luyện cũ chưa hoàn tất dọn dẹp; vui lòng thử lại.")
+
+        with self._lock:
+            if self.status in ("RUNNING", "STARTING", "STOPPING"):
                 raise RuntimeError("Không thể làm mới khi tiến trình huấn luyện đang chạy.")
             self.status = "IDLE"
             self.current_step = 0
@@ -234,6 +248,7 @@ class TrainingService:
         overrides: Optional[List[str]] = None,
         quick_check: bool = False,
         resume_checkpoint: Optional[str] = None,
+        runtime_plan: Optional[ResolvedTrainingPlan] = None,
     ) -> None:
         """Khởi chạy huấn luyện trên luồng riêng biệt (Background Thread) với khóa chống spam và đảm bảo độc quyền luồng."""
         # 1. Kiểm tra trạng thái sơ bộ và đợi luồng cũ ngoài lock (nếu luồng cũ đang kết thúc)
@@ -294,10 +309,17 @@ class TrainingService:
             def train_worker() -> None:
                 try:
                     config = EngineConfig.from_yaml(config_path, overrides=overrides)
+                    configure_logging_from_system(
+                        config.system, name="TrainingService", force_reconfigure=True
+                    )
                     if quick_check:
-                        config.training.max_iters = 50
-                        config.training.eval_interval = 25
-                        config.training.eval_iters = 10
+                        config = config.copy(
+                            training=config.training.copy(
+                                max_iters=50,
+                                eval_interval=25,
+                                eval_iters=10,
+                            )
+                        )
 
                     self.max_iters = config.training.max_iters
                     set_seed(config.system.seed)
@@ -339,7 +361,7 @@ class TrainingService:
                         pin_memory=config.data.pin_memory,
                     )
 
-                    config.model.vocab_size = tokenizer.vocab_size
+                    config = config.copy(model=config.model.copy(vocab_size=tokenizer.vocab_size))
 
                     if self._abort_requested.is_set():
                         self._finish_abort()
@@ -347,11 +369,18 @@ class TrainingService:
 
                     # 4. Model
                     model = ModelRegistry.create(config.model.name, config.model)
+                    effective_runtime_plan = runtime_plan
+                    if effective_runtime_plan is None:
+                        effective_runtime_plan = resolve_training_plan(config)
+                    else:
+                        validate_training_plan(config, effective_runtime_plan)
 
                     # 5. Callbacks
-                    device_str = resolve_device(config.system.device)
                     sample_gen: BaseGenerator = get_generator(
-                        "local", model=model, tokenizer=tokenizer, device=device_str
+                        "local",
+                        model=model,
+                        tokenizer=tokenizer,
+                        device=effective_runtime_plan.device,
                     )
                     sample_cfg = GenerationConfig(
                         max_new_tokens=60,
@@ -411,6 +440,7 @@ class TrainingService:
                                 config=config,
                                 callbacks=callbacks,
                                 tokenizer=tokenizer,
+                                runtime_plan=effective_runtime_plan,
                             )
                             self.trainer = trainer
                             self.status = "RUNNING"

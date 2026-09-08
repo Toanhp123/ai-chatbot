@@ -1,6 +1,7 @@
 import json
 
 from src.core.config.model import ModelConfig
+from src.core.config.system import SystemConfig
 from src.core.config.training import TrainingConfig
 from src.core.diagnostics import (
     DiagnosticReport,
@@ -223,3 +224,203 @@ def test_multi_scenario_vram_analysis():
 
     # Test in bảng kịch bản không phát sinh ngoại lệ
     print_vram_scenarios_table(res)
+
+
+def test_vram_scenarios_respect_explicit_cpu_runtime() -> None:
+    model_cfg = ModelConfig(vocab_size=500, block_size=128, n_layer=2, n_head=4, n_embd=128)
+    train_cfg = TrainingConfig(batch_size=16)
+
+    res = analyze_vram_scenarios(
+        model_config=model_cfg,
+        training_config=train_cfg,
+        system_config=SystemConfig(device="cpu"),
+        available_vram_gb=0.01,
+    )
+
+    assert all(item["effective_device"] == "cpu" for item in res["scenarios"])
+    assert all(item["feasible"] is True for item in res["scenarios"])
+
+
+def test_architecture_aware_parameter_estimator_matches_minigpt_model() -> None:
+    from src.core.diagnostics.estimator import calculate_model_params
+    from src.models.registry import ModelRegistry
+
+    config = ModelConfig(
+        name="minigpt",
+        vocab_size=257,
+        block_size=96,
+        n_embd=96,
+        n_head=6,
+        n_layer=3,
+        bias=True,
+        tie_word_embeddings=False,
+    )
+    config.validate()
+    model = ModelRegistry.create(config.name, config)
+
+    assert calculate_model_params(config) == sum(p.numel() for p in model.parameters())
+
+
+def test_architecture_aware_parameter_estimator_matches_llama_custom_mlp() -> None:
+    from src.core.diagnostics.estimator import calculate_model_params
+    from src.models.registry import ModelRegistry
+
+    config = ModelConfig(
+        name="llama",
+        vocab_size=257,
+        block_size=96,
+        n_embd=96,
+        n_head=6,
+        n_layer=3,
+        bias=True,
+        tie_word_embeddings=False,
+        model_kwargs={"intermediate_size": 1024, "multiple_of": 64},
+    )
+    config.validate()
+    model = ModelRegistry.create(config.name, config)
+
+    assert calculate_model_params(config) == sum(p.numel() for p in model.parameters())
+
+
+def test_vram_estimator_uses_runtime_micro_batch_semantics() -> None:
+    model_cfg = ModelConfig(n_embd=96, n_head=6, n_layer=2, block_size=64)
+    train_cfg = TrainingConfig(batch_size=16, gradient_accumulation_steps=4)
+
+    budget = estimate_vram_budget(model_config=model_cfg, training_config=train_cfg)
+
+    assert budget["micro_batch_size"] == 16
+    assert budget["effective_batch_size"] == 64
+    assert budget["gradient_accumulation_steps"] == 4
+
+
+def test_vram_estimator_uses_training_config_runtime_fields_by_default() -> None:
+    model_cfg = ModelConfig(n_embd=96, n_head=6, n_layer=2, block_size=64)
+    train_cfg = TrainingConfig(
+        batch_size=8,
+        precision="amp_fp16",
+        optimizer_type="sgd",
+        gradient_checkpointing=True,
+    )
+
+    budget = estimate_vram_budget(model_config=model_cfg, training_config=train_cfg)
+
+    assert budget["requested_precision"] == "amp_fp16"
+    assert budget["requested_optimizer_type"] == "sgd"
+    assert budget["gradient_checkpointing"] is True
+
+
+def test_memory_probe_failure_is_explicit_not_fake_zero(monkeypatch) -> None:
+    import sys
+
+    class BrokenPsutil:
+        @staticmethod
+        def virtual_memory():
+            raise OSError("memory probe failed")
+
+    monkeypatch.setitem(sys.modules, "psutil", BrokenPsutil())
+
+    info = get_memory_info()
+
+    assert info["probe"]["status"] == "FAILED"
+    assert info["total_gb"] is None
+    assert info["available_gb"] is None
+    assert "memory probe failed" in info["probe"]["error"]
+
+
+def test_disk_probe_failure_is_explicit_not_fake_zero(monkeypatch) -> None:
+    import src.core.diagnostics.storage as storage
+
+    def broken_disk_usage(path: str):
+        raise OSError(f"cannot stat {path}")
+
+    monkeypatch.setattr(storage.shutil, "disk_usage", broken_disk_usage)
+
+    info = get_disk_info(".")
+
+    assert info["probe"]["status"] == "FAILED"
+    assert info["total_gb"] is None
+    assert info["free_gb"] is None
+    assert "cannot stat" in info["probe"]["error"]
+
+
+def test_runner_does_not_turn_failed_capacity_probe_into_low_capacity_warning(monkeypatch) -> None:
+    import src.core.diagnostics.runner as runner_module
+
+    failed_probe = {"status": "FAILED", "error": "probe unavailable", "value": None}
+    monkeypatch.setattr(
+        runner_module,
+        "get_disk_info",
+        lambda path: {
+            "path": path,
+            "total_gb": None,
+            "used_gb": None,
+            "free_gb": None,
+            "percent_used": None,
+            "probe": failed_probe,
+        },
+    )
+    monkeypatch.setattr(
+        runner_module,
+        "get_memory_info",
+        lambda: {
+            "total_gb": None,
+            "available_gb": None,
+            "used_gb": None,
+            "percent_used": None,
+            "probe": failed_probe,
+        },
+    )
+    monkeypatch.setattr(
+        runner_module,
+        "get_gpu_info",
+        lambda: {
+            "cuda_available": False,
+            "device_count": 0,
+            "devices": [],
+            "primary_gpu": None,
+            "recommendations": {},
+        },
+    )
+    monkeypatch.setattr(
+        runner_module,
+        "verify_directory_permissions",
+        lambda paths: {p: {"exists": True, "readable": True, "writable": True} for p in paths},
+    )
+
+    report = runner_module.DiagnosticsRunner().run(test_tensor_allocation=False)
+
+    assert not any("Dung lượng đĩa trống cực thấp" in warning for warning in report.warnings)
+    assert not any("RAM hệ thống khả dụng dưới" in warning for warning in report.warnings)
+    assert any("Không thể đo dung lượng đĩa" in warning for warning in report.warnings)
+    assert any("Không thể đo dung lượng RAM" in warning for warning in report.warnings)
+
+
+def test_reporter_accepts_failed_capacity_probes_without_numeric_coercion() -> None:
+    from src.core.diagnostics.reporter import print_diagnostic_report
+    from src.core.diagnostics.runner import DiagnosticReport, DiagnosticStatus
+
+    failed_probe = {"status": "FAILED", "error": "probe unavailable", "value": None}
+    report = DiagnosticReport(
+        status=DiagnosticStatus.WARNING,
+        system={},
+        hardware={
+            "cpu": {},
+            "memory": {
+                "total_gb": None,
+                "available_gb": None,
+                "percent_used": None,
+                "probe": failed_probe,
+            },
+            "gpu": {"cuda_available": False, "devices": []},
+        },
+        storage={
+            "total_gb": None,
+            "used_gb": None,
+            "free_gb": None,
+            "percent_used": None,
+            "probe": failed_probe,
+        },
+        permissions={},
+    )
+
+    print_diagnostic_report(report)

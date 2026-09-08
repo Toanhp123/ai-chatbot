@@ -6,7 +6,7 @@ Hỗ trợ đa bí danh, tự động khám phá và cắm rút linh hoạt gi�
 import importlib
 from typing import Any, Callable, Dict, List, Type, TypeVar
 
-from src.core.exceptions import AIEngineError
+from src.core.exceptions import AIEngineError, GeneratorBackendNotFoundError
 from src.generation.base import BaseGenerator
 
 T = TypeVar("T", bound=BaseGenerator)
@@ -50,9 +50,7 @@ class GeneratorRegistry:
 
         if name_clean not in cls._registry:
             available = list(cls._registry.keys())
-            raise AIEngineError(
-                f"Không tìm thấy Generator '{name}'. Các generator khả dụng: {available}"
-            )
+            raise GeneratorBackendNotFoundError(name, available)
         return cls._registry[name_clean]
 
     @classmethod

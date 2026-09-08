@@ -6,6 +6,7 @@ Trình điều phối Kiểm tra Hệ thống (System Health Diagnostics Runner)
 - Duy trì hàm tương thích ngược check_hardware_and_environment()
 """
 
+import logging
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from enum import Enum
@@ -17,11 +18,18 @@ from src.core.diagnostics.hardware import (
     get_memory_info,
     probe_cuda_device,
 )
+from src.core.diagnostics.probe import ProbeStatus
 from src.core.diagnostics.storage import get_disk_info, verify_directory_permissions
 from src.core.diagnostics.system import get_system_info
-from src.core.logging import get_logger
 
-logger = get_logger("Diagnostics")
+logger = logging.getLogger("Diagnostics")
+
+
+def _probe_status(payload: Dict[str, Any]) -> str:
+    probe = payload.get("probe")
+    if isinstance(probe, dict):
+        return str(probe.get("status", ProbeStatus.OK.value))
+    return ProbeStatus.OK.value
 
 
 class DiagnosticStatus(str, Enum):
@@ -73,8 +81,13 @@ class DiagnosticsRunner:
         status = DiagnosticStatus.HEALTHY
 
         # 1. Đánh giá ổ đĩa
-        free_disk = disk_info.get("free_gb", 0.0)
-        if free_disk < 1.0:
+        free_disk = disk_info.get("free_gb")
+        disk_probe_status = _probe_status(disk_info)
+        if disk_probe_status == ProbeStatus.FAILED.value:
+            status = DiagnosticStatus.WARNING
+            warnings.append("Không thể đo dung lượng đĩa; trạng thái lưu trữ hiện chưa xác định.")
+            suggestions.append("Kiểm tra quyền truy cập filesystem rồi chạy lại diagnostics.")
+        elif isinstance(free_disk, (int, float)) and free_disk < 1.0:
             status = DiagnosticStatus.CRITICAL
             warnings.append(
                 f"Dung lượng đĩa trống cực thấp ({free_disk} GB)! Huấn luyện có thể bị crash."
@@ -82,7 +95,7 @@ class DiagnosticsRunner:
             suggestions.append(
                 "Giải phóng dung lượng ổ đĩa ngay để tránh lỗi ghi checkpoint hoặc log."
             )
-        elif free_disk < 5.0:
+        elif isinstance(free_disk, (int, float)) and free_disk < 5.0:
             if status != DiagnosticStatus.CRITICAL:
                 status = DiagnosticStatus.WARNING
             warnings.append(f"Dung lượng đĩa khả dụng dưới 5GB ({free_disk} GB).")
@@ -124,8 +137,14 @@ class DiagnosticsRunner:
                     suggestions.append("Khởi động lại driver CUDA hoặc kiểm tra card đồ họa.")
 
         # 4. Đánh giá RAM
-        free_ram = memory_info.get("available_gb", 0.0)
-        if free_ram > 0 and free_ram < 1.0:
+        free_ram = memory_info.get("available_gb")
+        memory_probe_status = _probe_status(memory_info)
+        if memory_probe_status == ProbeStatus.FAILED.value:
+            if status != DiagnosticStatus.CRITICAL:
+                status = DiagnosticStatus.WARNING
+            warnings.append("Không thể đo dung lượng RAM; trạng thái bộ nhớ hiện chưa xác định.")
+            suggestions.append("Kiểm tra psutil/quyền hệ thống rồi chạy lại diagnostics.")
+        elif isinstance(free_ram, (int, float)) and 0 < free_ram < 1.0:
             if status != DiagnosticStatus.CRITICAL:
                 status = DiagnosticStatus.WARNING
             warnings.append(f"RAM hệ thống khả dụng dưới 1GB ({free_ram} GB).")

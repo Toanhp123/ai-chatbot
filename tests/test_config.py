@@ -271,3 +271,21 @@ def test_resolve_device_prefers_mps_when_auto_and_cuda_unavailable(monkeypatch) 
 
     assert device_utils.resolve_device("auto") == "mps"
     assert device_utils.resolve_device("mps") == "mps"
+
+
+def test_config_copy_rejects_invalid_replacement() -> None:
+    cfg = ModelConfig(n_embd=96, n_head=6)
+    cfg.validate()
+
+    with pytest.raises(ConfigurationError, match="chia hết"):
+        cfg.copy(n_head=5)
+
+
+def test_engine_config_rejects_non_mapping_domain_as_configuration_error() -> None:
+    with pytest.raises(ConfigurationError, match="model"):
+        EngineConfig.from_dict({"model": 3})  # type: ignore[arg-type]
+
+
+def test_engine_config_normalizes_invalid_scalar_field_type() -> None:
+    with pytest.raises(ConfigurationError, match="training.precision"):
+        EngineConfig.from_dict({"training": {"precision": 1}})  # type: ignore[arg-type]

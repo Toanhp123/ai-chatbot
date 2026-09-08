@@ -10,7 +10,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from src.core.config import GenerationConfig
-from src.core.exceptions import AIEngineError
+from src.core.exceptions import AIEngineError, GeneratorBackendNotFoundError
 
 router = APIRouter(prefix="/api", tags=["Inference"])
 
@@ -79,6 +79,8 @@ async def select_generator_endpoint(req: SelectGeneratorRequest, request: Reques
             "message": f"Đã chuyển đổi sang generator backend '{req.backend}'.",
             "current_backend": inference_service.current_backend,
         }
+    except AIEngineError:
+        raise
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -94,11 +96,9 @@ async def generate_stream_endpoint(req: GenerateRequest, request: Request):
     requested_backend = req.backend
     if requested_backend is not None:
         requested_backend = requested_backend.lower().strip()
-        if requested_backend not in inference_service.list_generators():
-            raise HTTPException(
-                status_code=400,
-                detail=f"Generator backend không hợp lệ: '{req.backend}'.",
-            )
+        available_backends = inference_service.list_generators()
+        if requested_backend not in available_backends:
+            raise GeneratorBackendNotFoundError(requested_backend, available_backends)
 
     stop_sequences: Optional[List[List[int]]] = None
     if req.stop_words and inference_service.tokenizer:
@@ -155,7 +155,9 @@ async def load_checkpoint_endpoint(req: LoadCheckpointRequest, request: Request)
         }
     except FileNotFoundError as e:
         raise HTTPException(status_code=404, detail=str(e)) from e
-    except (AIEngineError, ValueError) as e:
+    except AIEngineError:
+        raise
+    except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Không thể nạp checkpoint: {e}") from e
@@ -233,18 +235,44 @@ async def get_raw_config_endpoint(path: str = "configs/truyen_kieu.yaml"):
 
 @router.post("/configs/save")
 async def save_raw_config_endpoint(req: SaveConfigRequest):
-    """Lưu nội dung chỉnh sửa vào file cấu hình YAML sau khi kiểm tra cú pháp hợp lệ."""
+    """Validate and atomically persist an EngineConfig YAML file."""
+    import tempfile
+
     import yaml
+
+    from src.core.config import EngineConfig
+    from src.core.exceptions import ConfigurationError
 
     norm_path = _resolve_config_path(req.path)
 
     try:
-        yaml.safe_load(req.content)
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Cú pháp YAML không hợp lệ: {e}")
+        parsed = yaml.safe_load(req.content)
+        if parsed is None:
+            parsed = {}
+        if not isinstance(parsed, dict):
+            raise ConfigurationError("Nội dung YAML phải là một dictionary/mapping ở cấp cao nhất.")
+        EngineConfig.from_dict(parsed)
+    except yaml.YAMLError as exc:
+        raise HTTPException(status_code=400, detail=f"Cú pháp YAML không hợp lệ: {exc}") from exc
 
     os.makedirs(os.path.dirname(norm_path) or "configs", exist_ok=True)
-    with open(norm_path, "w", encoding="utf-8") as f:
-        f.write(req.content)
+    temp_path = ""
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=os.path.dirname(norm_path) or "configs",
+            prefix=".config-",
+            suffix=".tmp",
+            delete=False,
+        ) as tmp:
+            temp_path = tmp.name
+            tmp.write(req.content)
+            tmp.flush()
+            os.fsync(tmp.fileno())
+        os.replace(temp_path, norm_path)
+    finally:
+        if temp_path and os.path.exists(temp_path):
+            os.remove(temp_path)
 
     return {"status": "success", "message": f"Đã lưu cấu hình thành công: {norm_path}"}

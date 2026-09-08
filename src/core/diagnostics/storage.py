@@ -9,6 +9,7 @@ import os
 import shutil
 from typing import Any, Dict, Sequence
 
+from src.core.diagnostics.probe import ProbeResult
 from src.core.exceptions import HardwareError
 
 
@@ -20,8 +21,10 @@ def get_disk_info(path: str = ".") -> Dict[str, Any]:
         used_gb = round(used / (1024**3), 2)
         free_gb = round(free / (1024**3), 2)
         percent_used = round((used / total) * 100, 1) if total > 0 else 0.0
-    except Exception:
-        total_gb, used_gb, free_gb, percent_used = 0.0, 0.0, 0.0, 0.0
+        probe = ProbeResult.ok(True)
+    except Exception as exc:
+        total_gb = used_gb = free_gb = percent_used = None
+        probe = ProbeResult.failed(exc)
 
     return {
         "path": os.path.abspath(path),
@@ -29,6 +32,7 @@ def get_disk_info(path: str = ".") -> Dict[str, Any]:
         "used_gb": used_gb,
         "free_gb": free_gb,
         "percent_used": percent_used,
+        "probe": probe.to_dict(),
     }
 
 
@@ -39,7 +43,11 @@ def verify_directory_permissions(
     results: Dict[str, Dict[str, bool]] = {}
 
     for d in paths:
-        status = {"exists": False, "readable": False, "writable": False}
+        status: Dict[str, Any] = {
+            "exists": False,
+            "readable": False,
+            "writable": False,
+        }
         try:
             os.makedirs(d, exist_ok=True)
             status["exists"] = os.path.isdir(d)
@@ -54,8 +62,9 @@ def verify_directory_permissions(
                 f.write("healthcheck")
             os.remove(test_file)
             status["writable"] = True
-        except Exception:
-            pass
+            status["probe"] = ProbeResult.ok(True).to_dict()
+        except Exception as exc:
+            status["probe"] = ProbeResult.failed(exc).to_dict()
 
         results[d] = status
 

@@ -34,11 +34,19 @@ class BaseConfig(ABC):
 
     def copy(self: T, **overrides: Any) -> T:
         """Tạo bản sao cấu hình với các trường ghi đè tùy chọn (immutable update)."""
-        return replace(self, **overrides)
+        copied = replace(self, **overrides)
+        copied.validate()
+        return copied
 
     @classmethod
-    def from_kwargs_safe(cls: Type[T], data: Dict[str, Any], ignore_unknown: bool = False) -> T:
+    def from_kwargs_safe(cls: Type[T], data: Any, ignore_unknown: bool = False) -> T:
         """Khởi tạo instance an toàn từ dictionary, lọc trường hợp lệ và phát hiện lỗi gõ nhầm (typo)."""
+        if not isinstance(data, dict):
+            raise ConfigurationError(
+                f"Dữ liệu cấu hình cho {cls.__name__} phải là dictionary/mapping, "
+                f"nhận được {type(data).__name__}.",
+                {"class": cls.__name__, "actual_type": type(data).__name__},
+            )
         try:
             cls_fields = fields(cls)
         except TypeError:

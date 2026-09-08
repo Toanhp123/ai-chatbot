@@ -10,6 +10,7 @@ Bao gồm:
 import json
 import logging
 import os
+from contextvars import ContextVar
 from datetime import datetime
 from logging.handlers import RotatingFileHandler, TimedRotatingFileHandler
 from typing import Any, Dict, List, Optional, TextIO, Union
@@ -84,24 +85,26 @@ class JSONLogFormatter(logging.Formatter):
 
 
 class LogContext:
-    """Quản lý biến ngữ cảnh log toàn cục/phiên chạy (Run Tracker)."""
+    """Ngữ cảnh log cô lập theo async context/thread thay vì process-global state."""
 
-    _context: Dict[str, Any] = {}
+    _context: ContextVar[Dict[str, Any]] = ContextVar("ai_engine_log_context", default={})
 
     @classmethod
     def set(cls, **kwargs: Any) -> None:
         """Thiết lập các biến ngữ cảnh (ví dụ run_id, rank, experiment)."""
-        cls._context.update(kwargs)
+        context = dict(cls._context.get())
+        context.update(kwargs)
+        cls._context.set(context)
 
     @classmethod
     def get(cls) -> Dict[str, Any]:
         """Lấy bản sao ngữ cảnh hiện tại."""
-        return dict(cls._context)
+        return dict(cls._context.get())
 
     @classmethod
     def clear(cls) -> None:
-        """Xóa sạch ngữ cảnh."""
-        cls._context.clear()
+        """Xóa sạch ngữ cảnh của context hiện tại."""
+        cls._context.set({})
 
 
 class LogContextFilter(logging.Filter):
@@ -228,6 +231,7 @@ class MetricLogger:
         self.buffered = buffered
         self.history: List[Dict[str, Any]] = []
         self._file_handle: Optional[TextIO] = None
+        self.persistence_error: Optional[str] = None
 
         if self.filepath:
             abs_path = os.path.abspath(self.filepath)
@@ -245,13 +249,19 @@ class MetricLogger:
         entry.update(metrics)
         self._record(entry)
 
+    def _record_persistence_failure(self, operation: str, exc: Exception) -> None:
+        self.persistence_error = f"{operation}: {exc}"
+        logging.getLogger("MetricLogger").warning(
+            "Metric persistence %s failed: %s", operation, exc
+        )
+
     def flush(self) -> None:
         """Xả toàn bộ dữ liệu từ bộ đệm ra đĩa."""
         if self._file_handle and not self._file_handle.closed:
             try:
                 self._file_handle.flush()
-            except Exception:
-                pass
+            except Exception as exc:
+                self._record_persistence_failure("flush", exc)
 
     def close(self) -> None:
         """Đóng an toàn file handle nếu đang hoạt động."""
@@ -259,8 +269,8 @@ class MetricLogger:
             try:
                 self._file_handle.flush()
                 self._file_handle.close()
-            except Exception:
-                pass
+            except Exception as exc:
+                self._record_persistence_failure("close", exc)
             finally:
                 self._file_handle = None
 
@@ -333,14 +343,14 @@ class MetricLogger:
         if self._file_handle and not self._file_handle.closed:
             try:
                 self._file_handle.write(line)
-            except Exception:
-                pass
+            except Exception as exc:
+                self._record_persistence_failure("write", exc)
         elif self.filepath:
             try:
                 with open(self.filepath, "a", encoding="utf-8") as f:
                     f.write(line)
-            except Exception:
-                pass
+            except Exception as exc:
+                self._record_persistence_failure("write", exc)
 
     def get_history(self) -> List[Dict[str, Any]]:
         """Lấy toàn bộ lịch sử chỉ số."""
@@ -490,7 +500,8 @@ class LogManager:
                 cls._managed_handlers.append(json_h)
 
             context_filter = LogContextFilter()
-            root_logger.addFilter(context_filter)
+            for handler in cls._managed_handlers:
+                handler.addFilter(context_filter)
 
             root_logger.setLevel(logging.DEBUG)
             cls._initialized = True
@@ -537,6 +548,25 @@ def setup_logger(
     )
 
 
+def configure_logging_from_system(
+    system_config: Any,
+    name: str = "ai-train",
+    *,
+    json_file: Optional[str] = None,
+    use_rich: bool = True,
+    force_reconfigure: bool = True,
+) -> logging.Logger:
+    """Áp dụng SystemConfig tại composition boundary làm logging source-of-truth."""
+    return setup_logger(
+        name=name,
+        level=system_config.log_level,
+        log_file=system_config.log_file,
+        json_file=json_file,
+        use_rich=use_rich,
+        force_reconfigure=force_reconfigure,
+    )
+
+
 def get_logger(name: str = "ai-train") -> logging.Logger:
     """Hàm tiện ích tương thích ngược để lấy logger."""
     return LogManager.get_logger(name=name)
@@ -560,6 +590,7 @@ __all__ = [
     "MetricLogger",
     "LogManager",
     "setup_logger",
+    "configure_logging_from_system",
     "get_logger",
     "get_metric_logger",
 ]

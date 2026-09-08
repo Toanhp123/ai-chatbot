@@ -299,6 +299,45 @@ def test_ui_generators(client: TestClient):
     # Chọn backend không tồn tại -> 400
     res_invalid = client.post("/api/generators/select", json={"backend": "invalid_backend_xyz"})
     assert res_invalid.status_code == 400
+    invalid_payload = res_invalid.json()
+    assert invalid_payload["error_code"] == "ERR_GEN_BACKEND_NOT_FOUND"
+    assert invalid_payload["is_recoverable"] is True
+
+
+def test_training_start_reuses_preflight_runtime_plan_for_worker() -> None:
+    from unittest.mock import Mock, patch
+
+    from src.core.config import EngineConfig
+    from src.core.runtime import RuntimeCapabilities, resolve_training_plan
+
+    config = EngineConfig()
+    config = config.copy(system=config.system.copy(device="cpu"))
+    runtime_plan = resolve_training_plan(
+        config,
+        capabilities=RuntimeCapabilities(
+            cuda_available=False,
+            mps_available=False,
+            bf16_supported=False,
+            bitsandbytes_available=False,
+        ),
+    )
+    app = create_app()
+    start_training_mock = Mock()
+    app.state.training_service.start_training = start_training_mock
+
+    with (
+        patch("src.core.config.EngineConfig.from_yaml", return_value=config),
+        patch("src.core.runtime.resolve_training_plan", return_value=runtime_plan) as resolve_mock,
+        TestClient(app) as local_client,
+    ):
+        response = local_client.post(
+            "/api/training/start",
+            json={"config_path": "unused.yaml", "run_name": "runtime_plan_test"},
+        )
+
+    assert response.status_code == 200
+    resolve_mock.assert_called_once_with(config)
+    assert start_training_mock.call_args.kwargs["runtime_plan"] is runtime_plan
 
 
 def test_ui_check_feasibility(client: TestClient):
@@ -527,6 +566,9 @@ def test_ui_generate_stream_rejects_invalid_backend_before_streaming(client: Tes
         json={"prompt": "hello world", "backend": "invalid_backend_xyz"},
     )
     assert res.status_code == 400
+    payload = res.json()
+    assert payload["error_code"] == "ERR_GEN_BACKEND_NOT_FOUND"
+    assert payload["details"]["requested"] == "invalid_backend_xyz"
 
 
 def test_ui_training_start_rejects_invalid_config_before_background_start(client: TestClient):
@@ -700,3 +742,79 @@ def test_ui_byte_tokenizer_visualizer_does_not_render_utf8_bytes_as_replacement_
     raw = [item["raw"] for item in response.json()["tokens"]]
     assert raw == ["0xC4", "0x83"]
     assert "�" not in "".join(raw)
+
+
+def test_ui_config_save_rejects_semantically_invalid_yaml_without_overwriting(
+    client: TestClient, tmp_path, monkeypatch
+):
+    configs = tmp_path / "configs"
+    configs.mkdir()
+    target = configs / "semantic.yaml"
+    original = "model:\n  n_embd: 96\n  n_head: 6\n"
+    target.write_text(original, encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+
+    response = client.post(
+        "/api/configs/save",
+        json={
+            "path": "configs/semantic.yaml",
+            "content": "model:\n  n_embd: 100\n  n_head: 6\n",
+        },
+    )
+
+    assert response.status_code == 400
+    payload = response.json()
+    assert payload["error_code"] == "ERR_CFG_INVALID"
+    assert payload["error_type"] == "ConfigurationError"
+    assert payload["suggestion"]
+    assert target.read_text(encoding="utf-8") == original
+
+
+def test_ui_config_save_uses_atomic_replace(client: TestClient, tmp_path, monkeypatch):
+    import src.ui.routes.inference as inference_routes
+
+    configs = tmp_path / "configs"
+    configs.mkdir()
+    target = configs / "atomic.yaml"
+    target.write_text("system:\n  seed: 1\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+
+    real_replace = inference_routes.os.replace
+    calls = []
+
+    def tracking_replace(source: str, destination: str) -> None:
+        calls.append((source, destination))
+        real_replace(source, destination)
+
+    monkeypatch.setattr(inference_routes.os, "replace", tracking_replace)
+
+    response = client.post(
+        "/api/configs/save",
+        json={"path": "configs/atomic.yaml", "content": "system:\n  seed: 42\n"},
+    )
+
+    assert response.status_code == 200
+    assert calls
+    assert calls[-1][1] == str(target.resolve())
+    assert target.read_text(encoding="utf-8") == "system:\n  seed: 42\n"
+
+
+def test_ui_diagnostics_estimate_honors_llama_memory_profile(client: TestClient):
+    response = client.post(
+        "/api/diagnostics/estimate",
+        json={
+            "model_name": "llama",
+            "batch_size": 4,
+            "block_size": 64,
+            "n_embd": 96,
+            "n_layer": 2,
+            "n_head": 6,
+            "vocab_size": 257,
+            "intermediate_size": 1024,
+        },
+    )
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["model_name"] == "llama"
+    assert data["total_parameters"] == 688_704

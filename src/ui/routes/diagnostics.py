@@ -3,7 +3,7 @@ Diagnostics API Routes: Lấy thông số hệ thống, phần cứng và tính 
 """
 
 import os
-from typing import Optional
+from typing import Any, Dict, Optional
 
 from fastapi import APIRouter
 from pydantic import BaseModel, Field
@@ -24,6 +24,7 @@ router = APIRouter(prefix="/api/diagnostics", tags=["Diagnostics"])
 
 
 class VRAMEstimateRequest(BaseModel):
+    model_name: str = Field(default="minigpt")
     batch_size: int = Field(default=64, ge=1, le=512)
     block_size: int = Field(default=128, ge=16, le=2048)
     n_embd: int = Field(default=192, ge=32, le=1024)
@@ -34,6 +35,10 @@ class VRAMEstimateRequest(BaseModel):
     optimizer_type: str = Field(default="adamw")
     gradient_checkpointing: bool = Field(default=False)
     gradient_accumulation_steps: int = Field(default=1, ge=1, le=32)
+    intermediate_size: Optional[int] = Field(default=None, ge=0)
+    multiple_of: int = Field(default=64, ge=1)
+    tie_word_embeddings: bool = Field(default=True)
+    bias: bool = Field(default=False)
 
 
 @router.get("/system")
@@ -55,12 +60,22 @@ async def get_system_diagnostics():
 @router.post("/estimate")
 async def estimate_vram_endpoint(req: VRAMEstimateRequest):
     """Mô phỏng và tính toán chi tiết ngân sách bộ nhớ VRAM."""
+    from src.core.config import EngineConfig
+    from src.core.runtime import resolve_training_plan
+
+    model_kwargs = {"multiple_of": req.multiple_of}
+    if req.intermediate_size is not None:
+        model_kwargs["intermediate_size"] = req.intermediate_size
     model_cfg = ModelConfig(
+        name=req.model_name.strip().lower(),
         vocab_size=req.vocab_size,
         block_size=req.block_size,
         n_embd=req.n_embd,
         n_layer=req.n_layer,
         n_head=req.n_head,
+        model_kwargs=model_kwargs,
+        tie_word_embeddings=req.tie_word_embeddings,
+        bias=req.bias,
     )
     training_cfg = TrainingConfig(
         batch_size=req.batch_size,
@@ -69,15 +84,14 @@ async def estimate_vram_endpoint(req: VRAMEstimateRequest):
         gradient_checkpointing=req.gradient_checkpointing,
         gradient_accumulation_steps=req.gradient_accumulation_steps,
     )
+    engine_cfg = EngineConfig(model=model_cfg, training=training_cfg)
+    engine_cfg.validate()
+    runtime_plan = resolve_training_plan(engine_cfg)
 
     budget = estimate_vram_budget(
         model_config=model_cfg,
         training_config=training_cfg,
-        vocab_size=req.vocab_size,
-        precision=req.precision,
-        optimizer_type=req.optimizer_type,
-        gradient_accumulation_steps=req.gradient_accumulation_steps,
-        gradient_checkpointing=req.gradient_checkpointing,
+        runtime_plan=runtime_plan,
     )
 
     # Làm phẳng dữ liệu cho UI tiêu thụ trực tiếp
@@ -99,11 +113,22 @@ async def scenarios_endpoint(req: VRAMEstimateRequest):
     from src.core.diagnostics.estimator import analyze_vram_scenarios
 
     model_cfg = ModelConfig(
+        name=req.model_name.strip().lower(),
         vocab_size=req.vocab_size,
         block_size=req.block_size,
         n_embd=req.n_embd,
         n_layer=req.n_layer,
         n_head=req.n_head,
+        model_kwargs={
+            "multiple_of": req.multiple_of,
+            **(
+                {"intermediate_size": req.intermediate_size}
+                if req.intermediate_size is not None
+                else {}
+            ),
+        },
+        tie_word_embeddings=req.tie_word_embeddings,
+        bias=req.bias,
     )
     training_cfg = TrainingConfig(
         batch_size=req.batch_size,
@@ -196,17 +221,18 @@ async def inspect_model_endpoint(
     actual_model_name = (
         model_name.strip().lower() if model_name and model_name.strip() else config.model.name
     )
-    config.model.name = actual_model_name
+    model_overrides: Dict[str, Any] = {"name": actual_model_name}
     if n_embd is not None and n_embd > 0:
-        config.model.n_embd = n_embd
+        model_overrides["n_embd"] = n_embd
     if n_head is not None and n_head > 0:
-        config.model.n_head = n_head
+        model_overrides["n_head"] = n_head
     if n_layer is not None and n_layer > 0:
-        config.model.n_layer = n_layer
+        model_overrides["n_layer"] = n_layer
     if block_size is not None and block_size > 0:
-        config.model.block_size = block_size
+        model_overrides["block_size"] = block_size
+    model_config = config.model.copy(**model_overrides)
 
-    model = ModelRegistry.create(actual_model_name, config.model)
+    model = ModelRegistry.create(actual_model_name, model_config)
 
     layers_info = []
     total_params = 0
@@ -227,7 +253,7 @@ async def inspect_model_endpoint(
         "model_name": actual_model_name,
         "total_parameters": total_params,
         "total_parameters_formatted": f"{total_params:,}",
-        "vocab_size": config.model.vocab_size,
+        "vocab_size": model_config.vocab_size,
         "block_size": config.model.block_size,
         "n_embd": config.model.n_embd,
         "n_head": config.model.n_head,

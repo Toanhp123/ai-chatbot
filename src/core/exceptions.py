@@ -56,6 +56,7 @@ class ErrorCode(str, Enum):
 
     # Lỗi sinh văn bản (Generation)
     GEN_SAMPLING_FAILED = "ERR_GEN_SAMPLING_FAILED"
+    GEN_BACKEND_NOT_FOUND = "ERR_GEN_BACKEND_NOT_FOUND"
     GEN_EMPTY_PROMPT = "ERR_GEN_EMPTY_PROMPT"
     GEN_CONTEXT_EXCEEDED = "ERR_GEN_CONTEXT_EXCEEDED"
 
@@ -386,6 +387,22 @@ class GenerationError(AIEngineError):
         )
 
 
+class GeneratorBackendNotFoundError(GenerationError):
+    """Ngoại lệ khi client yêu cầu generator backend chưa đăng ký."""
+
+    def __init__(self, backend: str, available: Optional[List[str]] = None):
+        available_list = available or []
+        super().__init__(
+            message=(
+                f"Không tìm thấy Generator '{backend}'. Các generator khả dụng: {available_list}"
+            ),
+            details={"requested": backend, "available": available_list},
+            error_code=ErrorCode.GEN_BACKEND_NOT_FOUND,
+            suggestion="Chọn một generator backend trong danh sách khả dụng.",
+            is_recoverable=True,
+        )
+
+
 class SamplingError(GenerationError):
     """Ngoại lệ khi thuật toán lấy mẫu xác suất gặp lỗi (Logits chứa NaN, tổng xác suất bằng 0...)."""
 
@@ -552,6 +569,7 @@ __all__ = [
     "CheckpointNotFoundError",
     "CheckpointCorruptedError",
     "GenerationError",
+    "GeneratorBackendNotFoundError",
     "SamplingError",
     "DiagnosticError",
     "VRAMBudgetExceededError",

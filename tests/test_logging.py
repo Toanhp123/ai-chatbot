@@ -290,3 +290,101 @@ def test_timed_rotating_file_handler(tmp_path):
     assert handler.level == logging.DEBUG
     assert timed_file.parent.exists()
     handler.close()
+
+
+def test_log_context_reaches_real_json_handler(tmp_path):
+    json_file = tmp_path / "context.jsonl"
+    LogContext.clear()
+    LogContext.set(run_id="run-real", experiment="exp-real", rank=3)
+    logger = setup_logger(
+        name="child.context",
+        level="INFO",
+        log_file=None,
+        json_file=str(json_file),
+        use_rich=False,
+        force_reconfigure=True,
+    )
+
+    logger.info("context integration")
+    for handler in logging.getLogger().handlers:
+        handler.flush()
+
+    payload = json.loads(json_file.read_text(encoding="utf-8").strip())
+    assert payload["run_id"] == "run-real"
+    assert payload["experiment"] == "exp-real"
+    assert payload["rank"] == 3
+    LogContext.clear()
+
+
+def test_log_context_is_isolated_between_threads():
+    import threading
+
+    first_set = threading.Event()
+    second_set = threading.Event()
+    values = {}
+
+    def first_worker():
+        LogContext.clear()
+        LogContext.set(run_id="run-A")
+        first_set.set()
+        assert second_set.wait(timeout=2)
+        values["a"] = LogContext.get().get("run_id")
+
+    def second_worker():
+        assert first_set.wait(timeout=2)
+        LogContext.clear()
+        LogContext.set(run_id="run-B")
+        values["b"] = LogContext.get().get("run_id")
+        second_set.set()
+
+    first = threading.Thread(target=first_worker)
+    second = threading.Thread(target=second_worker)
+    first.start()
+    second.start()
+    first.join(timeout=3)
+    second.join(timeout=3)
+
+    assert values == {"a": "run-A", "b": "run-B"}
+
+
+def test_metric_logger_exposes_persistence_failure(monkeypatch, tmp_path, caplog):
+    import builtins
+
+    metric_file = tmp_path / "metrics.jsonl"
+    metric_logger = MetricLogger(filepath=str(metric_file))
+    real_open = builtins.open
+
+    def broken_open(path, *args, **kwargs):
+        if str(path) == str(metric_file):
+            raise OSError("disk write failed")
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "open", broken_open)
+    with caplog.at_level(logging.WARNING):
+        metric_logger.log_step(step=1, loss=1.0)
+
+    assert metric_logger.persistence_error is not None
+    assert "disk write failed" in metric_logger.persistence_error
+    assert "metric persistence" in caplog.text.lower()
+
+
+def test_system_config_can_configure_logging(tmp_path):
+    from src.core.config import SystemConfig
+    from src.core.logging import configure_logging_from_system
+
+    log_file = tmp_path / "configured.log"
+    config = SystemConfig(log_level="ERROR", log_file=str(log_file))
+    config.validate()
+
+    logger = configure_logging_from_system(
+        config,
+        name="configured-system",
+        use_rich=False,
+        force_reconfigure=True,
+    )
+    logger.error("configured error")
+    for handler in logging.getLogger().handlers:
+        handler.flush()
+
+    assert log_file.exists()
+    assert "configured error" in log_file.read_text(encoding="utf-8")

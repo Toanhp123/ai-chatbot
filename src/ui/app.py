@@ -10,6 +10,7 @@ from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 
 from src.core.logging import get_logger
+from src.ui.errors import register_ai_engine_error_handlers
 from src.ui.routes.diagnostics import router as diagnostics_router
 from src.ui.routes.explorer import router as explorer_router
 from src.ui.routes.inference import router as inference_router
@@ -27,6 +28,7 @@ def create_app() -> FastAPI:
         description="Bảng điều khiển Sáng tác, Huấn luyện và Chẩn đoán AI Modular Monolith",
         version="1.0.0",
     )
+    register_ai_engine_error_handlers(app)
 
     # Cấu hình CORS
     app.add_middleware(

@@ -10,6 +10,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 
+from src.core.diagnostics.probe import ProbeResult
+
 
 def get_cpu_info() -> Dict[str, Any]:
     """Thu thập thông tin số nhân, luồng CPU và mức tải."""
@@ -17,28 +19,31 @@ def get_cpu_info() -> Dict[str, Any]:
     logical_cores = os.cpu_count() or 1
     cpu_percent = None
 
+    probe = ProbeResult.ok(True)
     try:
         import psutil
 
         physical_cores = psutil.cpu_count(logical=False)
         logical_cores = psutil.cpu_count(logical=True) or logical_cores
         cpu_percent = psutil.cpu_percent(interval=0.1)
-    except Exception:
-        pass
+    except Exception as exc:
+        probe = ProbeResult.failed(exc)
 
     return {
         "physical_cores": physical_cores or logical_cores,
         "logical_cores": logical_cores,
         "cpu_usage_percent": cpu_percent,
+        "probe": probe.to_dict(),
     }
 
 
 def get_memory_info() -> Dict[str, Any]:
     """Thu thập dung lượng RAM hệ thống."""
-    total_gb = 0.0
-    available_gb = 0.0
-    used_gb = 0.0
-    percent = 0.0
+    total_gb = None
+    available_gb = None
+    used_gb = None
+    percent = None
+    probe = ProbeResult.ok(True)
 
     try:
         import psutil
@@ -48,14 +53,15 @@ def get_memory_info() -> Dict[str, Any]:
         available_gb = round(mem.available / (1024**3), 2)
         used_gb = round((mem.total - mem.available) / (1024**3), 2)
         percent = mem.percent
-    except Exception:
-        pass
+    except Exception as exc:
+        probe = ProbeResult.failed(exc)
 
     return {
         "total_gb": total_gb,
         "available_gb": available_gb,
         "used_gb": used_gb,
         "percent_used": percent,
+        "probe": probe.to_dict(),
     }
 
 
@@ -73,14 +79,17 @@ def check_bf16_support() -> bool:
         return False
 
 
-def check_attention_backends() -> Dict[str, bool]:
+def check_attention_backends() -> Dict[str, Any]:
     """Kiểm tra tính khả dụng của 3 nhân Attention trong PyTorch 2.x SDPA."""
-    backends = {
+    backends: Dict[str, Any] = {
         "flash_attention": False,
         "memory_efficient": False,
         "math_attention": True,
     }
     if not torch.cuda.is_available():
+        backends["probe"] = ProbeResult.unsupported(
+            "CUDA không khả dụng; chỉ backend math có thể dùng."
+        ).to_dict()
         return backends
 
     try:
@@ -95,8 +104,9 @@ def check_attention_backends() -> Dict[str, bool]:
         backends["math_attention"] = getattr(
             torch.backends.cuda, "math_sdp_enabled", lambda: True
         )()
-    except Exception:
-        pass
+        backends["probe"] = ProbeResult.ok(True).to_dict()
+    except Exception as exc:
+        backends["probe"] = ProbeResult.failed(exc).to_dict()
 
     return backends
 
@@ -159,8 +169,18 @@ def get_hardware_recommendations(
 
 def get_gpu_info() -> Dict[str, Any]:
     """Thu thập thông tin chi tiết về GPU và trạng thái VRAM qua CUDA."""
-    cuda_available = torch.cuda.is_available()
-    device_count = torch.cuda.device_count() if cuda_available else 0
+    try:
+        cuda_available = bool(torch.cuda.is_available())
+        device_count = torch.cuda.device_count() if cuda_available else 0
+        probe = (
+            ProbeResult.ok(True)
+            if cuda_available
+            else ProbeResult.unsupported("CUDA không khả dụng trên runtime hiện tại.")
+        )
+    except Exception as exc:
+        cuda_available = False
+        device_count = 0
+        probe = ProbeResult.failed(exc)
     devices: List[Dict[str, Any]] = []
 
     if cuda_available:
@@ -202,6 +222,7 @@ def get_gpu_info() -> Dict[str, Any]:
         "bf16_supported": check_bf16_support(),
         "sdpa_backends": check_attention_backends(),
         "recommendations": get_hardware_recommendations(primary_cap, primary_free_vram),
+        "probe": probe.to_dict(),
     }
 
 

@@ -7,6 +7,13 @@ export interface ApiErrorPayload {
 	detail?: string;
 	message?: string;
 	status?: number;
+	error_type?: string;
+	error_code?: string;
+	severity?: "INFO" | "WARNING" | "ERROR" | "CRITICAL" | "FATAL" | string;
+	is_recoverable?: boolean;
+	timestamp?: string;
+	details?: Record<string, unknown>;
+	suggestion?: string | null;
 }
 
 export class ApiError extends Error {
@@ -81,7 +88,7 @@ export async function request<T>(
 		try {
 			errPayload = await res.json();
 			if (errPayload) {
-				errMsg = errPayload.detail || errPayload.message || errMsg;
+				errMsg = errPayload.message || errPayload.detail || errMsg;
 			}
 		} catch {
 			// ignore parse error
