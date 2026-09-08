@@ -10,9 +10,12 @@ Hỗ trợ:
 - Trả về đối tượng tổng kết TrainOutput chuẩn công nghiệp.
 """
 
+import copy
+import math
 import os
 import time
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import Any, Dict, List, Optional, Union
 
 import torch
@@ -20,7 +23,7 @@ import torch.nn as nn
 from torch.amp import GradScaler, autocast  # pyright: ignore[reportPrivateImportUsage]
 
 from src.core.config import EngineConfig
-from src.core.exceptions import CheckpointNotFoundError
+from src.core.exceptions import CheckpointNotFoundError, TrainingDivergedError
 from src.core.logging import get_logger
 from src.core.runtime import ResolvedTrainingPlan, resolve_training_plan, validate_training_plan
 from src.data.batch_provider import BaseBatchProvider, TensorBatchProvider
@@ -30,9 +33,18 @@ from src.models.base import BaseModel
 from src.training.callbacks import BaseCallback
 from src.training.optimizers import compute_scheduled_lr, configure_optimizer
 from src.utils.seed import capture_rng_state, restore_rng_state
-from src.utils.tensor_inspector import assert_valid_tensor, check_model_gradients
 
 logger = get_logger("Trainer")
+
+
+class TrainingTerminationReason(str, Enum):
+    """Stable terminal reason contract shared by Trainer and UI orchestration."""
+
+    COMPLETED = "COMPLETED"
+    EARLY_STOPPED = "EARLY_STOPPED"
+    USER_STOPPED = "USER_STOPPED"
+    ABORTED_STARTUP = "ABORTED_STARTUP"
+    FAILED = "FAILED"
 
 
 @dataclass
@@ -46,6 +58,7 @@ class TrainOutput:
     metrics: Dict[str, float] = field(default_factory=dict)
     elapsed_time_sec: float = 0.0
     interrupted: bool = False
+    termination_reason: TrainingTerminationReason = TrainingTerminationReason.COMPLETED
 
 
 class Trainer:
@@ -132,6 +145,7 @@ class Trainer:
 
         self.current_lr = config.training.learning_rate
         self.should_stop = False
+        self._stop_reason: Optional[TrainingTerminationReason] = None
         self.start_step = 1
         self.best_val_loss: Optional[float] = None
 
@@ -140,9 +154,19 @@ class Trainer:
         """Tổng số bước huấn luyện tối đa được cấu hình."""
         return self.config.training.max_iters
 
-    def request_stop(self) -> None:
-        """Kích hoạt cờ yêu cầu dừng sớm vòng lặp huấn luyện."""
+    def _request_stop_with_reason(self, reason: TrainingTerminationReason) -> None:
         self.should_stop = True
+        # An explicit user stop has precedence if it races an early-stopping callback.
+        if self._stop_reason is None or reason is TrainingTerminationReason.USER_STOPPED:
+            self._stop_reason = reason
+
+    def request_stop(self) -> None:
+        """Yêu cầu dừng do người dùng/caller chủ động."""
+        self._request_stop_with_reason(TrainingTerminationReason.USER_STOPPED)
+
+    def request_early_stop(self) -> None:
+        """Yêu cầu dừng do convergence policy, không phải user interruption."""
+        self._request_stop_with_reason(TrainingTerminationReason.EARLY_STOPPED)
 
     def get_model_state_dict(self) -> Dict[str, Any]:
         """Lấy bản sao state dict của mô hình."""
@@ -200,6 +224,89 @@ class Trainer:
             "tokenizer_state": tokenizer_state,
             "runtime_state": self.get_runtime_state(),
         }
+
+    @staticmethod
+    def _resume_trajectory_config(config_dict: Dict[str, Any]) -> Dict[str, Any]:
+        """Strip fields that may change without altering the resumed training trajectory."""
+        normalized = copy.deepcopy(config_dict)
+        normalized.pop("generation", None)
+        training = normalized.get("training")
+        if isinstance(training, dict):
+            for key in (
+                "max_iters",
+                "checkpoint_dir",
+                "checkpoint_name",
+                "run_name",
+                "save_top_k",
+                "save_last",
+            ):
+                training.pop(key, None)
+        system = normalized.get("system")
+        if isinstance(system, dict):
+            system.pop("log_level", None)
+            system.pop("log_file", None)
+        return normalized
+
+    @staticmethod
+    def _first_config_diff(
+        saved: Any, current: Any, path: str = "config"
+    ) -> Optional[tuple[str, Any, Any]]:
+        if isinstance(saved, dict) and isinstance(current, dict):
+            for key in sorted(set(saved) | set(current)):
+                child_path = f"{path}.{key}"
+                if key not in saved:
+                    return child_path, None, current[key]
+                if key not in current:
+                    return child_path, saved[key], None
+                diff = Trainer._first_config_diff(saved[key], current[key], child_path)
+                if diff is not None:
+                    return diff
+            return None
+        if saved != current:
+            return path, saved, current
+        return None
+
+    def _validate_checkpoint_config_compatibility(self, saved_config: Any) -> None:
+        if not isinstance(saved_config, dict):
+            logger.warning(
+                "Checkpoint legacy không có config đầy đủ; bỏ qua semantic config compatibility check."
+            )
+            return
+
+        # Only full Trainer checkpoints can promise exact semantic resume. Partial
+        # inference-oriented checkpoints remain loadable through the legacy path.
+        required_domains = {"system", "data", "model", "training"}
+        if not required_domains.issubset(saved_config):
+            logger.warning(
+                "Checkpoint legacy chỉ chứa config một phần; bỏ qua semantic config compatibility check."
+            )
+            return
+
+        current_config = self.get_config_dict()
+        saved_training = saved_config.get("training")
+        current_training = current_config.get("training")
+        if isinstance(saved_training, dict) and isinstance(current_training, dict):
+            saved_max = saved_training.get("max_iters")
+            current_max = current_training.get("max_iters")
+            if (
+                isinstance(saved_max, int)
+                and isinstance(current_max, int)
+                and current_max < saved_max
+            ):
+                raise ValueError(
+                    "Resume config không tương thích: training.max_iters không được giảm "
+                    f"({saved_max} -> {current_max})."
+                )
+
+        saved_trajectory = self._resume_trajectory_config(saved_config)
+        current_trajectory = self._resume_trajectory_config(current_config)
+        diff = self._first_config_diff(saved_trajectory, current_trajectory)
+        if diff is not None:
+            path, saved_value, current_value = diff
+            raise ValueError(
+                "Resume config không tương thích với trajectory checkpoint tại "
+                f"{path}: {saved_value!r} != {current_value!r}."
+            )
 
     def _validate_runtime_state_compatibility(self, runtime_state: Dict[str, Any]) -> None:
         """Preflight runtime-owned contracts before any checkpoint state is committed."""
@@ -262,6 +369,7 @@ class Trainer:
         # Validate semantic compatibility before mutating model/optimizer/runtime state.
         # A rejected resume must be atomic from the caller's perspective.
         checkpoint_version = int(state.get("checkpoint_version", 1))
+        self._validate_checkpoint_config_compatibility(state.get("config"))
         checkpoint_identity = state.get("tokenizer_identity")
         resume_tokenizer = self.tokenizer
         if checkpoint_version >= 2:
@@ -367,7 +475,7 @@ class Trainer:
         grad_clip = self.config.training.grad_clip
         accum_steps = max(1, self.config.training.gradient_accumulation_steps)
 
-        interrupted = False
+        termination_reason = TrainingTerminationReason.COMPLETED
         last_step = self.start_step - 1
         effective_step_loss = 0.0
         last_metrics: Dict[str, float] = {}
@@ -379,7 +487,7 @@ class Trainer:
                     logger.info(
                         f"Đã nhận tín hiệu dừng sớm (request_stop) tại bước {step}. Đang ngắt vòng lặp an toàn."
                     )
-                    interrupted = True
+                    termination_reason = self._stop_reason or TrainingTerminationReason.USER_STOPPED
                     break
 
                 last_step = step
@@ -390,7 +498,7 @@ class Trainer:
 
                 # 2. Vòng lặp tích lũy Gradient (Gradient Accumulation)
                 self.optimizer.zero_grad(set_to_none=True)
-                accum_loss = 0.0
+                accumulated_loss: Optional[torch.Tensor] = None
 
                 for _ in range(accum_steps):
                     xb, yb = self.batch_provider.get_train_batch(
@@ -405,22 +513,53 @@ class Trainer:
                         assert loss is not None, "Model forward returned None loss during training"
                         loss_scaled = loss / accum_steps
 
-                    accum_loss += loss.item()
+                    detached_loss = loss.detach()
+                    accumulated_loss = (
+                        detached_loss
+                        if accumulated_loss is None
+                        else accumulated_loss + detached_loss
+                    )
                     self.scaler.scale(loss_scaled).backward()
 
-                effective_step_loss = accum_loss / accum_steps
-                assert_valid_tensor(torch.tensor(effective_step_loss), "Training Loss")
+                assert accumulated_loss is not None
+                # One scalar read per optimizer update instead of one GPU sync per
+                # accumulation microbatch.  Python-side finiteness validation keeps
+                # NaN/Inf loss fatal without interfering with GradScaler overflow.
+                effective_step_loss = float((accumulated_loss / accum_steps).item())
+                if not math.isfinite(effective_step_loss):
+                    raise TrainingDivergedError(
+                        "Phát hiện giá trị NaN/Inf trong Training Loss!",
+                        {"tensor_name": "Training Loss"},
+                    )
 
-                # 3. Chuẩn hóa Unscale trước khi kiểm tra Gradients & Clipping
-                if self.use_amp:
+                # 3. Unscale một lần trước gradient clipping. Recoverable fp16
+                # overflow is owned by GradScaler; do not pre-empt it with a
+                # per-parameter NaN/Inf scan that synchronizes the GPU.
+                scaler_enabled = self.scaler.is_enabled()
+                if scaler_enabled:
                     self.scaler.unscale_(self.optimizer)
 
-                check_model_gradients(self.model)
-
-                if grad_clip > 0:
-                    if not self.use_amp:
-                        self.scaler.unscale_(self.optimizer)
-                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=grad_clip)
+                try:
+                    if grad_clip > 0:
+                        torch.nn.utils.clip_grad_norm_(
+                            self.model.parameters(),
+                            max_norm=grad_clip,
+                            error_if_nonfinite=not scaler_enabled,
+                        )
+                    elif not scaler_enabled:
+                        # Validate non-AMP gradients without changing them. One
+                        # global norm reduction replaces N parameter-level syncs.
+                        torch.nn.utils.clip_grad_norm_(
+                            self.model.parameters(),
+                            max_norm=float("inf"),
+                            error_if_nonfinite=True,
+                        )
+                except RuntimeError as exc:
+                    if "non-finite" in str(exc).lower():
+                        raise TrainingDivergedError(
+                            "Phát hiện gradient NaN/Inf trong bước huấn luyện."
+                        ) from exc
+                    raise
 
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
@@ -446,7 +585,7 @@ class Trainer:
             logger.warning(
                 f"\n⚠️ Quá trình huấn luyện bị ngắt bởi người dùng (KeyboardInterrupt) tại bước {last_step}."
             )
-            interrupted = True
+            termination_reason = TrainingTerminationReason.USER_STOPPED
         finally:
             # Trigger hook on_train_end và dọn dẹp bộ nhớ GPU
             for cb in self.callbacks:
@@ -462,8 +601,9 @@ class Trainer:
             best_val_loss=self.best_val_loss,
             metrics=last_metrics,
             elapsed_time_sec=elapsed_time,
-            interrupted=interrupted,
+            interrupted=termination_reason is TrainingTerminationReason.USER_STOPPED,
+            termination_reason=termination_reason,
         )
 
 
-__all__ = ["Trainer", "TrainOutput"]
+__all__ = ["Trainer", "TrainOutput", "TrainingTerminationReason"]

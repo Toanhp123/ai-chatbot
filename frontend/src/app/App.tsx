@@ -18,6 +18,7 @@ function AIStudioContent() {
 	const [isTraining, setIsTraining] = useState<boolean>(false);
 	const [isSidebarCollapsed, setIsSidebarCollapsed] =
 		useState<boolean>(false);
+	const [configRevision, setConfigRevision] = useState(0);
 	const resetPlaygroundRef = useRef<(() => void) | null>(null);
 
 	const { toast } = useToast();
@@ -63,6 +64,7 @@ function AIStudioContent() {
 	const handleSaveConfig = () => {
 		configEditor.saveConfig(
 			() => {
+				setConfigRevision((revision) => revision + 1);
 				toast(
 					"Cấu hình YAML đã được cập nhật và xác thực an toàn.",
 					"success",
@@ -151,6 +153,7 @@ function AIStudioContent() {
 				<TrainingPage
 					activeCheckpoint={activeCheckpoint}
 					onCheckpointLoaded={handleCheckpointLoaded}
+					configRevision={configRevision}
 				/>
 			</div>
 

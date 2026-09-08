@@ -6,7 +6,61 @@ Torch/Rich or configure filesystem-backed logging.
 """
 
 from importlib import import_module
-from typing import Dict, Tuple
+from typing import TYPE_CHECKING, Dict, Tuple
+
+if TYPE_CHECKING:
+    from src.core.config import (
+        BaseConfig,
+        DataConfig,
+        EngineConfig,
+        GenerationConfig,
+        ModelConfig,
+        SystemConfig,
+        TrainingConfig,
+    )
+    from src.core.diagnostics import (
+        DiagnosticsRunner,
+        check_hardware_and_environment,
+        estimate_vram_budget,
+        print_diagnostic_report,
+    )
+    from src.core.exceptions import (
+        AIEngineError,
+        CheckpointCorruptedError,
+        CheckpointError,
+        CheckpointNotFoundError,
+        ConfigFileNotFoundError,
+        ConfigurationError,
+        ConfigValidationError,
+        ContextLengthExceededError,
+        CudaUnavailableError,
+        DataPipelineError,
+        DatasetEmptyError,
+        DiagnosticError,
+        ErrorCode,
+        ErrorSeverity,
+        GenerationError,
+        GeneratorBackendNotFoundError,
+        HardwareError,
+        ModelArchitectureError,
+        ModelNotFoundError,
+        OutOfMemoryError,
+        ProtocolError,
+        ProtocolViolationError,
+        SamplingError,
+        SignatureMismatchError,
+        TrainingDivergedError,
+        TrainingError,
+        VocabularyMissingError,
+        VRAMBudgetExceededError,
+    )
+    from src.core.logging import (
+        LogContext,
+        MetricLogger,
+        get_logger,
+        get_metric_logger,
+        setup_logger,
+    )
 
 _EXPORTS: Dict[str, Tuple[str, str]] = {
     # Exceptions & codes

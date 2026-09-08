@@ -289,3 +289,26 @@ def test_engine_config_rejects_non_mapping_domain_as_configuration_error() -> No
 def test_engine_config_normalizes_invalid_scalar_field_type() -> None:
     with pytest.raises(ConfigurationError, match="training.precision"):
         EngineConfig.from_dict({"training": {"precision": 1}})  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("rope_theta", [0, -1, "bad", True, float("nan"), float("inf")])
+def test_llama_rope_theta_must_be_positive_finite_number(rope_theta) -> None:
+    cfg = ModelConfig(name="llama", model_kwargs={"rope_theta": rope_theta})
+
+    with pytest.raises(ConfigurationError, match="rope_theta"):
+        cfg.validate()
+
+
+@pytest.mark.parametrize("norm_eps", [float("nan"), float("inf"), float("-inf")])
+def test_llama_norm_eps_must_be_positive_finite_number(norm_eps) -> None:
+    cfg = ModelConfig(name="llama", model_kwargs={"norm_eps": norm_eps})
+
+    with pytest.raises(ConfigurationError, match="norm_eps"):
+        cfg.validate()
+
+
+def test_training_warmup_may_exceed_short_run_for_quick_checks() -> None:
+    config = TrainingConfig(max_iters=5, warmup_iters=100)
+    config.validate()
+
+    assert config.warmup_iters == 100

@@ -1,30 +1,30 @@
 import { useState, useEffect, useRef, useCallback } from "react";
-import { trainingApi } from "@/entities/training";
+import {
+	isLatestRequest,
+	isNewerTrainingVersion,
+	trainingApi,
+} from "@/entities/training";
 import type {
 	TrainingStatus,
+	TrainingTerminationReason,
 	LossStep,
 	EvalStep,
 	SampleRecord,
 	TrainingConfigForm,
+	TrainingOverrideField,
 	PreflightMemoryInfo,
+	TrainingStateResponse,
+	TrainingStreamEvent,
 } from "@/entities/training";
-
-function numberOrDefault(value: unknown, fallback: number): number {
-	if (value === null || value === undefined || value === "") return fallback;
-	const parsed = Number(value);
-	return Number.isFinite(parsed) ? parsed : fallback;
-}
-
-function optionalNumber(value: unknown): number | null {
-	if (value === null || value === undefined || value === "") return null;
-	const parsed = Number(value);
-	return Number.isFinite(parsed) ? parsed : null;
-}
+import { buildTrainingOverrides } from "@/entities/training";
 
 export function useTrainingControls() {
 	const [status, setStatus] = useState<TrainingStatus>("IDLE");
+	const [terminationReason, setTerminationReason] =
+		useState<TrainingTerminationReason>(null);
+	const [errorMessage, setErrorMessage] = useState<string | null>(null);
 	const [currentStep, setCurrentStep] = useState(0);
-	const [maxIters, setMaxIters] = useState(3000);
+	const [maxIters, setMaxIters] = useState(0);
 	const [currentLoss, setCurrentLoss] = useState<number | null>(null);
 	const [currentValLoss, setCurrentValLoss] = useState<number | null>(null);
 	const [currentLr, setCurrentLr] = useState<number | null>(null);
@@ -36,107 +36,60 @@ export function useTrainingControls() {
 		useState<PreflightMemoryInfo | null>(null);
 
 	const eventSourceRef = useRef<EventSource | null>(null);
+	const versionRef = useRef({ runId: -1, sequence: -1 });
+	const preflightRequestRef = useRef(0);
 
-	const resetMetrics = useCallback(() => {
-		setCurrentStep(0);
-		setCurrentLoss(null);
-		setCurrentValLoss(null);
-		setCurrentLr(null);
-		setLastSampleText("");
-		setHistorySteps([]);
-		setHistoryEvals([]);
-		setSampleHistory([]);
+	const applySnapshot = useCallback((data: TrainingStateResponse) => {
+		const previous = versionRef.current;
+		if (
+			!isNewerTrainingVersion(
+				{ runId: data.run_id, sequence: data.sequence },
+				previous,
+			)
+		) {
+			return false;
+		}
+
+		versionRef.current = { runId: data.run_id, sequence: data.sequence };
+		setStatus(data.status);
+		setTerminationReason(data.termination_reason ?? null);
+		setErrorMessage(data.error_message ?? null);
+		setCurrentStep(data.current_step ?? 0);
+		setMaxIters(data.max_iters ?? 0);
+		setCurrentLoss(data.current_loss ?? null);
+		setCurrentValLoss(data.current_val_loss ?? null);
+		setCurrentLr(data.current_lr ?? null);
+		setLastSampleText(data.last_sample_text ?? "");
+		setHistorySteps(data.history_steps ?? []);
+		setHistoryEvals(data.history_evals ?? []);
+		setSampleHistory(data.sample_history ?? []);
+		return true;
 	}, []);
 
-	// Đồng bộ trạng thái từ server (với cơ chế chống giật số liệu khi đang huấn luyện)
+	const acceptDelta = useCallback((runId: number, sequence: number) => {
+		const previous = versionRef.current;
+		if (!isNewerTrainingVersion({ runId, sequence }, previous)) {
+			return { accepted: false, newRun: false };
+		}
+		const newRun = runId > previous.runId;
+		versionRef.current = { runId, sequence };
+		return { accepted: true, newRun };
+	}, []);
+
 	const syncStatus = useCallback(async () => {
 		try {
 			const data = await trainingApi.getTrainingStatus();
-			if (!data) return;
-			setStatus(data.status || "IDLE");
-			if (data.max_iters) setMaxIters(data.max_iters);
-
-			// Nếu đã dừng hoặc IDLE và số bước bằng 0, xóa sạch số liệu
-			if (data.status === "STOPPED" || data.status === "IDLE") {
-				if (!data.current_step || data.current_step === 0) {
-					resetMetrics();
-					return;
-				}
-			}
-
-			// Chống giật lùi (anti-jitter) khi đang RUNNING:
-			// Nếu SSE stream đang phát theo thời gian thực, HTTP polling có thể bị trễ.
-			// Không bao giờ ghi đè giật lùi currentStep, currentLoss hay historySteps.
-			setCurrentStep((prev) => {
-				const polledStep = data.current_step || 0;
-				if (data.status === "RUNNING" && prev > polledStep) {
-					return prev;
-				}
-				return polledStep;
-			});
-
-			setCurrentLoss((prev) => {
-				if (data.status === "RUNNING" && prev !== null) {
-					return prev;
-				}
-				return data.current_loss ?? null;
-			});
-
-			setCurrentValLoss(data.current_val_loss ?? null);
-
-			setCurrentLr((prev) => {
-				if (data.status === "RUNNING" && prev !== null) {
-					return prev;
-				}
-				return data.current_lr ?? null;
-			});
-
-			if (data.last_sample_text) setLastSampleText(data.last_sample_text);
-			if (data.sample_history && data.sample_history.length > 0) {
-				setSampleHistory((prev) =>
-					prev.length > data.sample_history!.length
-						? prev
-						: data.sample_history!,
-				);
-			} else if (data.status === "STOPPED" || data.status === "IDLE") {
-				setSampleHistory([]);
-			}
-			if (data.history_steps && data.history_steps.length > 0) {
-				setHistorySteps((prev) => {
-					if (
-						data.status === "RUNNING" &&
-						prev.length > data.history_steps!.length
-					) {
-						return prev;
-					}
-					return data.history_steps!;
-				});
-			} else if (data.status === "STOPPED" || data.status === "IDLE") {
-				setHistorySteps([]);
-			}
-			if (data.history_evals && data.history_evals.length > 0) {
-				setHistoryEvals((prev) =>
-					prev.length > data.history_evals!.length
-						? prev
-						: data.history_evals!,
-				);
-			} else if (data.status === "STOPPED" || data.status === "IDLE") {
-				setHistoryEvals([]);
-			}
+			applySnapshot(data);
 		} catch (err) {
 			console.warn("Lỗi sync training status:", err);
 		}
-	}, [resetMetrics]);
+	}, [applySnapshot]);
 
-	// Kết nối SSE Stream & Polling fallback
 	useEffect(() => {
 		let isMounted = true;
+		let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 
-		const init = async () => {
-			if (!isMounted) return;
-			await syncStatus();
-		};
-		init();
+		void syncStatus();
 
 		const connectSSE = () => {
 			if (!isMounted) return;
@@ -147,47 +100,54 @@ export function useTrainingControls() {
 				es.onmessage = (event) => {
 					if (!isMounted) return;
 					try {
-						const data = JSON.parse(event.data);
+						const data = JSON.parse(event.data) as TrainingStreamEvent;
+						if (data.type === "init" || data.type === "status") {
+							applySnapshot(data);
+							return;
+						}
+
+						const accepted = acceptDelta(data.run_id, data.sequence);
+						if (!accepted.accepted) return;
+						if (accepted.newRun) {
+							setTerminationReason(null);
+							setErrorMessage(null);
+							setCurrentStep(0);
+							setCurrentLoss(null);
+							setCurrentValLoss(null);
+							setCurrentLr(null);
+							setLastSampleText("");
+							setHistorySteps([]);
+							setHistoryEvals([]);
+							setSampleHistory([]);
+						}
+
 						if (data.type === "step") {
 							setCurrentStep(data.step);
 							setCurrentLoss(data.loss);
 							setCurrentLr(data.lr);
-							setHistorySteps((prev) => {
-								const next = [...prev, data];
-								return next.length > 500
-									? next.slice(-500)
-									: next;
-							});
+							setHistorySteps((prev) => [...prev, data].slice(-3000));
 						} else if (data.type === "eval") {
 							setCurrentStep(data.step);
 							setCurrentValLoss(data.val_loss);
-							setHistoryEvals((prev) => [...prev, data]);
+							setCurrentLr(data.lr);
+							setHistoryEvals((prev) => [...prev, data].slice(-1000));
 						} else if (data.type === "sample") {
 							setLastSampleText(data.text);
-							setSampleHistory((prev) => [...prev, data]);
-						} else if (data.type === "status") {
-							setStatus(data.status);
-							if (data.max_iters) setMaxIters(data.max_iters);
-							if (
-								data.status === "STOPPED" ||
-								data.status === "IDLE"
-							) {
-								resetMetrics();
-							}
+							setSampleHistory((prev) => [...prev, data].slice(-200));
 						}
 					} catch {
-						// ignore parse error
+						// Ignore malformed third-party/proxy events; REST snapshot repairs gaps.
 					}
 				};
 
 				es.onerror = () => {
 					es.close();
 					if (isMounted) {
-						setTimeout(connectSSE, 3000);
+						reconnectTimer = setTimeout(connectSSE, 3000);
 					}
 				};
 			} catch {
-				// SSE not supported
+				// Polling below remains an authoritative fallback.
 			}
 		};
 
@@ -196,90 +156,58 @@ export function useTrainingControls() {
 
 		return () => {
 			isMounted = false;
+			if (reconnectTimer) clearTimeout(reconnectTimer);
 			if (eventSourceRef.current) {
 				eventSourceRef.current.close();
 				eventSourceRef.current = null;
 			}
 			clearInterval(pollInterval);
 		};
-	}, [syncStatus, resetMetrics]);
+	}, [acceptDelta, applySnapshot, syncStatus]);
 
-	const checkFeasibility = useCallback(async (config: TrainingConfigForm) => {
-		try {
-			const payload = {
-				config_path: config.config_path,
-				batch_size: numberOrDefault(config.batch_size, 64),
-				precision: config.precision,
-				optimizer_type: config.optimizer_type,
-				gradient_checkpointing: Boolean(config.gradient_checkpointing),
-				gradient_accumulation_steps: numberOrDefault(
-					config.gradient_accumulation_steps,
-					1,
-				),
-				model_name: config.model_name || "minigpt",
-				n_layer: optionalNumber(config.n_layer),
-				n_embd: optionalNumber(config.n_embd),
-				n_head: optionalNumber(config.n_head),
-				block_size: optionalNumber(config.block_size),
-			};
-			const res = await trainingApi.checkFeasibility(payload);
-			setPreflightInfo(res);
-			return res;
-		} catch (err) {
-			console.warn("Lỗi kiểm tra tính khả thi:", err);
-			return null;
-		}
-	}, []);
+	const checkFeasibility = useCallback(
+		async (
+			config: TrainingConfigForm,
+			overrideFields: Iterable<TrainingOverrideField> = [],
+		) => {
+			const requestId = ++preflightRequestRef.current;
+			try {
+				const res = await trainingApi.checkFeasibility({
+					config_path: config.config_path,
+					overrides: buildTrainingOverrides(config, overrideFields),
+				});
+				if (!isLatestRequest(requestId, preflightRequestRef.current)) {
+					return null;
+				}
+				setPreflightInfo(res);
+				return res;
+			} catch (err) {
+				if (isLatestRequest(requestId, preflightRequestRef.current)) {
+					console.warn("Lỗi kiểm tra tính khả thi:", err);
+				}
+				return null;
+			}
+		},
+		[],
+	);
 
 	const startTraining = useCallback(
-		async (config: TrainingConfigForm, onDone?: (res: unknown) => void) => {
-			setStatus("STARTING");
-			const payload = {
-				config_path: config.config_path,
-				quick_check: Boolean(config.quick_check),
-				model_name: config.model_name || "minigpt",
-				batch_size: Number(config.batch_size),
-				learning_rate: Number(config.learning_rate),
-				max_iters: Number(config.max_iters),
-				precision: config.precision,
-				optimizer_type: config.optimizer_type,
-				gradient_accumulation_steps: numberOrDefault(
-					config.gradient_accumulation_steps,
-					1,
-				),
-				gradient_checkpointing: Boolean(config.gradient_checkpointing),
-				eval_interval: numberOrDefault(config.eval_interval, 300),
-				eval_iters: numberOrDefault(config.eval_iters, 50),
-				save_last: Boolean(config.save_last),
-				split_ratio: numberOrDefault(config.split_ratio, 0.9),
-				batch_provider_type: config.batch_provider_type || "tensor",
-				n_layer: optionalNumber(config.n_layer),
-				n_embd: optionalNumber(config.n_embd),
-				n_head: optionalNumber(config.n_head),
-				block_size: optionalNumber(config.block_size),
-				dropout: optionalNumber(config.dropout),
-				seed: optionalNumber(config.seed),
-				lr_scheduler_type: config.lr_scheduler_type || "cosine",
-				warmup_iters: numberOrDefault(config.warmup_iters, 100),
-				min_lr: numberOrDefault(config.min_lr, 0.00003),
-				weight_decay: numberOrDefault(config.weight_decay, 0.1),
-				grad_clip: numberOrDefault(config.grad_clip, 1.0),
-				early_stopping_patience: numberOrDefault(
-					config.early_stopping_patience,
-					10,
-				),
-				resume_checkpoint: config.resume_checkpoint || null,
-				run_name: config.run_name?.trim() || null,
-				save_top_k: numberOrDefault(config.save_top_k, 3),
-				cleaner_type: config.cleaner_type || "default",
-				tokenizer_type: config.tokenizer_type || "char",
-			};
-
+		async (
+			config: TrainingConfigForm,
+			overrideFields: Iterable<TrainingOverrideField>,
+			onDone?: (res: unknown) => void,
+		) => {
 			try {
-				const res = await trainingApi.startTraining(payload);
-				if (res?.state?.status) {
-					setStatus(res.state.status as TrainingStatus);
-				}
+				// The start response contains preflight for the exact submitted config;
+				// invalidate any older standalone estimate still in flight.
+				preflightRequestRef.current += 1;
+				const res = await trainingApi.startTraining({
+					config_path: config.config_path,
+					overrides: buildTrainingOverrides(config, overrideFields),
+					resume_checkpoint: config.resume_checkpoint || null,
+				});
+				applySnapshot(res.state);
+				setPreflightInfo(res.preflight);
 				onDone?.(res);
 				return res;
 			} catch (err) {
@@ -287,33 +215,29 @@ export function useTrainingControls() {
 				throw err;
 			}
 		},
-		[syncStatus],
+		[applySnapshot, syncStatus],
 	);
 
 	const stopTraining = useCallback(async () => {
-		setStatus("STOPPING");
 		try {
 			const res = await trainingApi.stopTraining();
-			resetMetrics();
+			await syncStatus();
 			return res;
 		} catch (err) {
 			await syncStatus();
 			throw err;
 		}
-	}, [resetMetrics, syncStatus]);
+	}, [syncStatus]);
 
 	const clearTraining = useCallback(async () => {
-		resetMetrics();
-		setStatus("IDLE");
-		try {
-			await trainingApi.clearTraining();
-		} catch (err) {
-			console.warn("Lỗi khi gọi clear training:", err);
-		}
-	}, [resetMetrics]);
+		await trainingApi.clearTraining();
+		await syncStatus();
+	}, [syncStatus]);
 
 	return {
 		status,
+		terminationReason,
+		errorMessage,
 		currentStep,
 		maxIters,
 		currentLoss,
@@ -328,7 +252,6 @@ export function useTrainingControls() {
 		startTraining,
 		stopTraining,
 		clearTraining,
-		resetMetrics,
 		syncStatus,
 	};
 }

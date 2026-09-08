@@ -395,3 +395,49 @@ def test_checkpoint_callback_drops_missing_top_k_paths_when_restoring(tmp_path) 
     )
 
     assert cb.top_k_checkpoints == [(0.5, str(existing))]
+
+
+def test_model_checkpoint_train_end_does_not_rewrite_same_final_eval(monkeypatch, tmp_path) -> None:
+    """Final eval already persisted last checkpoint; train end must not write it twice."""
+    writes: list[str] = []
+
+    def fake_atomic_save(state: Dict[str, object], path: str) -> None:
+        writes.append(path)
+
+    monkeypatch.setattr("src.training.callbacks.checkpoint._atomic_torch_save", fake_atomic_save)
+    cb = ModelCheckpointCallback(
+        save_dir=str(tmp_path),
+        filename="best.pt",
+        save_top_k=0,
+        save_last=True,
+    )
+    trainer = DummyTrainer()
+    cb.on_train_begin(trainer)
+    cb.on_step_end(trainer, step=20, loss=1.0)
+    cb.on_eval_end(trainer, step=20, metrics={"val_loss": 1.0})
+    writes_after_eval = list(writes)
+
+    cb.on_train_end(trainer)
+
+    assert writes == writes_after_eval
+
+
+def test_model_checkpoint_final_eval_without_monitor_still_persists_last(tmp_path) -> None:
+    """save_last is lifecycle persistence and must not depend on the monitored metric."""
+    cb = ModelCheckpointCallback(
+        save_dir=str(tmp_path),
+        filename="best.pt",
+        monitor="val_loss",
+        save_top_k=0,
+        save_last=True,
+    )
+    trainer = DummyTrainer()
+    cb.on_train_begin(trainer)
+    cb.on_step_end(trainer, step=20, loss=1.0)
+
+    cb.on_eval_end(trainer, step=20, metrics={"train_loss": 1.0})
+    cb.on_train_end(trainer)
+
+    state = torch.load(tmp_path / "last_model.pt", weights_only=True)
+    assert state["step"] == 20
+    assert state["metrics"] == {"train_loss": 1.0}

@@ -332,7 +332,7 @@ def test_training_start_reuses_preflight_runtime_plan_for_worker() -> None:
     ):
         response = local_client.post(
             "/api/training/start",
-            json={"config_path": "unused.yaml", "run_name": "runtime_plan_test"},
+            json={"config_path": "configs/unused.yaml", "run_name": "runtime_plan_test"},
         )
 
     assert response.status_code == 200
@@ -354,6 +354,7 @@ def test_ui_check_feasibility(client: TestClient):
     assert "feasible" in data
     assert "estimated_gb" in data
     assert "estimated_mb" in data
+    assert data["advisory"] is True
 
 
 def test_ui_compare_tokenizers(client: TestClient):
@@ -818,3 +819,134 @@ def test_ui_diagnostics_estimate_honors_llama_memory_profile(client: TestClient)
     data = response.json()
     assert data["model_name"] == "llama"
     assert data["total_parameters"] == 688_704
+
+
+def test_training_start_accepts_canonical_dotted_overrides_without_schema_copy():
+    from unittest.mock import Mock, patch
+
+    from src.core.config import EngineConfig
+    from src.core.runtime import RuntimeCapabilities, resolve_training_plan
+    from src.ui.app import create_app
+
+    config = EngineConfig().copy(system=EngineConfig().system.copy(device="cpu"))
+    runtime_plan = resolve_training_plan(
+        config,
+        capabilities=RuntimeCapabilities(
+            cuda_available=False,
+            mps_available=False,
+            bf16_supported=False,
+            bitsandbytes_available=False,
+        ),
+    )
+    app = create_app()
+    start_mock = Mock()
+    app.state.training_service.start_training = start_mock
+
+    with (
+        patch("src.core.config.EngineConfig.from_yaml", return_value=config) as config_mock,
+        patch("src.core.runtime.resolve_training_plan", return_value=runtime_plan),
+        TestClient(app) as local_client,
+    ):
+        response = local_client.post(
+            "/api/training/start",
+            json={
+                "config_path": "configs/unused.yaml",
+                "overrides": {
+                    "training.optimizer_type": "sgd",
+                    "training.batch_size": 7,
+                    "model.n_layer": 3,
+                },
+                "run_name": "compat_name",
+            },
+        )
+
+    assert response.status_code == 200
+    passed_overrides = start_mock.call_args.kwargs["overrides"]
+    assert "training.optimizer_type=sgd" in passed_overrides
+    assert "training.batch_size=7" in passed_overrides
+    assert "model.n_layer=3" in passed_overrides
+    # Legacy top-level fields are translated by the same compatibility table.
+    assert "training.run_name=compat_name" in passed_overrides
+    assert config_mock.call_args.kwargs["overrides"] == passed_overrides
+
+
+def test_training_start_rejects_unknown_canonical_override_key_before_worker_start():
+    from unittest.mock import Mock
+
+    from src.ui.app import create_app
+
+    app = create_app()
+    start_mock = Mock()
+    app.state.training_service.start_training = start_mock
+
+    with TestClient(app) as local_client:
+        response = local_client.post(
+            "/api/training/start",
+            json={"overrides": {"training.typo_learning_rate": 0.1}},
+        )
+
+    assert response.status_code == 400
+    start_mock.assert_not_called()
+
+
+def test_training_config_endpoint_exposes_canonical_engine_config(client: TestClient):
+    response = client.get(
+        "/api/training/config",
+        params={"path": "configs/truyen_kieu.yaml"},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["model"]["name"] in {"minigpt", "llama", "llama_nano"}
+    assert payload["training"]["optimizer_type"] in {"adamw", "8bit_adamw", "sgd"}
+    assert isinstance(payload["training"]["batch_size"], int)
+
+
+def test_training_start_rejects_unknown_legacy_top_level_override(client: TestClient):
+    response = client.post(
+        "/api/training/start",
+        json={"learning_rtae": 0.01},
+    )
+
+    assert response.status_code == 400
+    assert "learning_rtae" in response.json()["detail"]
+
+
+def test_ui_training_config_endpoint_rejects_path_escape(client: TestClient):
+    response = client.get("/api/training/config", params={"path": "../pyproject.toml"})
+    assert response.status_code == 400
+    payload = response.json()
+    assert "configs" in payload.get("detail", payload.get("message", ""))
+
+
+def test_ui_training_feasibility_rejects_config_path_escape(client: TestClient):
+    response = client.post(
+        "/api/training/check-feasibility",
+        json={"config_path": "../pyproject.toml"},
+    )
+    assert response.status_code == 400
+    payload = response.json()
+    assert "configs" in payload.get("detail", payload.get("message", ""))
+
+
+def test_ui_training_resume_rejects_checkpoint_outside_configured_dir(
+    client: TestClient, tmp_path, monkeypatch
+):
+    outside = tmp_path / "outside.pt"
+    outside.write_bytes(b"checkpoint")
+    training_service = _app_state(client).training_service
+    start_calls = []
+    monkeypatch.setattr(
+        training_service,
+        "start_training",
+        lambda *args, **kwargs: start_calls.append((args, kwargs)),
+    )
+
+    response = client.post(
+        "/api/training/start",
+        json={"resume_checkpoint": str(outside)},
+    )
+
+    assert response.status_code == 400
+    assert "checkpoint_dir" in response.json()["detail"]
+    assert start_calls == []

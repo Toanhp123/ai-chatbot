@@ -11,24 +11,20 @@ from pydantic import BaseModel, Field
 
 from src.core.config import GenerationConfig
 from src.core.exceptions import AIEngineError, GeneratorBackendNotFoundError
+from src.ui.path_policy import resolve_path_within_root
 
 router = APIRouter(prefix="/api", tags=["Inference"])
 
 
 def _resolve_config_path(path: str) -> str:
     """Normalize a config path and ensure it stays inside the real configs/ directory."""
-    base_dir = os.path.realpath(os.path.abspath("configs"))
-    norm_path = os.path.normpath(path)
-    candidate = os.path.realpath(os.path.abspath(norm_path))
     try:
-        if os.path.commonpath([base_dir, candidate]) != base_dir:
-            raise ValueError
-    except ValueError:
+        return resolve_path_within_root(path, "configs")
+    except ValueError as exc:
         raise HTTPException(
             status_code=400,
             detail="Chỉ cho phép truy cập các file cấu hình trong thư mục configs/",
-        )
-    return candidate
+        ) from exc
 
 
 class GenerateRequest(BaseModel):

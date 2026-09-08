@@ -455,3 +455,122 @@ def test_evaluate_restores_previous_model_mode() -> None:
     trainer.evaluate()
 
     assert model.training is False
+
+
+def test_early_stopping_has_distinct_non_interrupted_termination_reason(monkeypatch) -> None:
+    from src.training.callbacks import EarlyStoppingCallback
+    from src.training.trainer import TrainingTerminationReason
+
+    config = EngineConfig()
+    config.model.vocab_size = 20
+    config.model.block_size = 8
+    config.model.n_embd = 16
+    config.model.n_head = 2
+    config.model.n_layer = 1
+    config.training.batch_size = 2
+    config.training.max_iters = 5
+    config.training.eval_interval = 1
+    config.training.eval_iters = 1
+    model = ModelRegistry.create("minigpt", config.model)
+    provider = MockBatchProvider(config.model.vocab_size)
+    trainer = Trainer(
+        model=model,
+        batch_provider=provider,
+        config=config,
+        callbacks=[EarlyStoppingCallback(patience=1)],
+        device="cpu",
+    )
+    metrics = iter(
+        [
+            {"train_loss": 1.0, "val_loss": 1.0},
+            {"train_loss": 1.1, "val_loss": 1.1},
+        ]
+    )
+    monkeypatch.setattr(trainer, "evaluate", lambda: next(metrics))
+
+    output = trainer.train()
+
+    assert output.global_step == 2
+    assert output.termination_reason is TrainingTerminationReason.EARLY_STOPPED
+    assert output.interrupted is False
+
+
+def test_trainer_hot_path_does_not_run_per_parameter_gradient_inspector(monkeypatch) -> None:
+    import src.training.trainer as trainer_module
+
+    def forbidden_gradient_scan(*args, **kwargs):
+        raise AssertionError("per-parameter gradient inspector must not run in the hot path")
+
+    monkeypatch.setattr(
+        trainer_module,
+        "check_model_gradients",
+        forbidden_gradient_scan,
+        raising=False,
+    )
+    config = EngineConfig()
+    config.model.vocab_size = 20
+    config.model.block_size = 8
+    config.model.n_embd = 16
+    config.model.n_head = 2
+    config.model.n_layer = 1
+    config.training.batch_size = 2
+    config.training.max_iters = 1
+    config.training.eval_interval = 1
+    config.training.eval_iters = 1
+    model = ModelRegistry.create("minigpt", config.model)
+    trainer = Trainer(
+        model=model,
+        batch_provider=MockBatchProvider(config.model.vocab_size),
+        config=config,
+        device="cpu",
+    )
+
+    output = trainer.train()
+
+    assert output.global_step == 1
+
+
+def test_gradient_accumulation_reads_loss_scalar_once_per_optimizer_step(monkeypatch) -> None:
+    """Gradient accumulation must not synchronize device loss once per microbatch."""
+    config = EngineConfig()
+    config.model.vocab_size = 20
+    config.model.block_size = 8
+    config.model.n_embd = 16
+    config.model.n_head = 2
+    config.model.n_layer = 1
+    config.model.dropout = 0.0
+    config.training.batch_size = 2
+    config.training.max_iters = 1
+    config.training.eval_interval = 99
+    config.training.eval_iters = 1
+    config.training.gradient_accumulation_steps = 3
+
+    model = ModelRegistry.create("minigpt", config.model)
+    provider = MockBatchProvider(config.model.vocab_size)
+    optimizer = torch.optim.SGD(model.parameters(), lr=config.training.learning_rate)
+    trainer = Trainer(
+        model=model,
+        batch_provider=provider,
+        config=config,
+        optimizer=optimizer,
+        device="cpu",
+    )
+    monkeypatch.setattr(
+        trainer,
+        "evaluate",
+        lambda: {"train_loss": 1.0, "val_loss": 1.0},
+    )
+
+    original_item = torch.Tensor.item
+    item_calls = 0
+
+    def counted_item(tensor, *args, **kwargs):
+        nonlocal item_calls
+        item_calls += 1
+        return original_item(tensor, *args, **kwargs)
+
+    monkeypatch.setattr(torch.Tensor, "item", counted_item)
+
+    trainer.train()
+
+    assert item_calls == 1

@@ -12,15 +12,20 @@ import {
 } from "@/shared/ui";
 import type {
 	TrainingConfigForm,
+	TrainingOverrideField,
 	PreflightMemoryInfo,
 } from "@/entities/training";
 import { Sliders, ShieldCheck, Loader2 } from "lucide-react";
 
 export interface TrainingConfigFormWidgetProps {
 	form: TrainingConfigForm;
-	onFormChange: (updated: TrainingConfigForm) => void;
+	onFormChange: (
+		updated: TrainingConfigForm,
+		changedField?: TrainingOverrideField,
+	) => void;
 	onCheckFeasibility: (
 		config: TrainingConfigForm,
+		changedField?: TrainingOverrideField,
 	) => Promise<PreflightMemoryInfo | null> | void;
 	preflightInfo?: PreflightMemoryInfo | null;
 }
@@ -31,15 +36,15 @@ export const TrainingConfigFormWidget: React.FC<
 	const { toast } = useToast();
 	const [isChecking, setIsChecking] = useState(false);
 
-	const updateField = <K extends keyof TrainingConfigForm>(
+	const updateField = <K extends TrainingOverrideField>(
 		key: K,
 		value: TrainingConfigForm[K],
 		triggerCheck = false,
 	) => {
 		const updated = { ...form, [key]: value };
-		onFormChange(updated);
+		onFormChange(updated, key);
 		if (triggerCheck) {
-			onCheckFeasibility(updated);
+			onCheckFeasibility(updated, key);
 		}
 	};
 
@@ -50,12 +55,12 @@ export const TrainingConfigFormWidget: React.FC<
 			if (res) {
 				if (res.feasible) {
 					toast(
-						`VRAM Khả Thi: Dự kiến đỉnh ~${res.estimated_gb?.toFixed(2)} GB (${res.estimated_mb?.toFixed(0)} MB) VRAM. An toàn để huấn luyện!`,
+						`Ước tính VRAM: Dự kiến đỉnh ~${res.estimated_gb?.toFixed(2)} GB (${res.estimated_mb?.toFixed(0)} MB). Đây là ước tính tham khảo trước khi tokenizer runtime được chốt.`,
 						"success",
 					);
 				} else {
 					toast(
-						`Cảnh báo OOM: Dự kiến đỉnh ~${res.estimated_gb?.toFixed(2)} GB vượt quá VRAM khả dụng. Hãy giảm Batch Size hoặc bật Gradient Checkpointing!`,
+						`Cảnh báo VRAM (ước tính): Dự kiến đỉnh ~${res.estimated_gb?.toFixed(2)} GB vượt ngân sách hiện tại. Hãy giảm Batch Size hoặc bật Gradient Checkpointing trước khi chạy.`,
 						"warning",
 					);
 				}
@@ -90,7 +95,7 @@ export const TrainingConfigFormWidget: React.FC<
 						onClick={handleManualCheck}
 						disabled={isChecking}
 						className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-[#f4f3ed] hover:bg-stone-200/80 border border-stone-300/80 text-[11px] text-stone-800 font-medium transition-all shadow-warm-sm disabled:opacity-60"
-						title="Ước tính và kiểm tra tính khả thi bộ nhớ GPU trước khi huấn luyện"
+						title="Ước tính tham khảo bộ nhớ GPU trước khi tokenizer runtime được chốt"
 					>
 						{isChecking ? (
 							<Loader2 className="w-3 h-3 text-amber-700 animate-spin" />
@@ -225,9 +230,9 @@ export const TrainingConfigFormWidget: React.FC<
 								description: "Weight Decay chuẩn (Khuyên dùng)",
 							},
 							{
-								value: "adam",
-								label: "Adam",
-								description: "Adaptive Moments",
+								value: "8bit_adamw",
+								label: "8-bit AdamW",
+								description: "Giảm bộ nhớ optimizer (cần bitsandbytes)",
 							},
 							{
 								value: "sgd",

@@ -117,22 +117,28 @@ def compute_scheduled_lr(step: int, config: TrainingConfig) -> float:
       - "cosine": Giảm dần theo Cosine Annealing về min_lr (mặc định).
     - Guard triệt tiêu hoàn toàn nguy cơ ZeroDivisionError khi max_iters == warmup_iters.
     """
-    # 1. Giai đoạn Linear Warmup
-    if config.warmup_iters > 0 and step < config.warmup_iters:
-        return config.learning_rate * (step + 1) / config.warmup_iters
+    # 1. Giai đoạn Linear Warmup. Short smoke/quick runs may intentionally
+    # lower max_iters below the configured warmup; bound the effective warmup
+    # to the run length instead of leaving the whole run at a tiny LR.
+    effective_warmup = min(config.warmup_iters, config.max_iters)
+    if effective_warmup > 0 and step < effective_warmup:
+        return config.learning_rate * (step + 1) / effective_warmup
 
-    # 2. Giai đoạn vượt ngưỡng max_iters
-    if step > config.max_iters:
-        return config.min_lr
-
-    # 3. Giai đoạn Decay
+    # 2. Giai đoạn Decay. Training steps use zero-based update indices
+    # [0, max_iters - 1], so the final optimizer update must already reach min_lr.
     scheduler_type = config.lr_scheduler_type.lower().strip()
     if scheduler_type == "constant":
         return config.learning_rate
 
-    # Guard an toàn chống chia cho 0
-    denom = max(1, config.max_iters - config.warmup_iters)
-    decay_ratio = min(1.0, max(0.0, float(step - config.warmup_iters) / float(denom)))
+    if effective_warmup < config.max_iters and step >= config.max_iters - 1:
+        return config.min_lr
+
+    # Preserve the public scheduler curve (which is defined over [0, max_iters])
+    # for all interior points. The zero-based trainer loop has one fewer index, so
+    # the final update is handled explicitly above instead of compressing the
+    # entire decay curve and changing historical midpoint values.
+    denom = max(1, config.max_iters - effective_warmup)
+    decay_ratio = min(1.0, max(0.0, float(step - effective_warmup) / float(denom)))
 
     if scheduler_type == "linear":
         return config.min_lr + (1.0 - decay_ratio) * (config.learning_rate - config.min_lr)

@@ -2,132 +2,185 @@
 Training API Routes: Bắt đầu, dừng và truyền dữ liệu biểu đồ huấn luyện thời gian thực qua SSE.
 """
 
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from src.core.exceptions import AIEngineError
+from src.ui.path_policy import resolve_path_within_root
 
 router = APIRouter(prefix="/api/training", tags=["Training"])
 
 
-class StartTrainingRequest(BaseModel):
+def _resolve_training_config_path(path: str) -> str:
+    try:
+        return resolve_path_within_root(path, "configs")
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail="Chỉ cho phép dùng file cấu hình trong thư mục configs/",
+        ) from exc
+
+
+def _resolve_resume_checkpoint(path: str, checkpoint_dir: str) -> str:
+    try:
+        return resolve_path_within_root(
+            path,
+            checkpoint_dir,
+            bare_name_in_root=True,
+        )
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail="Checkpoint resume phải nằm bên trong checkpoint_dir đã cấu hình.",
+        ) from exc
+
+
+class TrainingConfigRequest(BaseModel):
+    """Canonical config envelope shared by training planning endpoints.
+
+    New clients send dotted ``overrides``. ``extra=allow`` keeps historical
+    flat override fields readable through one compatibility table.
+    """
+
+    model_config = ConfigDict(extra="allow")
+
     config_path: str = Field(
         default="configs/truyen_kieu.yaml", description="Đường dẫn file cấu hình YAML"
     )
+    overrides: Dict[str, Any] = Field(
+        default_factory=dict,
+        description="Canonical EngineConfig overrides in dotted-path form.",
+    )
+
+
+class StartTrainingRequest(TrainingConfigRequest):
+    """Training start command plus lifecycle-only options."""
+
     quick_check: bool = Field(
         default=False, description="Chạy thử nghiệm 50 bước kiểm tra pipeline"
-    )
-    batch_size: Optional[int] = Field(default=None, description="Ghi đè batch size")
-    learning_rate: Optional[float] = Field(default=None, description="Ghi đè learning rate")
-    max_iters: Optional[int] = Field(default=None, description="Ghi đè số bước tối đa")
-    precision: Optional[str] = Field(
-        default=None, description="Độ chính xác: float32, amp_fp16, amp_bf16"
-    )
-    optimizer_type: Optional[str] = Field(
-        default=None, description="Loại optimizer: adamw, 8bit_adamw, sgd"
-    )
-    gradient_accumulation_steps: Optional[int] = Field(
-        default=None, description="Số bước tích lũy gradient"
     )
     resume_checkpoint: Optional[str] = Field(
         default=None, description="Đường dẫn file checkpoint để tiếp tục huấn luyện"
     )
-    run_name: Optional[str] = Field(
-        default=None, description="Tên phiên huấn luyện (prefix đặt tên checkpoint)"
-    )
-    save_top_k: Optional[int] = Field(
-        default=None, description="Số lượng checkpoint tốt nhất cần lưu giữ"
-    )
-    model_name: Optional[str] = Field(
-        default=None, description="Tên kiến trúc mô hình: minigpt hoặc llama"
-    )
-    lr_scheduler_type: Optional[str] = Field(
-        default=None, description="Loại scheduler: cosine, linear, constant"
-    )
-    warmup_iters: Optional[int] = Field(default=None, description="Số bước khởi động warmup")
-    min_lr: Optional[float] = Field(default=None, description="Tốc độ học tối thiểu")
-    weight_decay: Optional[float] = Field(default=None, description="Hệ số suy giảm trọng số")
-    grad_clip: Optional[float] = Field(default=None, description="Ngưỡng cắt tỉa gradient")
-    early_stopping_patience: Optional[int] = Field(
-        default=None, description="Số lần eval không cải thiện trước khi dừng sớm"
-    )
-    cleaner_type: Optional[str] = Field(
-        default=None, description="Loại cleaner dữ liệu: default, gemini, passthrough"
-    )
-    tokenizer_type: Optional[str] = Field(
-        default=None, description="Loại tokenizer: char, byte; gemini là alias legacy của byte"
-    )
-    gradient_checkpointing: Optional[bool] = Field(
-        default=None, description="Bật gradient checkpointing (giảm 70% VRAM)"
-    )
-    eval_interval: Optional[int] = Field(default=None, description="Chu kỳ bước đánh giá loss")
-    eval_iters: Optional[int] = Field(default=None, description="Số batch lấy mẫu khi đánh giá")
-    save_last: Optional[bool] = Field(
-        default=None, description="Lưu checkpoint cuối cùng last_model.pt"
-    )
-    split_ratio: Optional[float] = Field(
-        default=None, description="Tỉ lệ chia tập train/val (0.0 - 1.0)"
-    )
-    batch_provider_type: Optional[str] = Field(
-        default=None, description="Loại batch provider: tensor hoặc dataloader"
-    )
-    n_layer: Optional[int] = Field(default=None, description="Số tầng Transformer")
-    n_embd: Optional[int] = Field(default=None, description="Kích thước vector embedding")
-    n_head: Optional[int] = Field(default=None, description="Số attention heads")
-    dropout: Optional[float] = Field(default=None, description="Hệ số dropout chống overfitting")
-    block_size: Optional[int] = Field(
-        default=None, description="Độ dài ngữ cảnh tối đa (context window)"
-    )
-    seed: Optional[int] = Field(default=None, description="Hạt giống ngẫu nhiên (seed)")
 
 
-class CheckFeasibilityRequest(BaseModel):
-    config_path: str = Field(default="configs/truyen_kieu.yaml")
-    batch_size: Optional[int] = None
-    precision: Optional[str] = None
-    optimizer_type: Optional[str] = None
-    gradient_checkpointing: Optional[bool] = None
-    gradient_accumulation_steps: Optional[int] = None
-    model_name: Optional[str] = None
-    n_layer: Optional[int] = None
-    n_embd: Optional[int] = None
-    n_head: Optional[int] = None
-    block_size: Optional[int] = None
+class CheckFeasibilityRequest(TrainingConfigRequest):
+    """Feasibility accepts config overrides without lifecycle-only start fields."""
+
+
+_LEGACY_OVERRIDE_PATHS = {
+    "model_name": "model.name",
+    "cleaner_type": "data.cleaner_type",
+    "tokenizer_type": "data.tokenizer_type",
+    "batch_size": "training.batch_size",
+    "learning_rate": "training.learning_rate",
+    "max_iters": "training.max_iters",
+    "precision": "training.precision",
+    "optimizer_type": "training.optimizer_type",
+    "gradient_accumulation_steps": "training.gradient_accumulation_steps",
+    "gradient_checkpointing": "training.gradient_checkpointing",
+    "eval_interval": "training.eval_interval",
+    "eval_iters": "training.eval_iters",
+    "save_last": "training.save_last",
+    "split_ratio": "data.split_ratio",
+    "batch_provider_type": "data.batch_provider_type",
+    "n_layer": "model.n_layer",
+    "n_embd": "model.n_embd",
+    "n_head": "model.n_head",
+    "dropout": "model.dropout",
+    "lr_scheduler_type": "training.lr_scheduler_type",
+    "warmup_iters": "training.warmup_iters",
+    "min_lr": "training.min_lr",
+    "weight_decay": "training.weight_decay",
+    "grad_clip": "training.grad_clip",
+    "early_stopping_patience": "training.early_stopping_patience",
+    "run_name": "training.run_name",
+    "save_top_k": "training.save_top_k",
+    "block_size": "model.block_size",
+    "seed": "system.seed",
+}
+
+
+def _canonical_override_paths() -> set[str]:
+    from src.core.config import EngineConfig
+
+    result: set[str] = set()
+    raw = EngineConfig().to_dict()
+    for domain in ("system", "data", "model", "training"):
+        values = raw.get(domain, {})
+        if isinstance(values, dict):
+            result.update(f"{domain}.{key}" for key in values)
+    return result
+
+
+_CANONICAL_OVERRIDE_PATHS = _canonical_override_paths()
+
+
+def _override_value(value: Any) -> str:
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if value is None or isinstance(value, (dict, list, tuple, set)):
+        raise ValueError("Training override chỉ hỗ trợ scalar khác null.")
+    return str(value)
+
+
+def _build_overrides(req: TrainingConfigRequest, *, auto_run_name: bool = False) -> List[str]:
+    extras = req.model_extra or {}
+    ignored_legacy_envelope_fields = {"quick_check", "resume_checkpoint"}
+    unknown_legacy = sorted(
+        set(extras) - set(_LEGACY_OVERRIDE_PATHS) - ignored_legacy_envelope_fields
+    )
+    if unknown_legacy:
+        raise ValueError("Training override top-level không hợp lệ: " + ", ".join(unknown_legacy))
+
+    values: Dict[str, Any] = {}
+    for field_name, path in _LEGACY_OVERRIDE_PATHS.items():
+        value = getattr(req, field_name, None)
+        if isinstance(value, str):
+            value = value.strip()
+            if not value:
+                continue
+            if path in {
+                "model.name",
+                "data.cleaner_type",
+                "data.tokenizer_type",
+                "data.batch_provider_type",
+                "training.lr_scheduler_type",
+            }:
+                value = value.lower()
+        if value is not None:
+            values[path] = value
+
+    for path, value in req.overrides.items():
+        if path not in _CANONICAL_OVERRIDE_PATHS:
+            raise ValueError(f"Training override key không hợp lệ: '{path}'.")
+        values[path] = value
+
+    if auto_run_name and "training.run_name" not in values:
+        import time
+
+        values["training.run_name"] = f"kieu_{time.strftime('%Y%m%d_%H%M%S')}"
+
+    return [f"{path}={_override_value(value)}" for path, value in values.items()]
 
 
 @router.post("/check-feasibility")
 async def check_feasibility_endpoint(req: CheckFeasibilityRequest):
-    """Kiểm tra tính khả thi của bộ nhớ VRAM trước khi huấn luyện để chủ động phòng tránh lỗi OOM."""
+    """Ước tính VRAM trước training; đây là advisory vì runtime tokenizer có thể đổi vocab size."""
     from src.core.config import EngineConfig
     from src.core.diagnostics.estimator import check_memory_feasibility
     from src.core.runtime import resolve_training_plan
 
-    overrides = []
-    if req.batch_size is not None:
-        overrides.append(f"training.batch_size={req.batch_size}")
-    if req.precision:
-        overrides.append(f"training.precision={req.precision}")
-    if req.optimizer_type:
-        overrides.append(f"training.optimizer_type={req.optimizer_type}")
-    if req.gradient_checkpointing is not None:
-        overrides.append(f"training.gradient_checkpointing={req.gradient_checkpointing}")
-    if req.gradient_accumulation_steps is not None:
-        overrides.append(f"training.gradient_accumulation_steps={req.gradient_accumulation_steps}")
-    if req.model_name:
-        overrides.append(f"model.name={req.model_name.strip().lower()}")
-    if req.n_layer is not None:
-        overrides.append(f"model.n_layer={req.n_layer}")
-    if req.n_embd is not None:
-        overrides.append(f"model.n_embd={req.n_embd}")
-    if req.n_head is not None:
-        overrides.append(f"model.n_head={req.n_head}")
-    if req.block_size is not None:
-        overrides.append(f"model.block_size={req.block_size}")
+    try:
+        overrides = _build_overrides(req)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    config = EngineConfig.from_yaml(req.config_path, overrides=overrides if overrides else None)
+    config_path = _resolve_training_config_path(req.config_path)
+    config = EngineConfig.from_yaml(config_path, overrides=overrides if overrides else None)
     runtime_plan = resolve_training_plan(config)
     feasible, msg, budget = check_memory_feasibility(
         model_config=config.model,
@@ -137,6 +190,7 @@ async def check_feasibility_endpoint(req: CheckFeasibilityRequest):
 
     return {
         "feasible": feasible,
+        "advisory": True,
         "message": msg,
         "estimated_gb": budget.get("total_estimated_gb", 0.0),
         "estimated_mb": budget.get("total_estimated_mb", 0.0),
@@ -148,86 +202,30 @@ async def start_training_endpoint(req: StartTrainingRequest, request: Request):
     """Khởi chạy phiên huấn luyện nền."""
     training_service = request.app.state.training_service
 
-    overrides: List[str] = []
-    if req.model_name is not None and req.model_name.strip():
-        overrides.append(f"model.name={req.model_name.strip().lower()}")
-    if req.cleaner_type is not None and req.cleaner_type.strip():
-        overrides.append(f"data.cleaner_type={req.cleaner_type.strip().lower()}")
-    if req.tokenizer_type is not None and req.tokenizer_type.strip():
-        overrides.append(f"data.tokenizer_type={req.tokenizer_type.strip().lower()}")
-    if req.batch_size is not None:
-        overrides.append(f"training.batch_size={req.batch_size}")
-    if req.learning_rate is not None:
-        overrides.append(f"training.learning_rate={req.learning_rate}")
-    if req.max_iters is not None:
-        overrides.append(f"training.max_iters={req.max_iters}")
-    if req.precision is not None:
-        overrides.append(f"training.precision={req.precision}")
-    if req.optimizer_type is not None:
-        overrides.append(f"training.optimizer_type={req.optimizer_type}")
-    if req.gradient_accumulation_steps is not None:
-        overrides.append(f"training.gradient_accumulation_steps={req.gradient_accumulation_steps}")
-    if req.gradient_checkpointing is not None:
-        overrides.append(f"training.gradient_checkpointing={req.gradient_checkpointing}")
-    if req.eval_interval is not None:
-        overrides.append(f"training.eval_interval={req.eval_interval}")
-    if req.eval_iters is not None:
-        overrides.append(f"training.eval_iters={req.eval_iters}")
-    if req.save_last is not None:
-        overrides.append(f"training.save_last={req.save_last}")
-    if req.split_ratio is not None:
-        overrides.append(f"data.split_ratio={req.split_ratio}")
-    if req.batch_provider_type is not None and req.batch_provider_type.strip():
-        overrides.append(f"data.batch_provider_type={req.batch_provider_type.strip().lower()}")
-    if req.n_layer is not None:
-        overrides.append(f"model.n_layer={req.n_layer}")
-    if req.n_embd is not None:
-        overrides.append(f"model.n_embd={req.n_embd}")
-    if req.n_head is not None:
-        overrides.append(f"model.n_head={req.n_head}")
-    if req.dropout is not None:
-        overrides.append(f"model.dropout={req.dropout}")
-    if req.lr_scheduler_type is not None and req.lr_scheduler_type.strip():
-        overrides.append(f"training.lr_scheduler_type={req.lr_scheduler_type.strip().lower()}")
-    if req.warmup_iters is not None:
-        overrides.append(f"training.warmup_iters={req.warmup_iters}")
-    if req.min_lr is not None:
-        overrides.append(f"training.min_lr={req.min_lr}")
-    if req.weight_decay is not None:
-        overrides.append(f"training.weight_decay={req.weight_decay}")
-    if req.grad_clip is not None:
-        overrides.append(f"training.grad_clip={req.grad_clip}")
-    if req.early_stopping_patience is not None:
-        overrides.append(f"training.early_stopping_patience={req.early_stopping_patience}")
-    import time
-
-    if req.run_name is not None and req.run_name.strip():
-        overrides.append(f"training.run_name={req.run_name.strip()}")
-    else:
-        auto_run_name = f"kieu_{time.strftime('%Y%m%d_%H%M%S')}"
-        overrides.append(f"training.run_name={auto_run_name}")
-    if req.save_top_k is not None:
-        overrides.append(f"training.save_top_k={req.save_top_k}")
-    if req.block_size is not None:
-        overrides.append(f"model.block_size={req.block_size}")
-    if req.seed is not None:
-        overrides.append(f"system.seed={req.seed}")
-
-    if req.resume_checkpoint:
-        import os
-
-        if not os.path.exists(req.resume_checkpoint):
-            raise HTTPException(
-                status_code=400,
-                detail=f"Không tìm thấy file checkpoint để resume: '{req.resume_checkpoint}'",
-            )
+    try:
+        overrides = _build_overrides(req, auto_run_name=True)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     # Pre-flight Memory Feasibility Check
     from src.core.config import EngineConfig
     from src.core.diagnostics.estimator import check_memory_feasibility
     from src.core.runtime import resolve_training_plan
 
-    chk_config = EngineConfig.from_yaml(req.config_path, overrides=overrides if overrides else None)
+    config_path = _resolve_training_config_path(req.config_path)
+    chk_config = EngineConfig.from_yaml(config_path, overrides=overrides if overrides else None)
+    resume_checkpoint = None
+    if req.resume_checkpoint:
+        import os
+
+        resume_checkpoint = _resolve_resume_checkpoint(
+            req.resume_checkpoint, chk_config.training.checkpoint_dir
+        )
+        if not os.path.isfile(resume_checkpoint):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Không tìm thấy file checkpoint để resume: '{req.resume_checkpoint}'",
+            )
     runtime_plan = resolve_training_plan(chk_config)
     feasible, mem_msg, budget = check_memory_feasibility(
         model_config=chk_config.model,
@@ -237,10 +235,10 @@ async def start_training_endpoint(req: StartTrainingRequest, request: Request):
 
     try:
         training_service.start_training(
-            config_path=req.config_path,
+            config_path=config_path,
             overrides=overrides if overrides else None,
             quick_check=req.quick_check,
-            resume_checkpoint=req.resume_checkpoint,
+            resume_checkpoint=resume_checkpoint,
             runtime_plan=runtime_plan,
         )
         request.app.state.inference_service.set_checkpoint_dir(chk_config.training.checkpoint_dir)
@@ -250,8 +248,10 @@ async def start_training_endpoint(req: StartTrainingRequest, request: Request):
             "message": "Đã khởi chạy huấn luyện trên luồng nền.",
             "preflight": {
                 "feasible": feasible,
+                "advisory": True,
                 "message": mem_msg,
                 "estimated_gb": budget.get("total_estimated_gb", 0.0),
+                "estimated_mb": budget.get("total_estimated_mb", 0.0),
             },
             "state": training_service.get_state(),
         }
@@ -278,6 +278,14 @@ async def clear_training_endpoint(request: Request):
         return {"status": "success", "message": "Đã làm mới thông tin huấn luyện."}
     except RuntimeError as e:
         raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.get("/config")
+async def get_training_config_endpoint(path: str = "configs/truyen_kieu.yaml"):
+    """Return the canonical validated EngineConfig used by training."""
+    from src.core.config import EngineConfig
+
+    return EngineConfig.from_yaml(_resolve_training_config_path(path)).to_dict()
 
 
 @router.get("/status")

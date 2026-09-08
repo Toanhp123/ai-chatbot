@@ -67,14 +67,6 @@ class MiniGPT(BaseModel):
     def vocab_size(self) -> int:
         return self._vocab_size
 
-    @property
-    def device(self) -> torch.device:
-        return next(self.parameters()).device
-
-    @property
-    def dtype(self) -> torch.dtype:
-        return next(self.parameters()).dtype
-
     def set_gradient_checkpointing(self, enabled: bool) -> None:
         """Bật/tắt activation checkpointing cho các transformer block khi train."""
         self.gradient_checkpointing = bool(enabled)
@@ -101,11 +93,8 @@ class MiniGPT(BaseModel):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def get_num_params(self, non_embedding: bool = False) -> int:
-        n_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
-        if non_embedding and hasattr(self, "wpe"):
-            n_params -= self.wpe.weight.numel()
-        return n_params
+    def _embedding_param_count(self) -> int:
+        return self.wpe.weight.numel()
 
     def forward(
         self,

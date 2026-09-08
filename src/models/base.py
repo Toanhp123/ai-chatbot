@@ -38,9 +38,14 @@ class BaseModel(nn.Module, ABC):
         """Kiểu dữ liệu số học hiện tại của các tham số mô hình."""
         return next(self.parameters()).dtype
 
+    def _embedding_param_count(self) -> int:
+        """Return architecture-specific embedding parameters excluded by ``non_embedding``."""
+        return 0
+
     def get_num_params(self, non_embedding: bool = False) -> int:
-        """Tính toán tổng số lượng tham số có thể huấn luyện (trainable parameters)."""
-        return sum(p.numel() for p in self.parameters() if p.requires_grad)
+        """Return trainable parameter count with optional architecture-defined embedding exclusion."""
+        count = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        return count - self._embedding_param_count() if non_embedding else count
 
     def reset_kv_cache(self) -> None:
         """Đặt lại bộ nhớ đệm Key-Value (mặc định no-op cho các mô hình tính full-attention)."""

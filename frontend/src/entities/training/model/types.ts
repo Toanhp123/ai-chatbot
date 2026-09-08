@@ -5,33 +5,51 @@ export type TrainingStatus =
 	| "STOPPING"
 	| "STOPPED"
 	| "COMPLETED"
-	| "ERROR"
-	| "FAILED";
+	| "ERROR";
 
-export interface LossStep {
+export type TrainingTerminationReason =
+	| "COMPLETED"
+	| "EARLY_STOPPED"
+	| "USER_STOPPED"
+	| "ABORTED_STARTUP"
+	| "FAILED"
+	| null;
+
+export interface VersionedTrainingEvent {
+	run_id: number;
+	sequence: number;
+}
+
+export interface LossStep extends VersionedTrainingEvent {
+	type?: "step";
 	step: number;
 	loss: number;
 	lr: number;
 	elapsed: number;
 }
 
-export interface EvalStep {
+export interface EvalStep extends VersionedTrainingEvent {
+	type?: "eval";
 	step: number;
 	train_loss: number;
 	val_loss: number;
 	lr: number;
 }
 
-export interface SampleRecord {
-	type: string;
+export interface SampleRecord extends VersionedTrainingEvent {
+	type: "sample";
 	step: number;
 	text: string;
 	timestamp: string;
 }
 
+/**
+ * Only fields actually editable in the Training UI live here.
+ * Untouched settings remain owned by the YAML EngineConfig and are not sent
+ * back as hidden React defaults.
+ */
 export interface TrainingConfigForm {
 	config_path: string;
-	quick_check: boolean;
 	model_name: string;
 	batch_size: number;
 	learning_rate: number;
@@ -40,46 +58,73 @@ export interface TrainingConfigForm {
 	optimizer_type: string;
 	gradient_accumulation_steps: number;
 	gradient_checkpointing: boolean;
-	eval_interval: number;
-	eval_iters: number;
-	save_last: boolean;
-	split_ratio: number;
-	batch_provider_type: string;
-	n_layer: number | null;
-	n_embd: number | null;
-	n_head: number | null;
-	block_size: number | null;
-	dropout: number | null;
-	seed: number | null;
-	lr_scheduler_type: string;
-	warmup_iters: number;
-	min_lr: number;
-	weight_decay: number;
-	grad_clip: number;
-	early_stopping_patience: number;
 	resume_checkpoint: string;
-	run_name: string;
-	save_top_k: number;
-	cleaner_type: string;
-	tokenizer_type: string;
+}
+
+export type TrainingOverrideField = Exclude<
+	keyof TrainingConfigForm,
+	"config_path" | "resume_checkpoint"
+>;
+
+export type CanonicalTrainingOverrides = Record<string, string | number | boolean>;
+
+export interface TrainingStartPayload {
+	config_path: string;
+	overrides?: CanonicalTrainingOverrides;
+	resume_checkpoint?: string | null;
+}
+
+export interface TrainingFeasibilityPayload {
+	config_path: string;
+	overrides?: CanonicalTrainingOverrides;
 }
 
 export interface PreflightMemoryInfo {
 	feasible: boolean;
+	advisory: boolean;
 	message: string;
 	estimated_gb: number;
 	estimated_mb: number;
 }
 
-export interface TrainingStateResponse {
+export interface ResolvedTrainingConfig {
+	model: {
+		name: string;
+	};
+	training: {
+		batch_size: number;
+		learning_rate: number;
+		max_iters: number;
+		precision: string;
+		optimizer_type: string;
+		gradient_accumulation_steps: number;
+		gradient_checkpointing: boolean;
+	};
+	[key: string]: unknown;
+}
+
+export interface TrainingStateResponse extends VersionedTrainingEvent {
 	status: TrainingStatus;
+	termination_reason: TrainingTerminationReason;
 	current_step: number;
 	max_iters: number;
 	current_loss: number | null;
 	current_val_loss: number | null;
 	current_lr: number | null;
-	last_sample_text?: string;
-	sample_history?: SampleRecord[];
-	history_steps?: LossStep[];
-	history_evals?: EvalStep[];
+	last_sample_text: string;
+	error_message: string | null;
+	sample_history: SampleRecord[];
+	history_steps: LossStep[];
+	history_evals: EvalStep[];
 }
+
+export interface TrainingStatusEvent extends TrainingStateResponse {
+	type: "status" | "init";
+	message?: string;
+}
+
+export type TrainingStreamEvent =
+	| TrainingStatusEvent
+	| (LossStep & { type: "step" })
+	| (EvalStep & { type: "eval" })
+	| SampleRecord;

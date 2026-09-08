@@ -1,11 +1,36 @@
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
+import {
+	applyResumeToTrainingForm,
+	isLatestRequest,
+	DEFAULT_TRAINING_CONFIG_PATH,
+	resolvedConfigToTrainingForm,
+	trainingApi,
+} from "@/entities/training";
 import { useTrainingControls } from "@/features/training";
-import type { TrainingConfigForm } from "@/entities/training";
+import type {
+	TrainingConfigForm,
+	TrainingOverrideField,
+} from "@/entities/training";
 import type { Checkpoint } from "@/entities/checkpoint";
 
-export function useTrainingDashboard() {
+const FALLBACK_FORM: TrainingConfigForm = {
+	config_path: DEFAULT_TRAINING_CONFIG_PATH,
+	model_name: "minigpt",
+	batch_size: 64,
+	learning_rate: 0.0003,
+	max_iters: 3000,
+	precision: "float32",
+	optimizer_type: "adamw",
+	gradient_accumulation_steps: 1,
+	gradient_checkpointing: false,
+	resume_checkpoint: "",
+};
+
+export function useTrainingDashboard(configRevision = 0) {
 	const {
 		status,
+		terminationReason,
+		errorMessage,
 		currentStep,
 		maxIters,
 		currentLoss,
@@ -16,86 +41,116 @@ export function useTrainingDashboard() {
 		historySteps,
 		historyEvals,
 		preflightInfo,
-		checkFeasibility,
+		checkFeasibility: checkFeasibilityRaw,
 		startTraining,
 		stopTraining,
 		clearTraining,
-		resetMetrics,
 	} = useTrainingControls();
 
-	const [form, setForm] = useState<TrainingConfigForm>({
-		config_path: "configs/truyen_kieu.yaml",
-		quick_check: false,
-		model_name: "minigpt",
-		batch_size: 64,
-		learning_rate: 0.0003,
-		max_iters: 3000,
-		precision: "float32",
-		optimizer_type: "adamw",
-		gradient_accumulation_steps: 1,
-		gradient_checkpointing: false,
-		eval_interval: 300,
-		eval_iters: 50,
-		save_last: true,
-		split_ratio: 0.9,
-		batch_provider_type: "tensor",
-		n_layer: 4,
-		n_embd: 192,
-		n_head: 6,
-		block_size: 128,
-		dropout: 0.1,
-		seed: 1337,
-		lr_scheduler_type: "cosine",
-		warmup_iters: 100,
-		min_lr: 0.00003,
-		weight_decay: 0.1,
-		grad_clip: 1.0,
-		early_stopping_patience: 10,
-		resume_checkpoint: "",
-		run_name: "",
-		save_top_k: 3,
-		cleaner_type: "default",
-		tokenizer_type: "char",
-	});
-
+	const [form, setForm] = useState<TrainingConfigForm>(FALLBACK_FORM);
+	const [dirtyFields, setDirtyFields] = useState<Set<TrainingOverrideField>>(
+		new Set(),
+	);
+	const [configLoadState, setConfigLoadState] = useState<{
+		revision: number;
+		error: string | null;
+	}>({ revision: -1, error: null });
 	const [resumeTarget, setResumeTarget] = useState<Checkpoint | null>(null);
+	const resumeTargetRef = useRef<Checkpoint | null>(null);
+	const configLoadRequestRef = useRef(0);
 	const [isStarting, setIsStarting] = useState(false);
 	const [isStopping, setIsStopping] = useState(false);
 
+	const loadCanonicalConfig = useCallback(async () => {
+		const requestId = ++configLoadRequestRef.current;
+		try {
+			const config = await trainingApi.getResolvedConfig(
+				DEFAULT_TRAINING_CONFIG_PATH,
+			);
+			if (!isLatestRequest(requestId, configLoadRequestRef.current)) return;
+
+			const loadedForm = resolvedConfigToTrainingForm(config);
+			const selectedResume = resumeTargetRef.current;
+			const effective = applyResumeToTrainingForm(
+				loadedForm,
+				selectedResume?.path ?? "",
+				selectedResume?.step,
+			);
+			setForm(effective.form);
+			setDirtyFields(new Set(effective.overrideFields));
+			setConfigLoadState({ revision: configRevision, error: null });
+			await checkFeasibilityRaw(effective.form, effective.overrideFields);
+		} catch (err) {
+			if (!isLatestRequest(requestId, configLoadRequestRef.current)) return;
+			const message = err instanceof Error ? err.message : String(err);
+			setConfigLoadState({ revision: configRevision, error: message });
+			console.warn("Không thể nạp canonical training config:", err);
+		}
+	}, [checkFeasibilityRaw, configRevision]);
+
+	useEffect(() => {
+		void loadCanonicalConfig();
+	}, [configRevision, loadCanonicalConfig]);
+
+	const isConfigLoading = configLoadState.revision !== configRevision;
+	const isConfigReady =
+		configLoadState.revision === configRevision && configLoadState.error === null;
+	const configLoadError =
+		configLoadState.revision === configRevision ? configLoadState.error : null;
+
+	const handleFormChange = useCallback(
+		(updated: TrainingConfigForm, changedField?: TrainingOverrideField) => {
+			setForm(updated);
+			if (changedField) {
+				setDirtyFields((prev) => new Set(prev).add(changedField));
+			}
+		},
+		[],
+	);
+
+	const checkFeasibility = useCallback(
+		async (
+			config: TrainingConfigForm,
+			changedField?: TrainingOverrideField,
+		) => {
+			const fields = new Set(dirtyFields);
+			if (changedField) fields.add(changedField);
+			return checkFeasibilityRaw(config, fields);
+		},
+		[checkFeasibilityRaw, dirtyFields],
+	);
+
 	const handleSelectResume = useCallback((cp: Checkpoint | null) => {
 		if (!cp || !cp.path) {
+			resumeTargetRef.current = null;
 			setResumeTarget(null);
 			setForm((prev) => ({ ...prev, resume_checkpoint: "" }));
 			return;
 		}
 
+		resumeTargetRef.current = cp;
 		setResumeTarget(cp);
-		setForm((prev) => {
-			const next = { ...prev, resume_checkpoint: cp.path };
-			// Tự động kiểm tra và điều chỉnh max_iters nếu bước của checkpoint >= max_iters hiện tại
-			if (cp.step && Number(prev.max_iters) <= cp.step) {
-				next.max_iters = cp.step + 1000;
-			}
-			return next;
-		});
-	}, []);
+		const effective = applyResumeToTrainingForm(form, cp.path, cp.step);
+		setForm(effective.form);
+		if (effective.overrideFields.length > 0) {
+			setDirtyFields((fields) => {
+				const next = new Set(fields);
+				for (const field of effective.overrideFields) next.add(field);
+				return next;
+			});
+		}
+	}, [form]);
 
 	const handleCancelResume = useCallback(() => {
+		resumeTargetRef.current = null;
 		setResumeTarget(null);
 		setForm((prev) => ({ ...prev, resume_checkpoint: "" }));
 	}, []);
 
-	const runInitialCheck = useCallback(async () => {
-		await checkFeasibility(form);
-	}, [checkFeasibility, form]);
-
-	useEffect(() => {
-		runInitialCheck();
-		// eslint-disable-next-line react-hooks/exhaustive-deps
-	}, []);
-
 	const handleStart = async () => {
 		if (
+			!isConfigReady ||
+			isConfigLoading ||
 			isStarting ||
 			isStopping ||
 			status === "STARTING" ||
@@ -106,7 +161,7 @@ export function useTrainingDashboard() {
 		}
 		setIsStarting(true);
 		try {
-			await startTraining(form);
+			await startTraining(form, dirtyFields);
 		} catch (err: unknown) {
 			const error = err as Error;
 			alert(`Lỗi khởi động huấn luyện: ${error.message}`);
@@ -122,7 +177,6 @@ export function useTrainingDashboard() {
 			status === "IDLE" ||
 			status === "STOPPED" ||
 			status === "COMPLETED" ||
-			status === "FAILED" ||
 			status === "ERROR"
 		) {
 			return;
@@ -130,7 +184,6 @@ export function useTrainingDashboard() {
 		setIsStopping(true);
 		try {
 			await stopTraining();
-			resetMetrics();
 		} catch (err: unknown) {
 			const error = err as Error;
 			alert(`Lỗi dừng huấn luyện: ${error.message}`);
@@ -149,13 +202,21 @@ export function useTrainingDashboard() {
 		) {
 			return;
 		}
-		await clearTraining();
-		setResumeTarget(null);
-		setForm((prev) => ({ ...prev, resume_checkpoint: "" }));
+		try {
+			await clearTraining();
+			resumeTargetRef.current = null;
+			setResumeTarget(null);
+			setForm((prev) => ({ ...prev, resume_checkpoint: "" }));
+		} catch (err: unknown) {
+			const error = err as Error;
+			alert(`Lỗi làm mới trạng thái huấn luyện: ${error.message}`);
+		}
 	};
 
 	return {
 		status,
+		terminationReason,
+		errorMessage,
 		currentStep,
 		maxIters,
 		currentLoss,
@@ -166,10 +227,12 @@ export function useTrainingDashboard() {
 		historySteps,
 		historyEvals,
 		preflightInfo,
+		configLoadError,
 		form,
-		setForm,
+		setForm: handleFormChange,
 		checkFeasibility,
 		isStarting,
+		isStartDisabled: isConfigLoading || !isConfigReady,
 		isStopping,
 		handleStart,
 		handleStop,

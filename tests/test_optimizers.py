@@ -191,3 +191,23 @@ def test_configure_optimizer_honors_resolved_optimizer_override() -> None:
     optimizer = configure_optimizer(model, config, optimizer_type="adamw")
 
     assert isinstance(optimizer, torch.optim.AdamW)
+
+
+@pytest.mark.parametrize("scheduler_type", ["linear", "cosine"])
+def test_decay_scheduler_reaches_min_lr_on_final_optimizer_update(scheduler_type: str) -> None:
+    config = TrainingConfig(
+        learning_rate=1e-3,
+        min_lr=1e-4,
+        warmup_iters=10,
+        max_iters=100,
+        lr_scheduler_type=scheduler_type,
+    )
+
+    assert compute_scheduled_lr(config.max_iters - 1, config) == pytest.approx(config.min_lr)
+
+
+def test_short_run_bounds_effective_warmup_to_max_iters() -> None:
+    config = TrainingConfig(learning_rate=5e-4, max_iters=5, warmup_iters=100)
+
+    assert compute_scheduled_lr(0, config) == pytest.approx(1e-4)
+    assert compute_scheduled_lr(4, config) == pytest.approx(5e-4)

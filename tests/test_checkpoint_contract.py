@@ -324,3 +324,66 @@ def test_train_initializes_callbacks_before_restoring_callback_state(tmp_path) -
     target.train(resume_checkpoint=str(checkpoint))
 
     assert target_callback.value == 7
+
+
+def test_resume_rejects_trajectory_config_drift_before_state_mutation(tmp_path) -> None:
+    cfg = _tiny_config()
+    model = ModelRegistry.create("minigpt", cfg.model)
+    provider = get_batch_provider(
+        "tensor",
+        train_data=torch.randint(0, cfg.model.vocab_size, (32,)),
+        val_data=torch.randint(0, cfg.model.vocab_size, (32,)),
+    )
+    source = Trainer(model=model, batch_provider=provider, config=cfg, device="cpu")
+    state = source.get_checkpoint_state()
+    state["step"] = 1
+    path = tmp_path / "config-drift.pt"
+    torch.save(state, path)
+
+    target_cfg = EngineConfig.from_dict(cfg.to_dict())
+    target_cfg.training.learning_rate *= 2
+    target_model = ModelRegistry.create("minigpt", target_cfg.model)
+    before = {key: value.detach().clone() for key, value in target_model.state_dict().items()}
+    target = Trainer(model=target_model, batch_provider=provider, config=target_cfg, device="cpu")
+
+    with pytest.raises(ValueError, match="config|cấu hình|learning_rate"):
+        target.resume_from_checkpoint(str(path))
+
+    for key, value in target_model.state_dict().items():
+        assert torch.equal(value, before[key]), key
+
+
+def test_resume_allows_max_iters_extension_and_checkpoint_output_changes(tmp_path) -> None:
+    cfg = _tiny_config()
+    cfg.training.max_iters = 3
+    cfg.training.warmup_iters = 1
+    model = ModelRegistry.create("minigpt", cfg.model)
+    provider = get_batch_provider(
+        "tensor",
+        train_data=torch.randint(0, cfg.model.vocab_size, (32,)),
+        val_data=torch.randint(0, cfg.model.vocab_size, (32,)),
+    )
+    source = Trainer(model=model, batch_provider=provider, config=cfg, device="cpu")
+    state = source.get_checkpoint_state()
+    state["step"] = 1
+    path = tmp_path / "extend.pt"
+    torch.save(state, path)
+
+    target_cfg = EngineConfig.from_dict(cfg.to_dict())
+    target_cfg.training.max_iters = 5
+    target_cfg.training.checkpoint_dir = str(tmp_path / "other")
+    target_cfg.training.checkpoint_name = "continued.pt"
+    target_cfg.training.run_name = "continued"
+    target_cfg.training.save_top_k = 1
+    target_cfg.training.save_last = False
+    target = Trainer(
+        model=ModelRegistry.create("minigpt", target_cfg.model),
+        batch_provider=provider,
+        config=target_cfg,
+        device="cpu",
+    )
+
+    resumed_step = target.resume_from_checkpoint(str(path))
+
+    assert resumed_step == 1
+    assert target.start_step == 2

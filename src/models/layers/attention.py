@@ -16,6 +16,14 @@ from src.core.exceptions import ModelArchitectureError
 from src.models.layers.rotary import apply_rotary_emb
 
 
+def _offset_causal_mask(query_len: int, key_len: int, device: torch.device) -> torch.Tensor:
+    """Return a mask where query i can attend through its absolute cache position."""
+    past_len = key_len - query_len
+    query_positions = torch.arange(query_len, device=device).unsqueeze(1) + past_len
+    key_positions = torch.arange(key_len, device=device).unsqueeze(0)
+    return key_positions <= query_positions
+
+
 class CausalSelfAttention(nn.Module):
     """Cơ chế Causal Self-Attention tiêu chuẩn với hỗ trợ KV-Cache."""
 
@@ -78,17 +86,23 @@ class CausalSelfAttention(nn.Module):
         q = q.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
         v = v.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
 
-        is_causal = True
+        had_cache = False
         if use_cache:
             if self._k_cache is not None and self._v_cache is not None:
-                # Đã có cache: Nối key/value mới vào đuôi cache
+                had_cache = True
+                # Đã có cache: nối key/value mới vào đuôi cache. Query của một
+                # chunk mới vẫn phải causal bên trong chính chunk đó.
                 k = torch.cat([self._k_cache, k], dim=2)
                 v = torch.cat([self._v_cache, v], dim=2)
-                # Khi query chỉ là token mới nhất (T=1), nó được phép nhìn thấy toàn bộ quá khứ
-                is_causal = False
 
             self._k_cache = k
             self._v_cache = v
+
+        total_k_len = k.size(2)
+        attn_mask = None
+        use_builtin_causal = T > 1 and not had_cache
+        if had_cache and T > 1:
+            attn_mask = _offset_causal_mask(T, total_k_len, x.device).view(1, 1, T, total_k_len)
 
         # FlashAttention (PyTorch 2.x) tự động chọn nhân tối ưu nhất
         if hasattr(F, "scaled_dot_product_attention"):
@@ -96,15 +110,16 @@ class CausalSelfAttention(nn.Module):
                 q,
                 k,
                 v,
-                attn_mask=None,
+                attn_mask=attn_mask,
                 dropout_p=self.dropout if self.training else 0.0,
-                is_causal=is_causal and (T > 1),
+                is_causal=use_builtin_causal,
             )
         else:
-            total_k_len = k.size(2)
             att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(self.head_dim))
-            if is_causal and (T > 1):
+            if use_builtin_causal:
                 att = att.masked_fill(self.bias[:, :, :T, :total_k_len] == 0, float("-inf"))
+            elif attn_mask is not None:
+                att = att.masked_fill(~attn_mask, float("-inf"))
             att = F.softmax(att, dim=-1)
             att = self.attn_dropout(att)
             y = att @ v
@@ -170,32 +185,40 @@ class LlamaAttention(nn.Module):
             q = apply_rotary_emb(q, rotary_cos, rotary_sin)
             k = apply_rotary_emb(k, rotary_cos, rotary_sin)
 
-        is_causal = True
+        had_cache = False
         if use_cache:
             if self._k_cache is not None and self._v_cache is not None:
+                had_cache = True
                 k = torch.cat([self._k_cache, k], dim=2)
                 v = torch.cat([self._v_cache, v], dim=2)
-                is_causal = False
 
             self._k_cache = k
             self._v_cache = v
+
+        total_k_len = k.size(2)
+        attn_mask = None
+        use_builtin_causal = T > 1 and not had_cache
+        if had_cache and T > 1:
+            attn_mask = _offset_causal_mask(T, total_k_len, x.device).view(1, 1, T, total_k_len)
 
         if hasattr(F, "scaled_dot_product_attention"):
             y = F.scaled_dot_product_attention(
                 q,
                 k,
                 v,
-                attn_mask=None,
+                attn_mask=attn_mask,
                 dropout_p=self.dropout if self.training else 0.0,
-                is_causal=is_causal and (T > 1),
+                is_causal=use_builtin_causal,
             )
         else:
             att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(self.head_dim))
-            if is_causal and (T > 1):
-                causal_mask = torch.tril(torch.ones((T, k.size(2)), device=x.device)).view(
-                    1, 1, T, k.size(2)
+            if use_builtin_causal:
+                causal_mask = torch.tril(torch.ones((T, total_k_len), device=x.device)).view(
+                    1, 1, T, total_k_len
                 )
                 att = att.masked_fill(causal_mask == 0, float("-inf"))
+            elif attn_mask is not None:
+                att = att.masked_fill(~attn_mask, float("-inf"))
             att = F.softmax(att, dim=-1)
             y = att @ v
 

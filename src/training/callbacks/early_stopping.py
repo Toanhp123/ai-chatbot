@@ -73,7 +73,12 @@ class EarlyStoppingCallback(BaseCallback):
                     f"🛑 [Early Stopping] Dừng sớm tại bước {step} do chỉ số '{self.monitor}' "
                     f"không cải thiện sau {self.patience} lần đánh giá liên tiếp (Kỷ lục: {self.best_score:.4f})."
                 )
-                trainer.request_stop()
+                request_early_stop = getattr(trainer, "request_early_stop", None)
+                if callable(request_early_stop):
+                    request_early_stop()
+                else:
+                    # Backward-compatible fallback for external TrainerProtocol implementations.
+                    trainer.request_stop()
 
 
 __all__ = ["EarlyStoppingCallback"]

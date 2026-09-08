@@ -13,14 +13,18 @@ import type { Checkpoint } from "@/entities/checkpoint";
 export interface TrainingPageProps {
 	onCheckpointLoaded?: (path: string) => void;
 	activeCheckpoint?: string;
+	configRevision?: number;
 }
 
 export const TrainingPage: React.FC<TrainingPageProps> = ({
 	onCheckpointLoaded,
+	configRevision = 0,
 }) => {
 	const { toast } = useToast();
 	const {
 		status,
+		terminationReason,
+		errorMessage,
 		currentStep,
 		maxIters,
 		currentLoss,
@@ -31,10 +35,12 @@ export const TrainingPage: React.FC<TrainingPageProps> = ({
 		historySteps,
 		historyEvals,
 		preflightInfo,
+		configLoadError,
 		form,
 		setForm,
 		checkFeasibility,
 		isStarting,
+		isStartDisabled,
 		isStopping,
 		handleStart,
 		handleStop,
@@ -42,7 +48,7 @@ export const TrainingPage: React.FC<TrainingPageProps> = ({
 		resumeTarget,
 		handleSelectResume,
 		handleCancelResume,
-	} = useTrainingDashboard();
+	} = useTrainingDashboard(configRevision);
 
 	const onResumeSelected = (cp: Checkpoint) => {
 		handleSelectResume(cp);
@@ -65,6 +71,8 @@ export const TrainingPage: React.FC<TrainingPageProps> = ({
 			{/* Top Metrics & Status Ribbon Widget */}
 			<TrainingMetricsRibbonWidget
 				status={status}
+				terminationReason={terminationReason}
+				errorMessage={errorMessage}
 				currentStep={currentStep}
 				maxIters={maxIters}
 				currentLoss={currentLoss}
@@ -72,6 +80,8 @@ export const TrainingPage: React.FC<TrainingPageProps> = ({
 				currentLr={currentLr}
 				preflightInfo={preflightInfo}
 				isStarting={isStarting}
+				isStartDisabled={isStartDisabled}
+				configLoadError={configLoadError}
 				isStopping={isStopping}
 				onStart={handleStart}
 				onStop={handleStop}

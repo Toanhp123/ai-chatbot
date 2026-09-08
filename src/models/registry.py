@@ -23,14 +23,11 @@ class ModelRegistry:
     def _ensure_builtins(cls) -> None:
         """Tự động quét và nạp toàn bộ các kiến trúc mô hình trong package architectures."""
         architecture_dir = Path(__file__).with_name("architectures")
-        try:
-            for _, module_name, _ in pkgutil.iter_modules([str(architecture_dir)]):
-                if not module_name.startswith("_"):
-                    importlib.import_module(f"src.models.architectures.{module_name}")
-        except Exception:
-            # Discovery failure is surfaced as ModelNotFoundError by create(), preserving
-            # a stable public error without a registry↔package eager-import cycle.
-            pass
+        for _, module_name, _ in pkgutil.iter_modules([str(architecture_dir)]):
+            if not module_name.startswith("_"):
+                # Built-in model import failures are implementation errors, not an
+                # unknown-model condition; keep the original exception visible.
+                importlib.import_module(f"src.models.architectures.{module_name}")
 
     @classmethod
     def register(cls, *names: str) -> Callable[[Type[BaseModel]], Type[BaseModel]]:

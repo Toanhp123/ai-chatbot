@@ -334,3 +334,72 @@ def test_llama_bias_flag_is_applied_consistently() -> None:
     assert yes_block.mlp.w2.bias is not None
     with_bias_lm_head = cast(nn.Linear, with_bias.lm_head)
     assert with_bias_lm_head.bias is not None
+
+
+@pytest.mark.parametrize("model_cls", [MiniGPT, LlamaNano])
+def test_kv_cache_chunk_append_preserves_causal_mask(model_cls):
+    torch.manual_seed(1234)
+    name = "llama" if model_cls is LlamaNano else "minigpt"
+    cfg = ModelConfig(
+        name=name,
+        vocab_size=41,
+        block_size=16,
+        n_embd=32,
+        n_head=4,
+        n_layer=2,
+        dropout=0.0,
+    )
+    model = model_cls(cfg)
+    model.eval()
+
+    prefix = torch.randint(0, cfg.vocab_size, (1, 4))
+    chunk = torch.randint(0, cfg.vocab_size, (1, 2))
+    full = torch.cat([prefix, chunk], dim=1)
+
+    full_logits, _ = model(full, targets=full, use_cache=False)
+
+    model.reset_kv_cache()
+    model(prefix, targets=prefix, use_cache=True)
+    chunk_logits, _ = model(chunk, targets=chunk, use_cache=True)
+
+    assert torch.allclose(chunk_logits, full_logits[:, -chunk.size(1) :, :], atol=1e-5, rtol=1e-4)
+
+
+def test_model_registry_does_not_hide_builtin_import_failures(monkeypatch) -> None:
+    original_import = __import__("importlib").import_module
+
+    def broken_import(name: str, *args, **kwargs):
+        if name.startswith("src.models.architectures."):
+            raise RuntimeError("broken builtin model module")
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr("src.models.registry.importlib.import_module", broken_import)
+
+    with pytest.raises(RuntimeError, match="broken builtin model module"):
+        ModelRegistry._ensure_builtins()
+
+
+def test_base_model_non_embedding_count_uses_architecture_hook() -> None:
+    class HookedModel(BaseModel):
+        def __init__(self) -> None:
+            super().__init__()
+            self.embedding = nn.Embedding(4, 3)
+            self.proj = nn.Linear(3, 2, bias=False)
+
+        @property
+        def block_size(self) -> int:
+            return 8
+
+        @property
+        def vocab_size(self) -> int:
+            return 4
+
+        def _embedding_param_count(self) -> int:
+            return self.embedding.weight.numel()
+
+        def forward(self, idx, targets=None, use_cache=False):
+            return self.proj(self.embedding(idx)), None
+
+    model = HookedModel()
+    assert model.get_num_params(non_embedding=False) == 18
+    assert model.get_num_params(non_embedding=True) == 6

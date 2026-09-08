@@ -178,7 +178,14 @@ class ModelCheckpointCallback(BaseCallback):
         self.last_step = step
         self.last_eval_step = step
         self.last_metrics = dict(metrics)
+
         if self.monitor not in metrics:
+            # ``last`` is lifecycle persistence, independent from best/top-k ranking.
+            # Persist it even when this eval cannot participate in ranking.
+            if self.save_last:
+                self._save_state(trainer, step, metrics, self.last_filepath)
+                if self.last_filepath != self.canonical_last_filepath:
+                    self._save_state(trainer, step, metrics, self.canonical_last_filepath)
             logger.warning(
                 f"[ModelCheckpoint] Không tìm thấy chỉ số '{self.monitor}' trong metrics: {list(metrics.keys())}"
             )
@@ -207,8 +214,8 @@ class ModelCheckpointCallback(BaseCallback):
                     if worst_path != versioned_path:
                         paths_to_remove.append(worst_path)
 
-        # Runtime state is captured only after this callback's state has been updated,
-        # so a resumed callback continues with the same best/top-k bookkeeping.
+        # Capture runtime state only after this callback's best/top-k bookkeeping
+        # has been updated, so exact resume restores a coherent callback state.
         if self.save_last:
             self._save_state(trainer, step, metrics, self.last_filepath)
             if self.last_filepath != self.canonical_last_filepath:
@@ -243,7 +250,12 @@ class ModelCheckpointCallback(BaseCallback):
     def on_train_end(self, trainer: TrainerProtocol) -> None:
         """Persist final weights without attaching a stale/best metric to different weights."""
         if self.save_last and self.last_step > 0:
-            metrics = dict(self.last_metrics) if self.last_eval_step == self.last_step else {}
+            # on_eval_end already persisted the exact final weights and runtime state.
+            # Rewriting the same checkpoint here doubles I/O for the common case where
+            # the trainer always evaluates on max_iters.
+            if self.last_eval_step == self.last_step:
+                return
+            metrics: Dict[str, float] = {}
             try:
                 self._save_state(trainer, self.last_step, metrics, self.last_filepath)
                 if self.last_filepath != self.canonical_last_filepath:

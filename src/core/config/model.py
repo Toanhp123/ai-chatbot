@@ -2,6 +2,7 @@
 Cấu hình kiến trúc mô hình nơ-ron ngôn ngữ (Model Architecture Configuration).
 """
 
+import math
 from dataclasses import dataclass, field
 from typing import Any, Dict
 
@@ -64,6 +65,18 @@ class ModelConfig(BaseConfig):
                     {"head_dim": head_dim, "n_embd": self.n_embd, "n_head": self.n_head},
                 )
 
+            raw_rope_theta = self.model_kwargs.get("rope_theta", 10000.0)
+            if isinstance(raw_rope_theta, bool):
+                raise ConfigurationError("LLaMA rope_theta phải là số thực hữu hạn > 0.")
+            try:
+                rope_theta = float(raw_rope_theta)
+            except (TypeError, ValueError) as exc:
+                raise ConfigurationError("LLaMA rope_theta phải là số thực hữu hạn > 0.") from exc
+            if not math.isfinite(rope_theta) or rope_theta <= 0.0:
+                raise ConfigurationError(
+                    f"LLaMA rope_theta phải là số thực hữu hạn > 0, nhận được {raw_rope_theta}"
+                )
+
             raw_multiple_of = self.model_kwargs.get("multiple_of", 64)
             if isinstance(raw_multiple_of, bool):
                 raise ConfigurationError("LLaMA multiple_of phải là số nguyên > 0.")
@@ -81,8 +94,10 @@ class ModelConfig(BaseConfig):
                 norm_eps = float(raw_norm_eps)
             except (TypeError, ValueError) as exc:
                 raise ConfigurationError("LLaMA norm_eps phải là số thực > 0.") from exc
-            if norm_eps <= 0.0:
-                raise ConfigurationError(f"LLaMA norm_eps phải > 0, nhận được {raw_norm_eps}")
+            if not math.isfinite(norm_eps) or norm_eps <= 0.0:
+                raise ConfigurationError(
+                    f"LLaMA norm_eps phải là số thực hữu hạn > 0, nhận được {raw_norm_eps}"
+                )
 
             if "intermediate_size" in self.model_kwargs:
                 raw_intermediate = self.model_kwargs["intermediate_size"]

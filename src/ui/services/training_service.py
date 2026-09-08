@@ -7,7 +7,7 @@ import json
 import queue
 import threading
 import time
-from typing import Any, Dict, Iterator, List, Optional
+from typing import Any, Dict, Generator, List, Optional
 
 import torch
 
@@ -26,14 +26,14 @@ from src.training.callbacks import (
     SampleGenerationCallback,
     TrainerProtocol,
 )
-from src.training.trainer import Trainer, TrainOutput
+from src.training.trainer import Trainer, TrainingTerminationReason, TrainOutput
 from src.utils.seed import set_seed
 
 logger = get_logger("TrainingService")
 
 
 class WebMetricsCallback(BaseCallback):
-    """Callback chuyên biệt thu thập chỉ số huấn luyện và phát sóng tới tất cả UI subscribers."""
+    """Collect training metrics while TrainingService owns lifecycle transitions."""
 
     def __init__(
         self,
@@ -45,64 +45,40 @@ class WebMetricsCallback(BaseCallback):
         self.start_time = time.time()
 
     def on_train_begin(self, trainer: TrainerProtocol) -> None:
+        # The worker owns STARTING -> RUNNING exactly once.  The callback only
+        # measures elapsed time and records trainer metrics.
         self.start_time = time.time()
-        self.service.status = "RUNNING"
-        self.service.max_iters = trainer.max_iters
-        evt = {
-            "type": "status",
-            "status": "RUNNING",
-            "max_iters": trainer.max_iters,
-            "message": "Bắt đầu phiên huấn luyện.",
-        }
-        self.service.broadcast(evt)
 
     def on_step_end(self, trainer: TrainerProtocol, step: int, loss: float) -> None:
-        self.service.current_step = step
-        self.service.current_loss = round(float(loss), 4)
-        self.service.current_lr = round(float(trainer.current_lr), 7)
-
-        if step % self.log_interval == 0 or step == trainer.max_iters:
-            elapsed = time.time() - self.start_time
-            data = {
-                "type": "step",
-                "step": step,
-                "loss": self.service.current_loss,
-                "lr": self.service.current_lr,
-                "elapsed": round(elapsed, 1),
-            }
-            if len(self.service.history_steps) > 3000:
-                self.service.history_steps.pop(0)
-            self.service.history_steps.append(data)
-            self.service.broadcast(data)
+        elapsed = time.time() - self.start_time
+        self.service.record_step(
+            step=step,
+            loss=float(loss),
+            lr=float(trainer.current_lr),
+            elapsed=elapsed,
+            emit=step % self.log_interval == 0 or step == trainer.max_iters,
+        )
 
     def on_eval_end(self, trainer: TrainerProtocol, step: int, metrics: Dict[str, float]) -> None:
-        train_loss = round(float(metrics.get("train_loss", 0.0)), 4)
-        val_loss = round(float(metrics.get("val_loss", 0.0)), 4)
-        self.service.current_val_loss = val_loss
-
-        data = {
-            "type": "eval",
-            "step": step,
-            "train_loss": train_loss,
-            "val_loss": val_loss,
-            "lr": round(float(trainer.current_lr), 7),
-        }
-        self.service.history_evals.append(data)
-        self.service.broadcast(data)
+        self.service.record_eval(
+            step=step,
+            train_loss=float(metrics.get("train_loss", 0.0)),
+            val_loss=float(metrics.get("val_loss", 0.0)),
+            lr=float(trainer.current_lr),
+        )
 
     def on_train_end(self, trainer: TrainerProtocol) -> None:
-        elapsed = time.time() - self.start_time
-        evt = {
-            "type": "status",
-            "status": self.service.status,
-            "elapsed_total": round(elapsed, 1),
-            "message": "Quá trình huấn luyện đã kết thúc.",
-        }
-        self.service.broadcast(evt)
+        # Trainer callbacks run before TrainingService knows the final semantic
+        # termination reason, so emitting a status here would be stale/duplicate.
+        return None
 
 
 class TrainingService:
     """Service singleton điều phối huấn luyện mô hình nền cho Web UI với Pub/Sub Broadcast."""
+
+    MAX_STEP_HISTORY = 3000
+    MAX_EVAL_HISTORY = 1000
+    MAX_SAMPLE_HISTORY = 200
 
     def __init__(self) -> None:
         self.status: str = "IDLE"  # IDLE, STARTING, RUNNING, STOPPING, STOPPED, COMPLETED, ERROR
@@ -113,6 +89,9 @@ class TrainingService:
         self.current_lr: Optional[float] = None
         self.last_sample_text: str = ""
         self.error_message: Optional[str] = None
+        self.termination_reason: Optional[str] = None
+        self.run_id: int = 0
+        self.sequence: int = 0
         self.trainer: Optional[Trainer] = None
         self._thread: Optional[threading.Thread] = None
         self._lock = threading.Lock()
@@ -149,10 +128,13 @@ class TrainingService:
                     # Bỏ qua nếu buffer client bị đầy để tránh nghẽn
                     pass
 
-    def get_state(self) -> Dict[str, Any]:
-        """Trả về trạng thái hiện tại phục vụ REST API Polling Sync."""
+    def _snapshot_locked(self) -> Dict[str, Any]:
+        """Return one coherent UI snapshot. Caller must hold ``_lock``."""
         return {
+            "run_id": self.run_id,
+            "sequence": self.sequence,
             "status": self.status,
+            "termination_reason": self.termination_reason,
             "current_step": self.current_step,
             "max_iters": self.max_iters,
             "current_loss": self.current_loss,
@@ -160,13 +142,94 @@ class TrainingService:
             "current_lr": self.current_lr,
             "last_sample_text": self.last_sample_text,
             "error_message": self.error_message,
-            "history_steps": self.history_steps[-300:],  # 300 điểm gần nhất cho sync mượt mà
-            "history_evals": self.history_evals,
-            "sample_history": self.sample_history[-5:],
+            # REST/SSE init is authoritative for the server's bounded history.
+            # Do not truncate it further here or clients cannot reconcile gaps.
+            "history_steps": [dict(item) for item in self.history_steps],
+            "history_evals": [dict(item) for item in self.history_evals],
+            "sample_history": [dict(item) for item in self.sample_history],
         }
 
+    def _next_sequence_locked(self) -> int:
+        self.sequence += 1
+        return self.sequence
+
+    def _status_event_locked(self, message: str) -> Dict[str, Any]:
+        self._next_sequence_locked()
+        return {"type": "status", **self._snapshot_locked(), "message": message}
+
+    def get_state(self) -> Dict[str, Any]:
+        """Return an atomic, authoritative snapshot for REST polling/reconnect."""
+        with self._lock:
+            return self._snapshot_locked()
+
+    def record_step(
+        self,
+        *,
+        step: int,
+        loss: float,
+        lr: float,
+        elapsed: float,
+        emit: bool,
+    ) -> None:
+        event: Optional[Dict[str, Any]] = None
+        with self._lock:
+            self.current_step = step
+            self.current_loss = round(float(loss), 4)
+            self.current_lr = round(float(lr), 7)
+            sequence = self._next_sequence_locked()
+            if emit:
+                event = {
+                    "type": "step",
+                    "run_id": self.run_id,
+                    "sequence": sequence,
+                    "step": step,
+                    "loss": self.current_loss,
+                    "lr": self.current_lr,
+                    "elapsed": round(elapsed, 1),
+                }
+                self.history_steps.append(dict(event))
+                if len(self.history_steps) > self.MAX_STEP_HISTORY:
+                    del self.history_steps[: -self.MAX_STEP_HISTORY]
+        if event is not None:
+            self.broadcast(event)
+
+    def record_eval(self, *, step: int, train_loss: float, val_loss: float, lr: float) -> None:
+        with self._lock:
+            self.current_val_loss = round(float(val_loss), 4)
+            sequence = self._next_sequence_locked()
+            event = {
+                "type": "eval",
+                "run_id": self.run_id,
+                "sequence": sequence,
+                "step": step,
+                "train_loss": round(float(train_loss), 4),
+                "val_loss": self.current_val_loss,
+                "lr": round(float(lr), 7),
+            }
+            self.history_evals.append(dict(event))
+            if len(self.history_evals) > self.MAX_EVAL_HISTORY:
+                del self.history_evals[: -self.MAX_EVAL_HISTORY]
+        self.broadcast(event)
+
+    def record_sample(self, *, step: int, text: str) -> None:
+        with self._lock:
+            self.last_sample_text = text
+            sequence = self._next_sequence_locked()
+            event = {
+                "type": "sample",
+                "run_id": self.run_id,
+                "sequence": sequence,
+                "step": step,
+                "text": text,
+                "timestamp": time.strftime("%H:%M:%S"),
+            }
+            self.sample_history.append(dict(event))
+            if len(self.sample_history) > self.MAX_SAMPLE_HISTORY:
+                del self.sample_history[: -self.MAX_SAMPLE_HISTORY]
+        self.broadcast(event)
+
     def clear_state(self) -> None:
-        """Làm mới trạng thái sau khi worker cũ đã hoàn tất cleanup."""
+        """Erase the terminal run only after the worker has fully cleaned up."""
         cleanup_thread: Optional[threading.Thread] = None
         with self._lock:
             if self.status in ("RUNNING", "STARTING"):
@@ -185,7 +248,9 @@ class TrainingService:
             if self.status in ("RUNNING", "STARTING", "STOPPING"):
                 raise RuntimeError("Không thể làm mới khi tiến trình huấn luyện đang chạy.")
             self.status = "IDLE"
+            self.termination_reason = None
             self.current_step = 0
+            self.max_iters = 0
             self.current_loss = None
             self.current_val_loss = None
             self.current_lr = None
@@ -194,52 +259,21 @@ class TrainingService:
             self.history_steps.clear()
             self.history_evals.clear()
             self.sample_history.clear()
+            event = self._status_event_locked("Đã làm mới thông tin huấn luyện.")
 
-        self.broadcast(
-            {
-                "type": "status",
-                "status": "IDLE",
-                "current_step": 0,
-                "current_loss": None,
-                "current_val_loss": None,
-                "current_lr": None,
-                "last_sample_text": "",
-                "history_steps": [],
-                "history_evals": [],
-                "sample_history": [],
-                "message": "Đã làm mới thông tin huấn luyện.",
-            }
-        )
+        self.broadcast(event)
         logger.info("Đã làm mới toàn bộ thông tin trạng thái huấn luyện (cleared state).")
 
     def _finish_abort(self) -> None:
-        """Kết thúc và dọn dẹp an toàn khi người dùng hủy bỏ huấn luyện ở giai đoạn STARTING."""
+        """Finish a user-requested abort during STARTING without inventing metrics."""
         with self._lock:
             self.status = "STOPPED"
+            self.termination_reason = TrainingTerminationReason.ABORTED_STARTUP.value
             self.trainer = None
-            self.current_step = 0
-            self.current_loss = None
-            self.current_val_loss = None
-            self.current_lr = None
-            self.last_sample_text = ""
-            self.history_steps.clear()
-            self.history_evals.clear()
-            self.sample_history.clear()
-        self.broadcast(
-            {
-                "type": "status",
-                "status": "STOPPED",
-                "current_step": 0,
-                "current_loss": None,
-                "current_val_loss": None,
-                "current_lr": None,
-                "last_sample_text": "",
-                "history_steps": [],
-                "history_evals": [],
-                "sample_history": [],
-                "message": "Đã hủy bỏ khởi tạo huấn luyện an toàn theo yêu cầu người dùng.",
-            }
-        )
+            event = self._status_event_locked(
+                "Đã hủy bỏ khởi tạo huấn luyện an toàn theo yêu cầu người dùng."
+            )
+        self.broadcast(event)
         logger.info("Đã hủy bỏ khởi tạo huấn luyện an toàn (startup aborted).")
 
     def start_training(
@@ -250,9 +284,8 @@ class TrainingService:
         resume_checkpoint: Optional[str] = None,
         runtime_plan: Optional[ResolvedTrainingPlan] = None,
     ) -> None:
-        """Khởi chạy huấn luyện trên luồng riêng biệt (Background Thread) với khóa chống spam và đảm bảo độc quyền luồng."""
-        # 1. Kiểm tra trạng thái sơ bộ và đợi luồng cũ ngoài lock (nếu luồng cũ đang kết thúc)
-        old_thread = None
+        """Start one exclusive background training run with versioned UI state."""
+        old_thread: Optional[threading.Thread] = None
         with self._lock:
             if self.status in ("RUNNING", "STARTING"):
                 raise RuntimeError(
@@ -262,7 +295,7 @@ class TrainingService:
             if self.status == "STOPPING" or (self._thread and self._thread.is_alive()):
                 old_thread = self._thread
 
-        # Đợi luồng cũ kết thúc ngoài lock để tránh deadlock khi luồng cũ acquire lock trong finally
+        # Never join while holding _lock: the old worker acquires it in finally.
         if old_thread and old_thread.is_alive():
             logger.info("Đang đợi luồng huấn luyện trước đó giải phóng tài nguyên...")
             old_thread.join(timeout=3.5)
@@ -285,257 +318,228 @@ class TrainingService:
                 )
 
             self._abort_requested.clear()
+            self.run_id += 1
+            self.sequence = 0
             self.status = "STARTING"
+            self.termination_reason = None
             self.error_message = None
             self.current_step = 0
+            self.max_iters = 0
             self.current_loss = None
             self.current_val_loss = None
+            self.current_lr = None
+            self.last_sample_text = ""
             self.trainer = None
-
-            # Nếu không resume từ checkpoint cũ, làm mới lịch sử
-            if not resume_checkpoint:
-                self.history_steps.clear()
-                self.history_evals.clear()
-                self.sample_history.clear()
-
-            self.broadcast(
-                {
-                    "type": "status",
-                    "status": "STARTING",
-                    "message": "Đang chuẩn bị dữ liệu và khởi tạo kiến trúc mạng...",
-                }
+            # A new UI run gets a new run_id. Reusing process-local history from a
+            # previous run (even when resuming a checkpoint) would mislabel it.
+            self.history_steps.clear()
+            self.history_evals.clear()
+            self.sample_history.clear()
+            starting_event = self._status_event_locked(
+                "Đang chuẩn bị dữ liệu và khởi tạo kiến trúc mạng..."
             )
 
-            def train_worker() -> None:
-                try:
-                    config = EngineConfig.from_yaml(config_path, overrides=overrides)
-                    configure_logging_from_system(
-                        config.system, name="TrainingService", force_reconfigure=True
-                    )
-                    if quick_check:
-                        config = config.copy(
-                            training=config.training.copy(
-                                max_iters=50,
-                                eval_interval=25,
-                                eval_iters=10,
-                            )
+        self.broadcast(starting_event)
+
+        def train_worker() -> None:
+            try:
+                config = EngineConfig.from_yaml(config_path, overrides=overrides)
+                configure_logging_from_system(
+                    config.system, name="TrainingService", force_reconfigure=True
+                )
+                if quick_check:
+                    config = config.copy(
+                        training=config.training.copy(
+                            max_iters=50,
+                            eval_interval=25,
+                            eval_iters=10,
                         )
+                    )
 
+                with self._lock:
                     self.max_iters = config.training.max_iters
-                    set_seed(config.system.seed)
+                    config_event = self._status_event_locked("Đã nạp cấu hình huấn luyện.")
+                self.broadcast(config_event)
+                set_seed(config.system.seed)
 
-                    if self._abort_requested.is_set():
-                        self._finish_abort()
-                        return
+                if self._abort_requested.is_set():
+                    self._finish_abort()
+                    return
 
-                    # 1. Cleaner
-                    cleaner_kwargs = dict(config.data.cleaner_kwargs)
-                    cleaner_kwargs.setdefault("clean_line_numbers", config.data.clean_line_numbers)
-                    cleaner = get_cleaner(
-                        cleaner_type=config.data.cleaner_type,
-                        **cleaner_kwargs,
-                    )
+                cleaner_kwargs = dict(config.data.cleaner_kwargs)
+                cleaner_kwargs.setdefault("clean_line_numbers", config.data.clean_line_numbers)
+                cleaner = get_cleaner(
+                    cleaner_type=config.data.cleaner_type,
+                    **cleaner_kwargs,
+                )
 
-                    if self._abort_requested.is_set():
-                        self._finish_abort()
-                        return
+                if self._abort_requested.is_set():
+                    self._finish_abort()
+                    return
 
-                    # 2. DataPipeline
-                    train_data, val_data, tokenizer = DataPipeline.setup_data(
-                        config=config.data,
-                        cleaner=cleaner,
-                        block_size=config.model.block_size,
-                    )
+                train_data, val_data, tokenizer = DataPipeline.setup_data(
+                    config=config.data,
+                    cleaner=cleaner,
+                    block_size=config.model.block_size,
+                )
 
-                    if self._abort_requested.is_set():
-                        self._finish_abort()
-                        return
+                if self._abort_requested.is_set():
+                    self._finish_abort()
+                    return
 
-                    # 3. Batch Provider
-                    batch_provider = get_batch_provider(
-                        provider_type=config.data.batch_provider_type,
-                        train_data=train_data,
-                        val_data=val_data,
-                        block_size=config.model.block_size,
-                        num_workers=config.data.num_workers,
-                        pin_memory=config.data.pin_memory,
-                    )
+                batch_provider = get_batch_provider(
+                    provider_type=config.data.batch_provider_type,
+                    train_data=train_data,
+                    val_data=val_data,
+                    block_size=config.model.block_size,
+                    num_workers=config.data.num_workers,
+                    pin_memory=config.data.pin_memory,
+                )
 
-                    config = config.copy(model=config.model.copy(vocab_size=tokenizer.vocab_size))
+                # Runtime model shape must use the tokenizer actually selected by
+                # the data pipeline, not a stale YAML vocab_size.
+                config = config.copy(model=config.model.copy(vocab_size=tokenizer.vocab_size))
 
-                    if self._abort_requested.is_set():
-                        self._finish_abort()
-                        return
+                if self._abort_requested.is_set():
+                    self._finish_abort()
+                    return
 
-                    # 4. Model
-                    model = ModelRegistry.create(config.model.name, config.model)
-                    effective_runtime_plan = runtime_plan
-                    if effective_runtime_plan is None:
-                        effective_runtime_plan = resolve_training_plan(config)
+                model = ModelRegistry.create(config.model.name, config.model)
+                if self._abort_requested.is_set():
+                    self._finish_abort()
+                    return
+
+                effective_runtime_plan = runtime_plan
+                if effective_runtime_plan is None:
+                    effective_runtime_plan = resolve_training_plan(config)
+                else:
+                    validate_training_plan(config, effective_runtime_plan)
+
+                sample_gen: BaseGenerator = get_generator(
+                    "local",
+                    model=model,
+                    tokenizer=tokenizer,
+                    device=effective_runtime_plan.device,
+                )
+                sample_cfg = GenerationConfig(
+                    max_new_tokens=60,
+                    temperature=0.8,
+                    top_k=40,
+                    use_cache=True,
+                )
+
+                def sample_fn(step: int) -> str:
+                    text = sample_gen.generate("Trăm năm", config=sample_cfg)
+                    self.record_sample(step=step, text=text)
+                    return text
+
+                callbacks: List[BaseCallback] = [
+                    WebMetricsCallback(service=self, log_interval=10),
+                    SampleGenerationCallback(sample_fn=sample_fn),
+                    EarlyStoppingCallback(
+                        monitor="val_loss",
+                        mode="min",
+                        patience=config.training.early_stopping_patience,
+                    ),
+                    # Persist after stateful callbacks so resume snapshot is coherent.
+                    ModelCheckpointCallback(
+                        save_dir=config.training.checkpoint_dir,
+                        filename=config.training.checkpoint_name,
+                        monitor="val_loss",
+                        mode="min",
+                        save_top_k=config.training.save_top_k,
+                        save_last=config.training.save_last,
+                        run_name=config.training.run_name,
+                    ),
+                ]
+
+                trainer = Trainer(
+                    model=model,
+                    batch_provider=batch_provider,
+                    config=config,
+                    callbacks=callbacks,
+                    tokenizer=tokenizer,
+                    runtime_plan=effective_runtime_plan,
+                )
+
+                with self._lock:
+                    if self._abort_requested.is_set() or self.status == "STOPPING":
+                        abort_before_trainer = True
+                        running_event = None
                     else:
-                        validate_training_plan(config, effective_runtime_plan)
+                        abort_before_trainer = False
+                        self.trainer = trainer
+                        self.status = "RUNNING"
+                        running_event = self._status_event_locked("Bắt đầu huấn luyện mô hình.")
 
-                    # 5. Callbacks
-                    sample_gen: BaseGenerator = get_generator(
-                        "local",
-                        model=model,
-                        tokenizer=tokenizer,
-                        device=effective_runtime_plan.device,
+                if abort_before_trainer:
+                    self._finish_abort()
+                    return
+                if running_event is not None:
+                    self.broadcast(running_event)
+
+                train_out: TrainOutput = trainer.train(resume_checkpoint=resume_checkpoint)
+
+                with self._lock:
+                    reason = train_out.termination_reason
+                    user_stopped = (
+                        train_out.interrupted or reason is TrainingTerminationReason.USER_STOPPED
                     )
-                    sample_cfg = GenerationConfig(
-                        max_new_tokens=60,
-                        temperature=0.8,
-                        top_k=40,
-                        use_cache=True,
+                    if user_stopped:
+                        self.status = "STOPPED"
+                        self.termination_reason = TrainingTerminationReason.USER_STOPPED.value
+                    else:
+                        self.status = "COMPLETED"
+                        self.termination_reason = reason.value
+                    terminal_event = self._status_event_locked(
+                        f"Huấn luyện kết thúc với trạng thái: {self.status}"
                     )
+                self.broadcast(terminal_event)
 
-                    def sample_fn(step: int) -> str:
-                        text = sample_gen.generate("Trăm năm", config=sample_cfg)
-                        self.last_sample_text = text
-                        sample_record = {
-                            "type": "sample",
-                            "step": step,
-                            "text": text,
-                            "timestamp": time.strftime("%H:%M:%S"),
-                        }
-                        self.sample_history.append(sample_record)
-                        self.broadcast(sample_record)
-                        return text
-
-                    web_cb = WebMetricsCallback(
-                        service=self,
-                        log_interval=10,
-                    )
-
-                    callbacks: List[BaseCallback] = [
-                        web_cb,
-                        SampleGenerationCallback(sample_fn=sample_fn),
-                        EarlyStoppingCallback(
-                            monitor="val_loss",
-                            mode="min",
-                            patience=config.training.early_stopping_patience,
-                        ),
-                        # Persist after stateful callbacks so resume snapshot is coherent.
-                        ModelCheckpointCallback(
-                            save_dir=config.training.checkpoint_dir,
-                            filename=config.training.checkpoint_name,
-                            monitor="val_loss",
-                            mode="min",
-                            save_top_k=config.training.save_top_k,
-                            save_last=config.training.save_last,
-                            run_name=config.training.run_name,
-                        ),
-                    ]
-
-                    # 6. Trainer
-                    abort_before_trainer = False
-                    trainer: Optional[Trainer] = None
-                    with self._lock:
-                        if self._abort_requested.is_set():
-                            abort_before_trainer = True
-                        else:
-                            trainer = Trainer(
-                                model=model,
-                                batch_provider=batch_provider,
-                                config=config,
-                                callbacks=callbacks,
-                                tokenizer=tokenizer,
-                                runtime_plan=effective_runtime_plan,
+            except Exception as e:
+                logger.exception(f"Lỗi trong quá trình huấn luyện nền: {e}")
+                with self._lock:
+                    self.status = "ERROR"
+                    self.termination_reason = TrainingTerminationReason.FAILED.value
+                    self.error_message = str(e)
+                    error_event = self._status_event_locked(str(e))
+                self.broadcast(error_event)
+            finally:
+                cleanup_event: Optional[Dict[str, Any]] = None
+                with self._lock:
+                    self.trainer = None
+                    if self.status in ("STARTING", "STOPPING"):
+                        self.status = "STOPPED"
+                        if self.termination_reason is None:
+                            self.termination_reason = (
+                                TrainingTerminationReason.ABORTED_STARTUP.value
+                                if self.current_step == 0
+                                else TrainingTerminationReason.USER_STOPPED.value
                             )
-                            self.trainer = trainer
-                            self.status = "RUNNING"
+                        cleanup_event = self._status_event_locked(
+                            "Tiến trình huấn luyện đã dừng và hoàn tất dọn dẹp."
+                        )
+                    final_status = self.status
+                if cleanup_event is not None:
+                    self.broadcast(cleanup_event)
+                if torch.cuda.is_available():
+                    try:
+                        torch.cuda.empty_cache()
+                    except Exception:
+                        pass
+                logger.info(
+                    f"Luồng huấn luyện nền đã hoàn tất dọn dẹp. Trạng thái cuối: {final_status}"
+                )
 
-                    if abort_before_trainer:
-                        self._finish_abort()
-                        return
-
-                    self.broadcast(
-                        {
-                            "type": "status",
-                            "status": "RUNNING",
-                            "max_iters": self.max_iters,
-                            "message": "Bắt đầu huấn luyện mô hình.",
-                        }
-                    )
-
-                    if trainer is None:
-                        raise RuntimeError("Trainer initialization invariant violated.")
-                    train_out: TrainOutput = trainer.train(resume_checkpoint=resume_checkpoint)
-
-                    with self._lock:
-                        if (
-                            train_out.interrupted
-                            or self._abort_requested.is_set()
-                            or self.status == "STOPPING"
-                        ):
-                            self.status = "STOPPED"
-                            self.current_step = 0
-                            self.current_loss = None
-                            self.current_val_loss = None
-                            self.current_lr = None
-                            self.last_sample_text = ""
-                            self.history_steps.clear()
-                            self.history_evals.clear()
-                            self.sample_history.clear()
-                        else:
-                            self.status = "COMPLETED"
-
-                    self.broadcast(
-                        {
-                            "type": "status",
-                            "status": self.status,
-                            "current_step": self.current_step,
-                            "current_loss": self.current_loss,
-                            "current_val_loss": self.current_val_loss,
-                            "current_lr": self.current_lr,
-                            "last_sample_text": self.last_sample_text,
-                            "history_steps": list(self.history_steps),
-                            "history_evals": list(self.history_evals),
-                            "sample_history": list(self.sample_history),
-                            "message": f"Huấn luyện kết thúc với trạng thái: {self.status}",
-                        }
-                    )
-
-                except Exception as e:
-                    logger.exception(f"Lỗi trong quá trình huấn luyện nền: {e}")
-                    with self._lock:
-                        self.status = "ERROR"
-                        self.error_message = str(e)
-                    self.broadcast(
-                        {
-                            "type": "status",
-                            "status": "ERROR",
-                            "message": str(e),
-                        }
-                    )
-                finally:
-                    with self._lock:
-                        self.trainer = None
-                        if self.status in ("STARTING", "STOPPING"):
-                            self.status = "STOPPED"
-                        if self.status == "STOPPED":
-                            self.current_step = 0
-                            self.current_loss = None
-                            self.current_val_loss = None
-                            self.current_lr = None
-                            self.last_sample_text = ""
-                            self.history_steps.clear()
-                            self.history_evals.clear()
-                            self.sample_history.clear()
-                    if torch.cuda.is_available():
-                        try:
-                            torch.cuda.empty_cache()
-                        except Exception:
-                            pass
-                    logger.info(
-                        f"Luồng huấn luyện nền đã hoàn tất dọn dẹp. Trạng thái cuối: {self.status}"
-                    )
-
+        with self._lock:
             self._thread = threading.Thread(target=train_worker, daemon=True)
-            self._thread.start()
+            thread = self._thread
+        thread.start()
 
     def stop_training(self) -> None:
-        """Yêu cầu dừng huấn luyện an toàn ở bất kỳ giai đoạn nào."""
+        """Request a safe stop without erasing terminal run metrics."""
+        event: Optional[Dict[str, Any]] = None
+        trainer: Optional[Trainer] = None
         with self._lock:
             if self.status == "STOPPING":
                 logger.info("Yêu cầu dừng khi đang ở trạng thái STOPPING (đã nhận lệnh trước đó).")
@@ -544,63 +548,37 @@ class TrainingService:
             if self.status == "STARTING":
                 self.status = "STOPPING"
                 self._abort_requested.set()
-                self.broadcast(
-                    {
-                        "type": "status",
-                        "status": "STOPPING",
-                        "message": "Đang hủy tiến trình khởi tạo...",
-                    }
-                )
-                logger.info("Yêu cầu dừng khi đang ở trạng thái STARTING.")
-                return
-
-            if self.status == "RUNNING":
+                event = self._status_event_locked("Đang hủy tiến trình khởi tạo...")
+            elif self.status == "RUNNING":
                 self.status = "STOPPING"
                 self._abort_requested.set()
-                if self.trainer:
-                    self.trainer.request_stop()
-                self.broadcast(
-                    {
-                        "type": "status",
-                        "status": "STOPPING",
-                        "message": "Đang dừng huấn luyện an toàn...",
-                    }
+                trainer = self.trainer
+                event = self._status_event_locked("Đang dừng huấn luyện an toàn...")
+            else:
+                logger.info(
+                    f"Yêu cầu dừng được gửi nhưng trạng thái hiện tại là '{self.status}' (bỏ qua)."
                 )
-                logger.info("Đã gửi tín hiệu dừng huấn luyện an toàn (request_stop).")
                 return
 
-            logger.info(
-                f"Yêu cầu dừng được gửi nhưng trạng thái hiện tại là '{self.status}' (bỏ qua)."
-            )
+        if trainer is not None:
+            trainer.request_stop()
+        if event is not None:
+            self.broadcast(event)
+        logger.info("Đã gửi tín hiệu dừng huấn luyện an toàn.")
 
-    def stream_events(self) -> Iterator[str]:
-        """SSE stream phát sự kiện huấn luyện độc lập cho từng client bằng Pub/Sub."""
+    def stream_events(self) -> Generator[str, None, None]:
+        """SSE stream with an authoritative versioned snapshot followed by deltas."""
         client_q = self.register_subscriber()
 
         try:
-            # Gửi dữ liệu lịch sử đầu tiên cho client mới kết nối
-            initial_payload = json.dumps(
-                {
-                    "type": "init",
-                    "status": self.status,
-                    "history_steps": self.history_steps[-300:],
-                    "history_evals": self.history_evals,
-                    "sample_history": self.sample_history[-5:],
-                    "current_step": self.current_step,
-                    "current_loss": self.current_loss,
-                    "current_val_loss": self.current_val_loss,
-                    "max_iters": self.max_iters,
-                }
-            )
+            initial_payload = json.dumps({"type": "init", **self.get_state()})
             yield f"data: {initial_payload}\n\n"
 
             while True:
                 try:
-                    # Đợi sự kiện mới trong tối đa 1.0 giây
                     evt = client_q.get(timeout=1.0)
                     yield f"data: {json.dumps(evt)}\n\n"
                 except queue.Empty:
-                    # Gửi heartbeat giữ kết nối SSE
                     yield f": heartbeat {time.time()}\n\n"
         finally:
             self.unregister_subscriber(client_q)

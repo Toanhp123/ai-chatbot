@@ -1,6 +1,10 @@
 import React from "react";
 import { Badge, Button, StatCard } from "@/shared/ui";
-import type { TrainingStatus, PreflightMemoryInfo } from "@/entities/training";
+import type {
+	TrainingStatus,
+	TrainingTerminationReason,
+	PreflightMemoryInfo,
+} from "@/entities/training";
 import {
 	Activity,
 	Play,
@@ -16,6 +20,8 @@ import {
 
 export interface TrainingMetricsRibbonWidgetProps {
 	status: TrainingStatus;
+	terminationReason: TrainingTerminationReason;
+	errorMessage: string | null;
 	currentStep: number;
 	maxIters: number;
 	currentLoss: number | null;
@@ -23,6 +29,8 @@ export interface TrainingMetricsRibbonWidgetProps {
 	currentLr: number | null;
 	preflightInfo: PreflightMemoryInfo | null;
 	isStarting: boolean;
+	isStartDisabled?: boolean;
+	configLoadError?: string | null;
 	isStopping?: boolean;
 	onStart: () => void;
 	onStop: () => void;
@@ -40,6 +48,8 @@ export const TrainingMetricsRibbonWidget: React.FC<
 	TrainingMetricsRibbonWidgetProps
 > = ({
 	status,
+	terminationReason,
+	errorMessage,
 	currentStep,
 	maxIters,
 	currentLoss,
@@ -47,6 +57,8 @@ export const TrainingMetricsRibbonWidget: React.FC<
 	currentLr,
 	preflightInfo,
 	isStarting,
+	isStartDisabled = false,
+	configLoadError = null,
 	isStopping,
 	onStart,
 	onStop,
@@ -115,7 +127,6 @@ export const TrainingMetricsRibbonWidget: React.FC<
 						<CheckCircle2 className="w-3.5 h-3.5 mr-1" /> HOÀN THÀNH
 					</Badge>
 				);
-			case "FAILED":
 			case "ERROR":
 				return (
 					<Badge
@@ -213,6 +224,7 @@ export const TrainingMetricsRibbonWidget: React.FC<
 							size="md"
 							variant="primary"
 							onClick={onStart}
+							disabled={isStartDisabled}
 							className="font-semibold shadow-warm-sm min-w-[210px] justify-center transition-all duration-200 bg-amber-700 hover:bg-amber-800 text-amber-50"
 							title={`Tiếp tục huấn luyện từ ${resumeTarget.filename} (bước ${(resumeTarget.step ?? 0) + 1})`}
 						>
@@ -224,6 +236,7 @@ export const TrainingMetricsRibbonWidget: React.FC<
 							size="md"
 							variant="primary"
 							onClick={onStart}
+							disabled={isStartDisabled}
 							className="font-semibold shadow-warm-sm min-w-[185px] justify-center transition-all duration-200"
 						>
 							<Play className="w-4 h-4 mr-2 fill-current" />
@@ -232,6 +245,27 @@ export const TrainingMetricsRibbonWidget: React.FC<
 					)}
 				</div>
 			</div>
+
+			{configLoadError && (
+				<div className="p-3 px-4 rounded-xl bg-amber-50 border border-amber-200 text-xs text-amber-900 shadow-warm-xs">
+					<strong className="font-semibold">Không thể nạp cấu hình training canonical:</strong>{" "}
+					<span className="font-mono break-words">{configLoadError}</span>
+					<span> — nút Start được khóa để tránh chạy bằng giá trị fallback hiển thị sai.</span>
+				</div>
+			)}
+
+			{status === "ERROR" && errorMessage && (
+				<div className="p-3 px-4 rounded-xl bg-rose-50 border border-rose-200 text-xs text-rose-800 shadow-warm-xs">
+					<strong className="font-semibold">Lỗi huấn luyện:</strong>{" "}
+					<span className="font-mono break-words">{errorMessage}</span>
+				</div>
+			)}
+
+			{status === "COMPLETED" && terminationReason === "EARLY_STOPPED" && (
+				<div className="p-3 px-4 rounded-xl bg-emerald-50 border border-emerald-200 text-xs text-emerald-800 shadow-warm-xs">
+					Huấn luyện đã hoàn tất bằng Early Stopping; metrics cuối được giữ lại để đánh giá.
+				</div>
+			)}
 
 			{/* Resume Notification Banner */}
 			{!isCurrentlyActive && resumeTarget && (

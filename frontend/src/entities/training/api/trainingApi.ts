@@ -1,19 +1,30 @@
 import { request } from "@/shared/api";
 import type {
 	PreflightMemoryInfo,
+	ResolvedTrainingConfig,
+	TrainingFeasibilityPayload,
+	TrainingStartPayload,
 	TrainingStateResponse,
 } from "../model/types";
 
 export const trainingApi = {
 	getTrainingStatus: () =>
-		request<TrainingStateResponse>("/api/training/status"),
+		request<TrainingStateResponse>("/api/training/status", {
+			skipCache: true,
+		}),
 
-	startTraining: (payload: any) =>
+	getResolvedConfig: (path: string) =>
+		request<ResolvedTrainingConfig>(
+			`/api/training/config?path=${encodeURIComponent(path)}`,
+			{ skipCache: true },
+		),
+
+	startTraining: (payload: TrainingStartPayload) =>
 		request<{
 			status: string;
 			message: string;
-			preflight: any;
-			state: any;
+			preflight: PreflightMemoryInfo;
+			state: TrainingStateResponse;
 		}>("/api/training/start", {
 			method: "POST",
 			body: JSON.stringify(payload),
@@ -29,7 +40,7 @@ export const trainingApi = {
 			method: "POST",
 		}),
 
-	checkFeasibility: (payload: any) =>
+	checkFeasibility: (payload: TrainingFeasibilityPayload) =>
 		request<PreflightMemoryInfo>("/api/training/check-feasibility", {
 			method: "POST",
 			body: JSON.stringify(payload),
