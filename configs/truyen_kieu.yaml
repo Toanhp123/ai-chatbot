@@ -1,0 +1,56 @@
+# Cấu hình chuẩn hóa cho bài toán huấn luyện Mini-GPT trên tác phẩm Truyện Kiều
+
+system:
+    seed: 1337
+    device: "auto" # "auto", "cuda", hoặc "cpu"
+    mixed_precision: false # Có dùng amp fp16/bf16 không (mặc định false cho GTX 1660 FP32 chuẩn)
+    log_level: "INFO"
+    log_file: "logs/engine.log"
+
+data:
+    data_dir: "data"
+    input_file: "data/input.txt"
+    vocab_file: "data/vocab.json"
+    source_url: "https://raw.githubusercontent.com/duyet/truyenkieu-word2vec/master/truyen_kieu_data.txt"
+    split_ratio: 0.9
+    clean_line_numbers: true
+    cleaner_type: "default" # "default" (Unicode NFC), "pipeline", hoặc "none"
+    tokenizer_type: "char" # "char" (cấp ký tự) hoặc "byte" (cấp byte UTF-8 Zero OOV)
+    batch_provider_type: "tensor" # "tensor" (siêu tốc in-memory) hoặc "dataloader" (PyTorch chuẩn)
+    num_workers: 0 # Số worker nạp dữ liệu (0 khuyến nghị trên Windows)
+    pin_memory: true # Pin memory sang GPU nhanh hơn
+
+model:
+    name: "minigpt"
+    vocab_size: 129 # Tự động cập nhật khi nạp tokenizer nếu khác
+    block_size: 128
+    n_embd: 192
+    n_head: 6
+    n_layer: 4
+    dropout: 0.1
+    tie_word_embeddings: true # Tối ưu chia sẻ trọng số giữa wte và lm_head
+    bias: false # Tắt bias trong linear/layer_norm theo chuẩn LLaMA/GPT hiện đại
+
+training:
+    batch_size: 64
+    max_iters: 3000
+    eval_interval: 300
+    eval_iters: 50
+    learning_rate: 0.0003
+    min_lr: 0.00003
+    warmup_iters: 100
+    weight_decay: 0.1
+    grad_clip: 1.0
+    checkpoint_dir: "checkpoints"
+    checkpoint_name: "best_model.pt"
+    early_stopping_patience: 10
+    gradient_accumulation_steps: 1 # Tích lũy gradient (micro-batching)
+    gradient_checkpointing: false # Đổi tính toán lấy bộ nhớ VRAM
+    precision: "float32" # "float32", "amp_fp16", "amp_bf16"
+    optimizer_type: "adamw" # "adamw", "8bit_adamw", "sgd"
+
+generation:
+    max_new_tokens: 250
+    temperature: 0.75
+    top_k: 40
+    top_p: 0.9

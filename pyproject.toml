@@ -1,0 +1,73 @@
+[project]
+name = "ai-train"
+version = "0.1.0"
+description = "Modular Mini-GPT Training and Inference Engine in PyTorch"
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.1",
+    "numpy>=1.24",
+    "PyYAML>=6.0",
+    "psutil>=5.9",
+    "rich>=13.0",
+    "fastapi>=0.110",
+    "pydantic>=2.0",
+    "uvicorn>=0.29",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.6",
+    "pyright>=1.1",
+]
+eight-bit = ["bitsandbytes>=0.43"]
+gemini = ["google-genai>=1.0"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+exclude = [
+    ".git",
+    ".pytest_cache",
+    ".ruff_cache",
+    ".vscode",
+    "checkpoints",
+    "logs",
+    "data",
+]
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle errors
+    "W",   # pycodestyle warnings
+    "F",   # pyflakes
+    "I",   # isort (sắp xếp import tự động)
+]
+ignore = [
+    "E501",  # Line quá dài (do ruff format tự động xuống dòng)
+    "E402",  # Module import not at top (dành cho main.py cấu hình UTF-8 trước khi import)
+]
+
+[tool.ruff.lint.per-file-ignores]
+# File __init__.py đóng vai trò Re-export nên không báo lỗi F401 (unused import)
+"__init__.py" = ["F401", "F403"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+skip-magic-trailing-comma = false
+line-ending = "auto"
+
+[tool.pyright]
+include = ["src", "scripts", "tests", "main.py"]
+pythonVersion = "3.11"
+reportMissingTypeStubs = false
+reportUnreachable = "error"
+
+reportUnusedImport = "error"
+reportUnusedVariable = "error"
+reportDuplicateImport = "error"
+
+
+
+

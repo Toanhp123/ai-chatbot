@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.pyright/
+.venv/
+venv/
+
+# Runtime/generated artifacts
+.cache/
+checkpoints/
+logs/
+*.log
+
+# Generated binary datasets
+*.bin
+
+# Frontend dependencies/build artifacts
+frontend/node_modules/
+frontend/dist/
+src/ui/dist/assets/
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Environment variables
+.env
+.env.*
+!.env.example
+
