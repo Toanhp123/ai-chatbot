@@ -192,3 +192,75 @@ def test_binary_token_storage_rejects_values_outside_dtype_range(tmp_path) -> No
     tokens = torch.tensor([0, 65_535, 65_536], dtype=torch.long)
     with pytest.raises(DataPipelineError, match="range"):
         DataPipeline.save_to_binary(tokens, str(tmp_path / "tokens.bin"), dtype="uint16")
+
+
+def test_existing_local_input_is_cleaned_before_tokenization(tmp_path) -> None:
+    input_file = tmp_path / "input.txt"
+    input_file.write_text(("001 Hello    world!\n" * 8), encoding="utf-8")
+    config = DataConfig(
+        data_dir=str(tmp_path),
+        input_file=str(input_file),
+        vocab_file=str(tmp_path / "vocab.json"),
+        clean_line_numbers=True,
+    )
+
+    text = DataPipeline.fetch_or_load_text(config, cleaner=TextCleaner(clean_line_numbers=True))
+
+    assert "001" not in text
+    assert "    " not in text
+    assert "Hello world!" in text
+
+
+def test_setup_data_rejects_split_too_short_for_block_size(tmp_path) -> None:
+    input_file = tmp_path / "input.txt"
+    # 120 one-byte/character tokens => validation split ~12 tokens at ratio 0.9.
+    input_file.write_text("a" * 120, encoding="utf-8")
+    config = DataConfig(
+        data_dir=str(tmp_path),
+        input_file=str(input_file),
+        vocab_file=str(tmp_path / "vocab.json"),
+        split_ratio=0.9,
+        cleaner_type="none",
+    )
+
+    with pytest.raises(DatasetEmptyError, match="block_size|validation|đánh giá"):
+        DataPipeline.setup_data(config, block_size=16)
+
+
+def test_dataloader_provider_restores_cursor_and_shuffle_order_for_exact_resume() -> None:
+    from src.data.batch_provider import DataLoaderBatchProvider
+    from src.data.dataset import TextDataset
+
+    data = torch.arange(0, 80, dtype=torch.long)
+    train_dataset = TextDataset(data[:60], block_size=4)
+    val_dataset = TextDataset(data[20:], block_size=4)
+
+    torch.manual_seed(123)
+    provider = DataLoaderBatchProvider(train_dataset, val_dataset, num_workers=0)
+    provider.get_train_batch(batch_size=3, block_size=4, device="cpu")
+    provider.get_val_batch(batch_size=3, block_size=4, device="cpu")
+    saved = provider.state_dict()
+    expected_train = provider.get_train_batch(batch_size=3, block_size=4, device="cpu")
+    expected_val = provider.get_val_batch(batch_size=3, block_size=4, device="cpu")
+
+    resumed = DataLoaderBatchProvider(train_dataset, val_dataset, num_workers=0)
+    resumed.load_state_dict(saved)
+    actual_train = resumed.get_train_batch(batch_size=3, block_size=4, device="cpu")
+    actual_val = resumed.get_val_batch(batch_size=3, block_size=4, device="cpu")
+
+    assert resumed.supports_exact_resume is True
+    assert torch.equal(actual_train[0], expected_train[0])
+    assert torch.equal(actual_train[1], expected_train[1])
+    assert torch.equal(actual_val[0], expected_val[0])
+    assert torch.equal(actual_val[1], expected_val[1])
+
+
+def test_multiworker_dataloader_provider_does_not_claim_exact_resume() -> None:
+    from src.data.batch_provider import DataLoaderBatchProvider
+    from src.data.dataset import TextDataset
+
+    data = torch.arange(0, 40, dtype=torch.long)
+    dataset = TextDataset(data, block_size=4)
+    provider = DataLoaderBatchProvider(dataset, dataset, num_workers=1)
+
+    assert provider.supports_exact_resume is False

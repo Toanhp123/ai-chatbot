@@ -3,13 +3,27 @@ Bộ mã hóa cấp độ byte UTF-8 tiêu chuẩn công nghiệp.
 Kích thước 260 tokens, Zero OOV, hỗ trợ đa ngữ và emoji.
 """
 
+import codecs
 import json
 import os
 from typing import Any, List, Optional
 
 from src.core.exceptions import VocabularyMissingError
-from src.data.tokenizers.base import BaseTokenizer
+from src.data.tokenizers.base import BaseTokenizer, IncrementalTextDecoder
 from src.data.tokenizers.registry import TokenizerRegistry
+
+
+class _ByteIncrementalDecoder(IncrementalTextDecoder):
+    def __init__(self, tokenizer: "ByteTokenizer") -> None:
+        super().__init__(tokenizer)
+        self._decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+
+    def push(self, tokens: List[int]) -> str:
+        raw = bytes(token for token in tokens if 0 <= token < 256)
+        return self._decoder.decode(raw, final=False)
+
+    def finish(self) -> str:
+        return self._decoder.decode(b"", final=True)
 
 
 @TokenizerRegistry.register("byte", "utf8", "utf-8")
@@ -71,6 +85,21 @@ class ByteTokenizer(BaseTokenizer):
     @property
     def eos_token_id(self) -> Optional[int]:
         return self._eos_id
+
+    def identity_payload(self) -> dict[str, Any]:
+        return {
+            "tokenizer_type": "byte",
+            "vocab_size": self._vocab_size,
+            "special_tokens": {
+                "pad": self._pad_token,
+                "unk": self._unk_token,
+                "bos": self._bos_token,
+                "eos": self._eos_token,
+            },
+        }
+
+    def create_incremental_decoder(self) -> IncrementalTextDecoder:
+        return _ByteIncrementalDecoder(self)
 
     def encode(self, text: str) -> List[int]:
         if not text:

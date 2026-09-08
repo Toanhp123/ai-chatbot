@@ -8,9 +8,11 @@ Unit tests for enterprise training callbacks system:
 """
 
 import os
+import random
 import tempfile
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, cast
 
+import numpy as np
 import pytest
 import torch
 import torch.nn as nn
@@ -51,6 +53,16 @@ class DummyTrainer:
 
     def get_config_dict(self) -> Dict[str, Any]:
         return self.config_dict
+
+    def get_checkpoint_state(self) -> Dict[str, Any]:
+        return {
+            "checkpoint_version": 2,
+            "model_state_dict": self.get_model_state_dict(),
+            "optimizer_state_dict": self.get_optimizer_state_dict(),
+            "config": self.get_config_dict(),
+            "tokenizer_identity": None,
+            "runtime_state": {},
+        }
 
 
 def test_trainer_protocol_conformance() -> None:
@@ -261,3 +273,125 @@ def test_model_checkpoint_failed_save_preserves_existing_file(tmp_path, monkeypa
 
     assert target.read_bytes() == b"known-good"
     assert not list(tmp_path.glob("*.tmp"))
+
+
+def test_model_checkpoint_top_k_handles_non_monotonic_scores() -> None:
+    with tempfile.TemporaryDirectory() as tmpdir:
+        cb = ModelCheckpointCallback(
+            save_dir=tmpdir,
+            filename="best.pt",
+            monitor="val_loss",
+            mode="min",
+            save_top_k=2,
+            save_last=False,
+            run_name="nonmono",
+        )
+        trainer = DummyTrainer()
+        cb.on_train_begin(trainer)
+        cb.on_eval_end(trainer, step=10, metrics={"val_loss": 3.0})
+        cb.on_eval_end(trainer, step=20, metrics={"val_loss": 1.0})
+        cb.on_eval_end(trainer, step=30, metrics={"val_loss": 2.0})
+
+        versioned = sorted(name for name in os.listdir(tmpdir) if name.startswith("nonmono_step"))
+        assert versioned == [
+            "nonmono_step20_val1.0000.pt",
+            "nonmono_step30_val2.0000.pt",
+        ]
+
+
+def test_last_checkpoint_keeps_last_metric_not_historical_best() -> None:
+    with tempfile.TemporaryDirectory() as tmpdir:
+        cb = ModelCheckpointCallback(
+            save_dir=tmpdir,
+            filename="best.pt",
+            monitor="val_loss",
+            mode="min",
+            save_top_k=0,
+            save_last=True,
+        )
+        trainer = DummyTrainer()
+        cb.on_train_begin(trainer)
+        cb.on_eval_end(trainer, step=10, metrics={"val_loss": 1.0})
+        cb.on_eval_end(trainer, step=20, metrics={"val_loss": 2.0})
+        cb.on_train_end(trainer)
+
+        state = torch.load(os.path.join(tmpdir, "last_model.pt"), weights_only=True)
+        assert state["step"] == 20
+        assert state["val_loss"] == pytest.approx(2.0)
+
+
+def test_sample_callback_does_not_advance_training_rng() -> None:
+    cb = SampleGenerationCallback(sample_fn=lambda _step: str(torch.rand(3).tolist()))
+    trainer = DummyTrainer()
+    torch.manual_seed(1234)
+    before = torch.random.get_rng_state().clone()
+
+    cb.on_eval_end(trainer, step=1, metrics={"val_loss": 1.0})
+
+    assert torch.equal(torch.random.get_rng_state(), before)
+
+
+def test_sample_callback_preserves_python_numpy_and_torch_rng() -> None:
+    def sample_fn(_step: int) -> str:
+        _ = random.random()
+        _ = np.random.random()
+        _ = torch.rand(3)
+        return "sample"
+
+    cb = SampleGenerationCallback(sample_fn=sample_fn)
+    trainer = DummyTrainer()
+    random.seed(77)
+    np.random.seed(77)
+    torch.manual_seed(77)
+    python_before = random.getstate()
+    numpy_before = cast(
+        tuple[str, np.ndarray, int, int, float],
+        np.random.get_state(legacy=True),
+    )
+    torch_before = torch.random.get_rng_state().clone()
+
+    cb.on_eval_end(trainer, step=1, metrics={"val_loss": 1.0})
+
+    assert random.getstate() == python_before
+    numpy_after = cast(
+        tuple[str, np.ndarray, int, int, float],
+        np.random.get_state(legacy=True),
+    )
+    assert numpy_after[0] == numpy_before[0]
+    assert np.array_equal(numpy_after[1], numpy_before[1])
+    assert numpy_after[2:] == numpy_before[2:]
+    assert torch.equal(torch.random.get_rng_state(), torch_before)
+
+
+def test_model_checkpoint_restores_zero_or_negative_best_metric(tmp_path) -> None:
+    zero_path = tmp_path / "best_zero.pt"
+    torch.save({"accuracy": 0.0, "val_loss": 1.0}, zero_path)
+    zero_cb = ModelCheckpointCallback(
+        save_dir=str(tmp_path), filename="best_zero.pt", monitor="accuracy", mode="max"
+    )
+    zero_cb.on_train_begin(DummyTrainer())
+    assert zero_cb.best_score == pytest.approx(0.0)
+
+    negative_path = tmp_path / "best_negative.pt"
+    torch.save({"accuracy": -0.25, "val_loss": 1.0}, negative_path)
+    negative_cb = ModelCheckpointCallback(
+        save_dir=str(tmp_path), filename="best_negative.pt", monitor="accuracy", mode="max"
+    )
+    negative_cb.on_train_begin(DummyTrainer())
+    assert negative_cb.best_score == pytest.approx(-0.25)
+
+
+def test_checkpoint_callback_drops_missing_top_k_paths_when_restoring(tmp_path) -> None:
+    existing = tmp_path / "existing.pt"
+    existing.write_bytes(b"placeholder")
+    missing = tmp_path / "missing.pt"
+    cb = ModelCheckpointCallback(save_dir=str(tmp_path), save_top_k=2)
+
+    cb.load_state_dict(
+        {
+            "best_score": 0.5,
+            "top_k_checkpoints": [[0.5, str(existing)], [0.6, str(missing)]],
+        }
+    )
+
+    assert cb.top_k_checkpoints == [(0.5, str(existing))]

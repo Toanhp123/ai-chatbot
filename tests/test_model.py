@@ -1,13 +1,15 @@
-from typing import Optional, Tuple
+from typing import Any, Optional, Tuple, cast
 
 import pytest
 import torch
+import torch.nn as nn
 
 from src.core.config import ModelConfig
 from src.core.exceptions import ContextLengthExceededError, ModelNotFoundError
 from src.models.architectures.llama import LlamaNano
 from src.models.architectures.minigpt import MiniGPT
 from src.models.base import BaseModel
+from src.models.layers.block import LlamaBlock, TransformerBlock
 from src.models.registry import ModelRegistry
 
 
@@ -203,3 +205,115 @@ def test_context_length_exceeded_error():
     with pytest.raises(ContextLengthExceededError) as exc_info:
         model(long_input)
     assert "Độ dài chuỗi đầu vào (10) vượt quá giới hạn" in str(exc_info.value)
+
+
+def test_minigpt_respects_disabled_weight_tying() -> None:
+    cfg = ModelConfig(
+        name="minigpt",
+        vocab_size=32,
+        block_size=16,
+        n_embd=16,
+        n_head=2,
+        n_layer=1,
+        tie_word_embeddings=False,
+    )
+    model = MiniGPT(cfg)
+    wte = cast(nn.Embedding, model.wte)
+    lm_head = cast(nn.Linear, model.lm_head)
+
+    assert wte.weight.data_ptr() != lm_head.weight.data_ptr()
+
+
+def test_minigpt_bias_flag_is_applied_consistently() -> None:
+    cfg = ModelConfig(
+        name="minigpt",
+        vocab_size=32,
+        block_size=16,
+        n_embd=16,
+        n_head=2,
+        n_layer=1,
+        bias=True,
+    )
+    model = MiniGPT(cfg)
+    blocks = cast(nn.ModuleList, model.blocks)
+    block = cast(TransformerBlock, blocks[0])
+
+    assert block.attn.c_attn.bias is not None
+    assert block.attn.c_proj.bias is not None
+    assert block.mlp.net[0].bias is not None
+    assert block.mlp.net[2].bias is not None
+    lm_head = cast(nn.Linear, model.lm_head)
+    assert lm_head.bias is not None
+
+
+def test_llama_bias_flag_is_applied_to_linear_layers() -> None:
+    cfg = ModelConfig(
+        name="llama",
+        vocab_size=32,
+        block_size=16,
+        n_embd=16,
+        n_head=2,
+        n_layer=1,
+        bias=True,
+    )
+    model = LlamaNano(cfg)
+    blocks = cast(nn.ModuleList, model.blocks)
+    block = cast(LlamaBlock, blocks[0])
+
+    assert block.attn.q_proj.bias is not None
+    assert block.attn.o_proj.bias is not None
+    assert block.mlp.w1.bias is not None
+    assert block.mlp.w2.bias is not None
+    assert block.mlp.w3.bias is not None
+    lm_head = cast(nn.Linear, model.lm_head)
+    assert lm_head.bias is not None
+
+
+@pytest.mark.parametrize(
+    "cfg",
+    [
+        ModelConfig(name="llama", vocab_size=16, block_size=8, n_embd=6, n_head=2, n_layer=1),
+        ModelConfig(name="llama", model_kwargs={"multiple_of": 0}),
+        ModelConfig(name="llama", model_kwargs={"norm_eps": -1.0}),
+    ],
+)
+def test_llama_invalid_architecture_specific_config_fails_validation(cfg: ModelConfig) -> None:
+    from src.core.exceptions import ConfigurationError
+
+    with pytest.raises(ConfigurationError):
+        cfg.validate()
+
+
+def test_llama_bias_flag_is_applied_consistently() -> None:
+    from src.core.config import ModelConfig
+    from src.models.architectures.llama import LlamaNano
+
+    base: dict[str, Any] = dict(
+        name="llama",
+        vocab_size=16,
+        block_size=8,
+        n_embd=8,
+        n_head=2,
+        n_layer=1,
+        dropout=0.0,
+    )
+    without_bias = LlamaNano(ModelConfig(**base, bias=False))
+    with_bias = LlamaNano(ModelConfig(**base, bias=True))
+
+    no_blocks = cast(nn.ModuleList, without_bias.blocks)
+    yes_blocks = cast(nn.ModuleList, with_bias.blocks)
+    no_block = cast(LlamaBlock, no_blocks[0])
+    yes_block = cast(LlamaBlock, yes_blocks[0])
+    assert no_block.attn.q_proj.bias is None
+    assert no_block.attn.o_proj.bias is None
+    assert no_block.mlp.w1.bias is None
+    assert no_block.mlp.w2.bias is None
+    without_bias_lm_head = cast(nn.Linear, without_bias.lm_head)
+    assert without_bias_lm_head.bias is None
+
+    assert yes_block.attn.q_proj.bias is not None
+    assert yes_block.attn.o_proj.bias is not None
+    assert yes_block.mlp.w1.bias is not None
+    assert yes_block.mlp.w2.bias is not None
+    with_bias_lm_head = cast(nn.Linear, with_bias.lm_head)
+    assert with_bias_lm_head.bias is not None

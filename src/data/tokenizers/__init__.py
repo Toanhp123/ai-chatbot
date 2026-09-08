@@ -6,6 +6,7 @@ from src.data.tokenizers.registry import (
     TokenizerRegistry,
     get_tokenizer,
     load_tokenizer,
+    load_tokenizer_state,
 )
 
 __all__ = [
@@ -13,6 +14,7 @@ __all__ = [
     "TokenizerRegistry",
     "get_tokenizer",
     "load_tokenizer",
+    "load_tokenizer_state",
     "CharTokenizer",
     "ByteTokenizer",
     "GeminiTokenizer",

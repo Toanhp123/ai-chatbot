@@ -3,6 +3,7 @@ Inference Service: Quản lý nạp mô hình, hoán đổi checkpoint và đi�
 """
 
 import json
+import math
 import os
 import threading
 import time
@@ -12,15 +13,18 @@ import torch
 
 from src.core.config import GenerationConfig, ModelConfig
 from src.core.logging import get_logger
-from src.data.tokenizers import BaseTokenizer, load_tokenizer
+from src.data.tokenizers import BaseTokenizer, load_tokenizer, load_tokenizer_state
+from src.data.tokenizers.base import get_tokenizer_identity
 from src.generation import (
     BaseGenerator,
+    GenerationOutput,
     GeneratorRegistry,
     TextIteratorStreamer,
     get_generator,
 )
 from src.models.base import BaseModel
 from src.models.registry import ModelRegistry
+from src.utils.device import resolve_device
 
 logger = get_logger("InferenceService")
 
@@ -39,16 +43,15 @@ class InferenceService:
         self.checkpoint_dir = checkpoint_dir
         self.current_checkpoint_path: Optional[str] = None
         self.vocab_path = vocab_path
-        self.device_str = (
-            "cuda"
-            if (device == "auto" and torch.cuda.is_available())
-            else ("cpu" if device == "auto" else device)
-        )
+        self.device_str = resolve_device(device)
         self.current_backend: str = backend
         self.tokenizer: Optional[BaseTokenizer] = None
         self.model: Optional[BaseModel] = None
         self.generator: Optional[BaseGenerator] = None
         self._lock = threading.Lock()
+        # Model/generator instances own mutable KV-cache state; serialize generation
+        # sessions so concurrent HTTP requests cannot corrupt one another.
+        self._generation_lock = threading.Lock()
 
         # Nạp mặc định nếu checkpoint và từ vựng tồn tại
         if os.path.exists(vocab_path):
@@ -63,6 +66,36 @@ class InferenceService:
             except Exception as e:
                 logger.warning(f"Chưa thể nạp checkpoint mặc định {default_checkpoint}: {e}")
 
+    def set_checkpoint_dir(self, checkpoint_dir: str) -> None:
+        """Update the single checkpoint directory used by list/delete/download flows."""
+        if not checkpoint_dir or not checkpoint_dir.strip():
+            raise ValueError("checkpoint_dir không được để trống.")
+        with self._lock:
+            self.checkpoint_dir = checkpoint_dir
+
+    def set_vocab_path(self, vocab_path: str) -> None:
+        """Update the vocab source used for future checkpoint loads without disturbing the active model."""
+        if not vocab_path or not vocab_path.strip():
+            raise ValueError("vocab_path không được để trống.")
+        with self._lock:
+            self.vocab_path = vocab_path
+
+    def resolve_checkpoint_path(self, path: str, *, filename_only: bool = False) -> str:
+        """Resolve a managed checkpoint path without allowing traversal or symlink escape."""
+        root = os.path.realpath(os.path.abspath(self.checkpoint_dir))
+        if filename_only:
+            candidate = os.path.realpath(os.path.join(root, os.path.basename(path)))
+        else:
+            candidate = os.path.realpath(os.path.abspath(path))
+            if os.path.dirname(path) in {"", "."}:
+                candidate = os.path.realpath(os.path.join(root, os.path.basename(path)))
+        try:
+            if os.path.commonpath([root, candidate]) != root or candidate == root:
+                raise ValueError
+        except ValueError as exc:
+            raise ValueError("Checkpoint phải nằm bên trong checkpoint_dir đã cấu hình.") from exc
+        return candidate
+
     def list_checkpoints(self) -> List[Dict[str, Any]]:
         """Quét và trả về danh sách tất cả checkpoint cùng metadata."""
         checkpoints: List[Dict[str, Any]] = []
@@ -71,7 +104,12 @@ class InferenceService:
 
         for fname in os.listdir(self.checkpoint_dir):
             if fname.endswith(".pt") or fname.endswith(".pth"):
-                fpath = os.path.join(self.checkpoint_dir, fname)
+                try:
+                    fpath = self.resolve_checkpoint_path(fname, filename_only=True)
+                except ValueError:
+                    continue
+                if not os.path.isfile(fpath):
+                    continue
                 stat = os.stat(fpath)
                 size_mb = round(stat.st_size / (1024 * 1024), 2)
                 modified_time = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(stat.st_mtime))
@@ -93,9 +131,7 @@ class InferenceService:
                         if raw_val is not None:
                             try:
                                 v = float(raw_val)
-                                import math
-
-                                if not math.isnan(v) and not math.isinf(v) and v > 0:
+                                if math.isfinite(v):
                                     val_loss = round(v, 4)
                             except (ValueError, TypeError):
                                 pass
@@ -186,13 +222,36 @@ class InferenceService:
             if not os.path.exists(checkpoint_path):
                 raise FileNotFoundError(f"Không tìm thấy file checkpoint: {checkpoint_path}")
 
-            tokenizer = self.tokenizer
-            if tokenizer is None and os.path.exists(self.vocab_path):
-                tokenizer = load_tokenizer(self.vocab_path)
-
             checkpoint = torch.load(
                 checkpoint_path, map_location=self.device_str, weights_only=True
             )
+            checkpoint_identity = checkpoint.get("tokenizer_identity")
+            if not isinstance(checkpoint_identity, dict):
+                raise ValueError(
+                    "Checkpoint legacy không có tokenizer identity; từ chối nạp để tránh ánh xạ token sai."
+                )
+            checkpoint_version = int(checkpoint.get("checkpoint_version", 1))
+            embedded_state = checkpoint.get("tokenizer_state")
+            if checkpoint_version >= 3 and not isinstance(embedded_state, dict):
+                raise ValueError("Checkpoint v3 thiếu tokenizer state bắt buộc.")
+            if isinstance(embedded_state, dict):
+                tokenizer = load_tokenizer_state(embedded_state)
+            else:
+                tokenizer = (
+                    load_tokenizer(self.vocab_path)
+                    if os.path.exists(self.vocab_path)
+                    else self.tokenizer
+                )
+            if tokenizer is None:
+                raise ValueError(
+                    "Không thể nạp checkpoint khi chưa có tokenizer/từ vựng tương ứng."
+                )
+            current_identity = get_tokenizer_identity(tokenizer)
+            if checkpoint_identity.get("fingerprint") != current_identity.get("fingerprint"):
+                raise ValueError(
+                    "Tokenizer/từ vựng hiện tại không khớp tokenizer identity của checkpoint."
+                )
+
             cfg_dict = checkpoint.get("config", {}).get("model", {})
             model_config = ModelConfig.from_kwargs_safe(cfg_dict, ignore_unknown=True)
             model = ModelRegistry.create(model_config.name, model_config)
@@ -223,7 +282,7 @@ class InferenceService:
         """Xóa một checkpoint khỏi thư mục lưu trữ an toàn."""
         with self._lock:
             safe_filename = os.path.basename(filename)
-            target_path = os.path.join(self.checkpoint_dir, safe_filename)
+            target_path = self.resolve_checkpoint_path(safe_filename, filename_only=True)
             if not os.path.exists(target_path):
                 raise FileNotFoundError(f"Không tìm thấy file checkpoint: {safe_filename}")
 
@@ -249,7 +308,10 @@ class InferenceService:
         """
         if backend and backend.lower().strip() != self.current_backend:
             self.set_backend(backend)
-        if not self.generator or not self.tokenizer:
+        with self._lock:
+            generator = self.generator
+            tokenizer = self.tokenizer
+        if generator is None or tokenizer is None:
             error_payload = json.dumps(
                 {
                     "error": "Chưa có mô hình hoặc từ vựng nào được nạp. Hãy kiểm tra lại checkpoint.",
@@ -260,18 +322,21 @@ class InferenceService:
 
         streamer = TextIteratorStreamer(timeout=30.0)
         generation_error: List[Exception] = []
+        generation_output: List[GenerationOutput] = []
         tokens_emitted: List[str] = []
         t0 = time.time()
 
         def worker() -> None:
             try:
-                assert self.generator is not None
-                self.generator.generate(
-                    prompt=prompt,
-                    config=config,
-                    streamer=streamer,
-                    return_output=False,
-                )
+                with self._generation_lock:
+                    result = generator.generate(
+                        prompt=prompt,
+                        config=config,
+                        streamer=streamer,
+                        return_output=True,
+                    )
+                    if isinstance(result, GenerationOutput):
+                        generation_output.append(result)
             except Exception as e:
                 logger.exception(f"Lỗi worker suy luận: {e}")
                 generation_error.append(e)
@@ -290,8 +355,15 @@ class InferenceService:
 
         thread.join(timeout=1.0)
         elapsed = time.time() - t0
-        token_count = len(tokens_emitted)
-        tps = round(token_count / elapsed, 2) if elapsed > 0 else 0.0
+        token_count = (
+            generation_output[0].tokens_generated if generation_output else len(tokens_emitted)
+        )
+        tps = round(
+            generation_output[0].tokens_per_second
+            if generation_output
+            else (token_count / elapsed if elapsed > 0 else 0.0),
+            2,
+        )
 
         if generation_error:
             yield f"data: {json.dumps({'type': 'error', 'message': str(generation_error[0])})}\n\n"

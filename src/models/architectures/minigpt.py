@@ -8,6 +8,7 @@ from typing import Optional, Tuple, cast
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 from src.core.config import ModelConfig
 from src.core.exceptions import ContextLengthExceededError
@@ -34,17 +35,26 @@ class MiniGPT(BaseModel):
         # Transformer Blocks
         self.blocks = nn.ModuleList(
             [
-                TransformerBlock(config.n_embd, config.n_head, config.block_size, config.dropout)
+                TransformerBlock(
+                    config.n_embd,
+                    config.n_head,
+                    config.block_size,
+                    config.dropout,
+                    bias=config.bias,
+                )
                 for _ in range(config.n_layer)
             ]
         )
         self.ln_f = nn.LayerNorm(config.n_embd)
 
         # Output LM Head
-        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=config.bias)
 
         # Weight tying (chia sẻ trọng số giữa embedding và head)
-        self.wte.weight = self.lm_head.weight
+        if config.tie_word_embeddings:
+            self.wte.weight = self.lm_head.weight
+
+        self.gradient_checkpointing = False
 
         # Khởi tạo trọng số chuẩn
         self.apply(self._init_weights)
@@ -64,6 +74,10 @@ class MiniGPT(BaseModel):
     @property
     def dtype(self) -> torch.dtype:
         return next(self.parameters()).dtype
+
+    def set_gradient_checkpointing(self, enabled: bool) -> None:
+        """Bật/tắt activation checkpointing cho các transformer block khi train."""
+        self.gradient_checkpointing = bool(enabled)
 
     def reset_kv_cache(self) -> None:
         """Xóa trạng thái cache Key-Value trên tất cả các transformer blocks."""
@@ -125,7 +139,14 @@ class MiniGPT(BaseModel):
 
         for block in self.blocks:
             tb = cast(TransformerBlock, block)
-            x = tb(x, use_cache=use_cache)
+            if self.gradient_checkpointing and self.training and not use_cache:
+                x = checkpoint(
+                    lambda hidden, current_block=tb: current_block(hidden, use_cache=False),
+                    x,
+                    use_reentrant=False,
+                )
+            else:
+                x = tb(x, use_cache=use_cache)
         x = self.ln_f(x)
 
         if targets is not None:

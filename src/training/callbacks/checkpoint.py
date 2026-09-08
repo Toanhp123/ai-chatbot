@@ -2,9 +2,10 @@
 Model checkpoint persistence callbacks with Top-K and Last checkpoint support.
 """
 
+import math
 import os
 import tempfile
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, cast
 
 import torch
 
@@ -70,9 +71,7 @@ class ModelCheckpointCallback(BaseCallback):
         self.min_delta = min_delta
         self.save_top_k = max(0, save_top_k)
         self.save_last = save_last
-        self.run_name = (
-            _validate_path_component(run_name, "run_name") if run_name else None
-        )
+        self.run_name = _validate_path_component(run_name, "run_name") if run_name else None
         self.best_score = float("inf") if mode == "min" else float("-inf")
         self.filepath = os.path.join(save_dir, self.filename)
         self.last_filepath = os.path.join(
@@ -82,6 +81,44 @@ class ModelCheckpointCallback(BaseCallback):
         self.canonical_last_filepath = os.path.join(save_dir, "last_model.pt")
         self.top_k_checkpoints: List[Tuple[float, str]] = []
         self.last_step = 0
+        self.last_eval_step = 0
+        self.last_metrics: Dict[str, float] = {}
+
+    def state_dict(self) -> Dict[str, object]:
+        return {
+            "best_score": self.best_score,
+            "top_k_checkpoints": [[score, path] for score, path in self.top_k_checkpoints],
+            "last_step": self.last_step,
+            "last_eval_step": self.last_eval_step,
+            "last_metrics": dict(self.last_metrics),
+        }
+
+    def load_state_dict(self, state: Dict[str, object]) -> None:
+        raw_best_score = cast(
+            float | int | str,
+            state.get(
+                "best_score",
+                float("inf") if self.mode == "min" else float("-inf"),
+            ),
+        )
+        self.best_score = float(raw_best_score)
+        raw_top_k = state.get("top_k_checkpoints", [])
+        restored: List[Tuple[float, str]] = []
+        if isinstance(raw_top_k, list):
+            for item in raw_top_k:
+                if isinstance(item, (list, tuple)) and len(item) == 2:
+                    restored.append((float(cast(float | int | str, item[0])), str(item[1])))
+        restored = [(score, path) for score, path in restored if os.path.exists(path)]
+        restored.sort(key=lambda x: x[0], reverse=(self.mode == "max"))
+        self.top_k_checkpoints = restored[: self.save_top_k] if self.save_top_k > 0 else []
+        self.last_step = int(cast(int | str, state.get("last_step", 0)))
+        self.last_eval_step = int(cast(int | str, state.get("last_eval_step", 0)))
+        raw_metrics = state.get("last_metrics", {})
+        self.last_metrics = (
+            {str(key): float(cast(float | int | str, value)) for key, value in raw_metrics.items()}
+            if isinstance(raw_metrics, dict)
+            else {}
+        )
 
     def on_train_begin(self, trainer: TrainerProtocol) -> None:
         os.makedirs(self.save_dir, exist_ok=True)
@@ -95,13 +132,7 @@ class ModelCheckpointCallback(BaseCallback):
                         saved_val = state.get("val_loss")
                     if saved_val is not None:
                         val_float = float(saved_val)
-                        import math
-
-                        if (
-                            not math.isnan(val_float)
-                            and not math.isinf(val_float)
-                            and val_float > 0
-                        ):
+                        if math.isfinite(val_float):
                             self.best_score = val_float
                             logger.info(
                                 f"🏆 [ModelCheckpoint] Đã nạp kỷ lục tốt nhất toàn cục từ '{self.filename}': "
@@ -118,6 +149,9 @@ class ModelCheckpointCallback(BaseCallback):
             return current < (self.best_score - self.min_delta)
         return current > (self.best_score + self.min_delta)
 
+    def _is_better(self, candidate: float, reference: float) -> bool:
+        return candidate < reference if self.mode == "min" else candidate > reference
+
     def _save_state(
         self,
         trainer: TrainerProtocol,
@@ -127,93 +161,89 @@ class ModelCheckpointCallback(BaseCallback):
         is_best: bool = False,
     ) -> None:
         val_loss = metrics.get("val_loss")
-        state = {
-            "step": step,
-            self.monitor: metrics.get(self.monitor),
-            "val_loss": val_loss,
-            "metrics": metrics,
-            "is_best": is_best,
-            "run_name": self.run_name,
-            "model_state_dict": trainer.get_model_state_dict(),
-            "optimizer_state_dict": trainer.get_optimizer_state_dict(),
-            "config": trainer.get_config_dict(),
-        }
+        state = dict(trainer.get_checkpoint_state())
+        state.update(
+            {
+                "step": step,
+                self.monitor: metrics.get(self.monitor),
+                "val_loss": val_loss,
+                "metrics": dict(metrics),
+                "is_best": is_best,
+                "run_name": self.run_name,
+            }
+        )
         _atomic_torch_save(state, path)
 
     def on_eval_end(self, trainer: TrainerProtocol, step: int, metrics: Dict[str, float]) -> None:
         self.last_step = step
+        self.last_eval_step = step
+        self.last_metrics = dict(metrics)
         if self.monitor not in metrics:
             logger.warning(
                 f"[ModelCheckpoint] Không tìm thấy chỉ số '{self.monitor}' trong metrics: {list(metrics.keys())}"
             )
             return
 
-        current = metrics[self.monitor]
+        current = float(metrics[self.monitor])
+        improved = self._is_improvement(current)
+        old_best = self.best_score
+        if improved:
+            self.best_score = current
 
-        # 1. Luôn lưu last checkpoint nếu save_last bật (cập nhật cả last_model.pt và session_last.pt)
+        versioned_path: Optional[str] = None
+        paths_to_remove: List[str] = []
+        if self.save_top_k > 0:
+            qualifies = len(self.top_k_checkpoints) < self.save_top_k
+            if not qualifies and self.top_k_checkpoints:
+                qualifies = self._is_better(current, self.top_k_checkpoints[-1][0])
+            if qualifies:
+                prefix = self.run_name if self.run_name else "checkpoint"
+                versioned_filename = f"{prefix}_step{step}_val{current:.4f}.pt"
+                versioned_path = os.path.join(self.save_dir, versioned_filename)
+                self.top_k_checkpoints.append((current, versioned_path))
+                self.top_k_checkpoints.sort(key=lambda x: x[0], reverse=(self.mode == "max"))
+                while len(self.top_k_checkpoints) > self.save_top_k:
+                    _, worst_path = self.top_k_checkpoints.pop()
+                    if worst_path != versioned_path:
+                        paths_to_remove.append(worst_path)
+
+        # Runtime state is captured only after this callback's state has been updated,
+        # so a resumed callback continues with the same best/top-k bookkeeping.
         if self.save_last:
             self._save_state(trainer, step, metrics, self.last_filepath)
             if self.last_filepath != self.canonical_last_filepath:
                 self._save_state(trainer, step, metrics, self.canonical_last_filepath)
 
-        # 2. Kiểm tra có cải thiện kỷ lục hay không
-        if self._is_improvement(current):
-            old_best = self.best_score
-            self.best_score = current
-
-            # A. Lưu canonical best checkpoint
+        if improved:
             self._save_state(trainer, step, metrics, self.filepath, is_best=True)
             logger.info(
-                f"⭐ [Checkpoint] Kỷ lục mới xuất sắc! ({self.monitor}: {current:.4f} < {old_best:.4f}). Đã cập nhật vào {self.filepath}"
+                f"⭐ [Checkpoint] Kỷ lục mới xuất sắc! ({self.monitor}: {current:.4f} so với {old_best:.4f}). "
+                f"Đã cập nhật vào {self.filepath}"
             )
-
-            # B. Lưu versioned checkpoint nếu save_top_k > 0
-            if self.save_top_k > 0:
-                prefix = self.run_name if self.run_name else "checkpoint"
-                versioned_filename = f"{prefix}_step{step}_val{current:.4f}.pt"
-                versioned_path = os.path.join(self.save_dir, versioned_filename)
-                self._save_state(trainer, step, metrics, versioned_path)
-
-                self.top_k_checkpoints.append((current, versioned_path))
-                # Sắp xếp: nếu min thì loss nhỏ đứng đầu; nếu max thì score lớn đứng đầu
-                self.top_k_checkpoints.sort(key=lambda x: x[0], reverse=(self.mode == "max"))
-
-                # Dọn dẹp nếu vượt quá save_top_k
-                while len(self.top_k_checkpoints) > self.save_top_k:
-                    _, worst_path = self.top_k_checkpoints.pop()
-                    if (
-                        os.path.exists(worst_path)
-                        and worst_path != self.filepath
-                        and worst_path != self.last_filepath
-                        and worst_path != self.canonical_last_filepath
-                    ):
-                        try:
-                            os.remove(worst_path)
-                            logger.info(
-                                f"🗑️ [Checkpoint] Đã dọn dẹp checkpoint cũ '{os.path.basename(worst_path)}' để duy trì top-{self.save_top_k}."
-                            )
-                        except OSError as e:
-                            logger.warning(f"Không thể xoá checkpoint cũ '{worst_path}': {e}")
         else:
             logger.info(
-                f"ℹ️ [Checkpoint] Bước {step} ({self.monitor}: {current:.4f}) chưa vượt qua kỷ lục tốt nhất ({self.best_score:.4f}). Giữ nguyên {self.filename}."
+                f"ℹ️ [Checkpoint] Bước {step} ({self.monitor}: {current:.4f}) chưa vượt qua "
+                f"kỷ lục tốt nhất ({self.best_score:.4f}). Giữ nguyên {self.filename}."
             )
 
+        if versioned_path is not None:
+            self._save_state(trainer, step, metrics, versioned_path)
+
+        for worst_path in paths_to_remove:
+            if os.path.exists(worst_path):
+                try:
+                    os.remove(worst_path)
+                    logger.info(
+                        f"🗑️ [Checkpoint] Đã dọn '{os.path.basename(worst_path)}' "
+                        f"để duy trì top-{self.save_top_k}."
+                    )
+                except OSError as exc:
+                    logger.warning(f"Không thể xoá checkpoint cũ '{worst_path}': {exc}")
+
     def on_train_end(self, trainer: TrainerProtocol) -> None:
-        """Đảm bảo lưu lại trạng thái bước cuối cùng khi kết thúc toàn bộ phiên huấn luyện."""
+        """Persist final weights without attaching a stale/best metric to different weights."""
         if self.save_last and self.last_step > 0:
-            best_val = (
-                self.best_score
-                if (
-                    self.best_score != float("inf")
-                    and self.best_score != float("-inf")
-                    and self.best_score > 0
-                )
-                else None
-            )
-            metrics: Dict[str, float] = {}
-            if best_val is not None:
-                metrics["val_loss"] = best_val
+            metrics = dict(self.last_metrics) if self.last_eval_step == self.last_step else {}
             try:
                 self._save_state(trainer, self.last_step, metrics, self.last_filepath)
                 if self.last_filepath != self.canonical_last_filepath:

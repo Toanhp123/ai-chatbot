@@ -238,3 +238,30 @@ def test_custom_tokenizer_registration_plug_and_play():
     dummy = get_tokenizer("custom_dummy")
     assert isinstance(dummy, DummyTokenizer)
     assert dummy.encode("anything") == [0, 1]
+
+
+def test_tokenizer_loader_rejects_unknown_metadata_type(tmp_path) -> None:
+    from src.data.tokenizers import load_tokenizer
+
+    vocab_file = tmp_path / "vocab.json"
+    vocab_file.write_text(
+        json.dumps({"version": "2.0", "tokenizer_type": "mystery", "vocab": ["a", "b"]}),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(DataPipelineError, match="mystery|Tokenizer"):
+        load_tokenizer(str(vocab_file))
+
+
+def test_legacy_gemini_tokenizer_has_same_token_identity_as_byte_tokenizer(tmp_path) -> None:
+    from src.data.tokenizers import GeminiTokenizer
+    from src.data.tokenizers.base import get_tokenizer_identity
+
+    byte_tokenizer = ByteTokenizer()
+    gemini_tokenizer = GeminiTokenizer(
+        api_key="unused-secret",
+        cache_dir=str(tmp_path / "cache"),
+    )
+
+    assert get_tokenizer_identity(gemini_tokenizer) == get_tokenizer_identity(byte_tokenizer)
+    assert not hasattr(gemini_tokenizer, "_client")

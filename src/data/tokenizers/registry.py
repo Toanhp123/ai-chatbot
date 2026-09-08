@@ -72,10 +72,11 @@ class TokenizerRegistry:
             if target_cls is not None:
                 return target_cls.load_vocab(filepath, **kwargs)
 
-            # Fallback nếu không xác định được loại
-            char_cls = cls._registry.get("char")
-            if char_cls is not None:
-                return char_cls.load_vocab(filepath, **kwargs)
+            raise DataPipelineError(
+                f"Loại Tokenizer trong metadata không được hỗ trợ: '{raw_type}'",
+                details={"requested_type": norm_type, "available_types": cls.list_available()},
+                suggestion="Không tự động fallback vì có thể làm thay đổi ngữ nghĩa token của checkpoint.",
+            )
 
         raise DataPipelineError(
             f"Định dạng file từ vựng không hợp lệ tại {filepath}",
@@ -99,9 +100,51 @@ def load_tokenizer(vocab_path: str, **kwargs: Any) -> BaseTokenizer:
     return TokenizerRegistry.load(vocab_path, **kwargs)
 
 
+def load_tokenizer_state(state: object) -> BaseTokenizer:
+    """Reconstruct a tokenizer from checkpoint-embedded semantic state."""
+    if not isinstance(state, dict):
+        raise DataPipelineError("Tokenizer state trong checkpoint không hợp lệ.")
+
+    raw_type = state.get("tokenizer_type")
+    norm_type = str(raw_type).lower().strip() if raw_type is not None else ""
+    special = state.get("special_tokens", {})
+    if not isinstance(special, dict):
+        special = {}
+
+    if norm_type == "char":
+        vocab = state.get("vocab")
+        if not isinstance(vocab, list) or not all(isinstance(token, str) for token in vocab):
+            raise DataPipelineError("Checkpoint CharTokenizer thiếu vocab hợp lệ.")
+        return TokenizerRegistry.create(
+            "char",
+            vocab=vocab,
+            add_special_tokens=bool(state.get("add_special_tokens", False)),
+            pad_token=str(special.get("pad", "<pad>")),
+            unk_token=str(special.get("unk", "<unk>")),
+            bos_token=str(special.get("bos", "<bos>")),
+            eos_token=str(special.get("eos", "<eos>")),
+        )
+
+    if norm_type == "byte":
+        return TokenizerRegistry.create(
+            "byte",
+            pad_token=str(special.get("pad", "<pad>")),
+            unk_token=str(special.get("unk", "<unk>")),
+            bos_token=str(special.get("bos", "<bos>")),
+            eos_token=str(special.get("eos", "<eos>")),
+        )
+
+    raise DataPipelineError(
+        f"Tokenizer state không thể phục hồi: '{raw_type}'.",
+        details={"tokenizer_type": raw_type, "available_types": ["char", "byte"]},
+        suggestion="Dùng checkpoint v3 được tạo bởi CharTokenizer/ByteTokenizer tương thích.",
+    )
+
+
 __all__ = [
     "BaseTokenizer",
     "TokenizerRegistry",
     "get_tokenizer",
     "load_tokenizer",
+    "load_tokenizer_state",
 ]

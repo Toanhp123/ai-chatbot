@@ -1,3 +1,5 @@
+import torch
+
 from src.core.config import GenerationConfig, ModelConfig
 from src.data.tokenizers.char import CharTokenizer
 from src.generation.generator import TextGenerator
@@ -51,3 +53,23 @@ def test_generator_with_and_without_kv_cache():
     )
     assert len(out_llama_cached) == len("hello") + 10
     assert out_llama_cached.startswith("hello")
+
+
+def test_text_generator_default_device_is_portable_auto(monkeypatch):
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    mps = getattr(torch.backends, "mps", None)
+    if mps is not None:
+        monkeypatch.setattr(mps, "is_available", lambda: False)
+
+    tokenizer = CharTokenizer("abc ")
+    cfg = ModelConfig(
+        name="minigpt",
+        vocab_size=tokenizer.vocab_size,
+        block_size=8,
+        n_embd=8,
+        n_head=2,
+        n_layer=1,
+    )
+    generator = TextGenerator(MiniGPT(cfg), tokenizer)
+
+    assert generator.device == "cpu"

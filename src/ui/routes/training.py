@@ -58,7 +58,7 @@ class StartTrainingRequest(BaseModel):
         default=None, description="Loại cleaner dữ liệu: default, gemini, passthrough"
     )
     tokenizer_type: Optional[str] = Field(
-        default=None, description="Loại tokenizer: char, byte, gemini"
+        default=None, description="Loại tokenizer: char, byte; gemini là alias legacy của byte"
     )
     gradient_checkpointing: Optional[bool] = Field(
         default=None, description="Bật gradient checkpointing (giảm 70% VRAM)"
@@ -105,7 +105,7 @@ async def check_feasibility_endpoint(req: CheckFeasibilityRequest):
     from src.core.diagnostics.estimator import check_memory_feasibility
 
     overrides = []
-    if req.batch_size:
+    if req.batch_size is not None:
         overrides.append(f"training.batch_size={req.batch_size}")
     if req.precision:
         overrides.append(f"training.precision={req.precision}")
@@ -113,23 +113,21 @@ async def check_feasibility_endpoint(req: CheckFeasibilityRequest):
         overrides.append(f"training.optimizer_type={req.optimizer_type}")
     if req.gradient_checkpointing is not None:
         overrides.append(f"training.gradient_checkpointing={req.gradient_checkpointing}")
-    if req.gradient_accumulation_steps:
+    if req.gradient_accumulation_steps is not None:
         overrides.append(f"training.gradient_accumulation_steps={req.gradient_accumulation_steps}")
     if req.model_name:
         overrides.append(f"model.name={req.model_name.strip().lower()}")
-    if req.n_layer:
+    if req.n_layer is not None:
         overrides.append(f"model.n_layer={req.n_layer}")
-    if req.n_embd:
+    if req.n_embd is not None:
         overrides.append(f"model.n_embd={req.n_embd}")
-    if req.n_head:
+    if req.n_head is not None:
         overrides.append(f"model.n_head={req.n_head}")
-    if req.block_size:
+    if req.block_size is not None:
         overrides.append(f"model.block_size={req.block_size}")
 
     try:
-        config = EngineConfig.from_yaml(
-            req.config_path, overrides=overrides if overrides else None
-        )
+        config = EngineConfig.from_yaml(req.config_path, overrides=overrides if overrides else None)
         feasible, msg, budget = check_memory_feasibility(
             model_config=config.model,
             training_config=config.training,
@@ -246,6 +244,8 @@ async def start_training_endpoint(req: StartTrainingRequest, request: Request):
             quick_check=req.quick_check,
             resume_checkpoint=req.resume_checkpoint,
         )
+        request.app.state.inference_service.set_checkpoint_dir(chk_config.training.checkpoint_dir)
+        request.app.state.inference_service.set_vocab_path(chk_config.data.vocab_file)
         return {
             "status": "success",
             "message": "Đã khởi chạy huấn luyện trên luồng nền.",

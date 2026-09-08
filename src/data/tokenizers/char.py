@@ -105,6 +105,21 @@ class CharTokenizer(BaseTokenizer):
     def eos_token_id(self) -> Optional[int]:
         return self._eos_id
 
+    def identity_payload(self) -> dict[str, Any]:
+        return {
+            "tokenizer_type": "char",
+            "vocab": list(self.chars),
+            "add_special_tokens": self.add_special_tokens,
+            "special_tokens": {
+                "pad": self._pad_token_str,
+                "unk": self._unk_token_str,
+                "bos": self._bos_token_str,
+                "eos": self._eos_token_str,
+            }
+            if self.add_special_tokens
+            else {},
+        }
+
     def encode(self, text: str) -> List[int]:
         if self._unk_id is not None:
             return [self.stoi.get(c, self._unk_id) for c in text]

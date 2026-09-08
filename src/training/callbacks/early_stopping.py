@@ -2,7 +2,7 @@
 Early stopping callback to prevent overfitting and save resources.
 """
 
-from typing import Dict
+from typing import Dict, cast
 
 from src.core.logging import get_logger
 from src.training.callbacks.base import BaseCallback, TrainerProtocol
@@ -26,6 +26,8 @@ class EarlyStoppingCallback(BaseCallback):
         patience: int = 10,
         min_delta: float = 1e-4,
     ) -> None:
+        if patience <= 0:
+            raise ValueError(f"patience phải > 0, nhận được {patience}")
         if mode not in ("min", "max"):
             raise ValueError(f"Chế độ mode không hợp lệ: '{mode}'. Chỉ chấp nhận 'min' hoặc 'max'.")
 
@@ -35,6 +37,18 @@ class EarlyStoppingCallback(BaseCallback):
         self.min_delta = min_delta
         self.counter = 0
         self.best_score = float("inf") if mode == "min" else float("-inf")
+
+    def state_dict(self) -> Dict[str, float | int]:
+        return {"counter": self.counter, "best_score": self.best_score}
+
+    def load_state_dict(self, state: Dict[str, object]) -> None:
+        self.counter = int(cast(int | str, state.get("counter", 0)))
+        self.best_score = float(
+            cast(
+                float | int | str,
+                state.get("best_score", float("inf") if self.mode == "min" else float("-inf")),
+            )
+        )
 
     def _is_improvement(self, current: float) -> bool:
         if self.mode == "min":

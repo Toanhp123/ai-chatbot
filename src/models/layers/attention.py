@@ -21,7 +21,14 @@ class CausalSelfAttention(nn.Module):
 
     bias: torch.Tensor
 
-    def __init__(self, n_embd: int, n_head: int, block_size: int, dropout: float = 0.1):
+    def __init__(
+        self,
+        n_embd: int,
+        n_head: int,
+        block_size: int,
+        dropout: float = 0.1,
+        bias: bool = False,
+    ):
         super().__init__()
         if n_embd % n_head != 0:
             raise ModelArchitectureError(
@@ -35,8 +42,8 @@ class CausalSelfAttention(nn.Module):
         self.dropout = dropout
 
         # Chiếu đồng thời Query, Key, Value
-        self.c_attn = nn.Linear(n_embd, 3 * n_embd, bias=False)
-        self.c_proj = nn.Linear(n_embd, n_embd, bias=False)
+        self.c_attn = nn.Linear(n_embd, 3 * n_embd, bias=bias)
+        self.c_proj = nn.Linear(n_embd, n_embd, bias=bias)
         self.attn_dropout = nn.Dropout(dropout)
         self.resid_dropout = nn.Dropout(dropout)
 
@@ -110,7 +117,13 @@ class CausalSelfAttention(nn.Module):
 class LlamaAttention(nn.Module):
     """Cơ chế Multi-Head Attention phong cách LLaMA với Rotary Embeddings và KV-Cache."""
 
-    def __init__(self, n_embd: int, n_head: int, dropout: float = 0.0):
+    def __init__(
+        self,
+        n_embd: int,
+        n_head: int,
+        dropout: float = 0.0,
+        bias: bool = False,
+    ):
         super().__init__()
         if n_embd % n_head != 0:
             raise ModelArchitectureError(
@@ -123,10 +136,10 @@ class LlamaAttention(nn.Module):
         self.head_dim = n_embd // n_head
         self.dropout = dropout
 
-        self.q_proj = nn.Linear(n_embd, n_embd, bias=False)
-        self.k_proj = nn.Linear(n_embd, n_embd, bias=False)
-        self.v_proj = nn.Linear(n_embd, n_embd, bias=False)
-        self.o_proj = nn.Linear(n_embd, n_embd, bias=False)
+        self.q_proj = nn.Linear(n_embd, n_embd, bias=bias)
+        self.k_proj = nn.Linear(n_embd, n_embd, bias=bias)
+        self.v_proj = nn.Linear(n_embd, n_embd, bias=bias)
+        self.o_proj = nn.Linear(n_embd, n_embd, bias=bias)
         self.resid_dropout = nn.Dropout(dropout) if dropout > 0.0 else nn.Identity()
 
         self._k_cache: Optional[torch.Tensor] = None

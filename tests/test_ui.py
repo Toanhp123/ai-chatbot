@@ -2,10 +2,17 @@
 Kiểm thử tự động cho phân hệ UI (FastAPI AI Studio Dashboard).
 """
 
+from typing import cast
+
 import pytest
+from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from src.ui.app import create_app
+
+
+def _app_state(client: TestClient):
+    return cast(FastAPI, client.app).state
 
 
 @pytest.fixture(scope="module")
@@ -213,7 +220,7 @@ def test_ui_diagnostics_logs(client: TestClient):
 
 
 def test_ui_explorer_tokenize_gemini(client: TestClient):
-    """Kiểm tra trực quan hóa Gemini AI Tokenizer (với Zero-OOV Fallback)."""
+    """Alias tokenizer legacy ``gemini`` vẫn tương thích với ByteTokenizer."""
     payload = {"text": "Trăm năm Kiều", "tokenizer_type": "gemini"}
     res = client.post("/api/explorer/tokenize", json=payload)
     assert res.status_code == 200
@@ -311,14 +318,14 @@ def test_ui_check_feasibility(client: TestClient):
 
 
 def test_ui_compare_tokenizers(client: TestClient):
-    """Kiểm tra so sánh đồng thời 3 bộ mã hóa Char, Byte và Gemini."""
+    """Chỉ so sánh các tokenizer có semantics khác nhau, không lặp alias Gemini."""
     payload = {"text": "Trăm năm trong cõi người ta"}
     res = client.post("/api/explorer/compare-tokenizers", json=payload)
     assert res.status_code == 200
     data = res.json()
     assert "comparisons" in data
     assert "byte" in data["comparisons"]
-    assert "gemini" in data["comparisons"]
+    assert "gemini" not in data["comparisons"]
     assert data["comparisons"]["byte"]["token_count"] > 0
 
 
@@ -556,3 +563,140 @@ def test_ui_checkpoint_load_invalid_backend_is_400(client: TestClient):
         },
     )
     assert res.status_code == 400
+
+
+def test_ui_stop_words_preserve_multi_token_sequences(client: TestClient, monkeypatch):
+    from src.data.tokenizers import CharTokenizer
+
+    service = _app_state(client).inference_service
+    old_tokenizer = service.tokenizer
+    tokenizer = CharTokenizer(vocab=list("abc"))
+    service.tokenizer = tokenizer
+    captured = {}
+
+    def fake_stream(prompt, config, backend=None):
+        captured["config"] = config
+        yield 'data: {"done": true}\n\n'
+
+    monkeypatch.setattr(service, "stream_generate", fake_stream)
+    try:
+        response = client.post(
+            "/api/generate/stream",
+            json={"prompt": "c", "max_new_tokens": 10, "stop_words": ["ab"]},
+        )
+    finally:
+        service.tokenizer = old_tokenizer
+
+    assert response.status_code == 200
+    config = captured["config"]
+    assert config.stop_sequences == [tokenizer.encode("ab")]
+    assert config.stop_tokens is None
+
+
+def test_ui_checkpoint_download_uses_inference_service_directory(client: TestClient, tmp_path):
+    import torch
+
+    service = _app_state(client).inference_service
+    old_dir = service.checkpoint_dir
+    custom_dir = tmp_path / "custom-checkpoints"
+    custom_dir.mkdir()
+    torch.save({"step": 1}, custom_dir / "custom.pt")
+    service.checkpoint_dir = str(custom_dir)
+    try:
+        response = client.get("/api/checkpoints/custom.pt/download")
+    finally:
+        service.checkpoint_dir = old_dir
+
+    assert response.status_code == 200
+    assert response.content
+
+
+def test_ui_training_feasibility_does_not_silently_ignore_zero_override(client: TestClient):
+    res = client.post("/api/training/check-feasibility", json={"batch_size": 0})
+    assert res.status_code == 400
+
+
+def test_ui_training_start_commits_inference_checkpoint_dir_only_after_start_succeeds(
+    client: TestClient, monkeypatch
+):
+    training_service = _app_state(client).training_service
+    inference_service = _app_state(client).inference_service
+    committed_dirs = []
+
+    def reject_start(*args, **kwargs):
+        raise RuntimeError("already running")
+
+    monkeypatch.setattr(training_service, "start_training", reject_start)
+    monkeypatch.setattr(
+        inference_service, "set_checkpoint_dir", lambda path: committed_dirs.append(path)
+    )
+
+    res = client.post("/api/training/start", json={"quick_check": True})
+
+    assert res.status_code == 400
+    assert committed_dirs == []
+
+
+def test_ui_checkpoint_download_rejects_symlink_escape(client: TestClient, tmp_path):
+    import os
+
+    import torch
+
+    if not hasattr(os, "symlink"):
+        pytest.skip("symlink unavailable")
+
+    service = _app_state(client).inference_service
+    old_dir = service.checkpoint_dir
+    checkpoint_dir = tmp_path / "checkpoints"
+    checkpoint_dir.mkdir()
+    outside = tmp_path / "outside.pt"
+    torch.save({"step": 99}, outside)
+    link = checkpoint_dir / "escape.pt"
+    try:
+        link.symlink_to(outside)
+    except OSError:
+        pytest.skip("symlink creation unavailable")
+
+    service.checkpoint_dir = str(checkpoint_dir)
+    try:
+        response = client.get("/api/checkpoints/escape.pt/download")
+    finally:
+        service.checkpoint_dir = old_dir
+
+    assert response.status_code in {400, 404}
+
+
+def test_ui_config_read_rejects_symlink_escape(client: TestClient, tmp_path, monkeypatch):
+    import os
+
+    if not hasattr(os, "symlink"):
+        pytest.skip("symlink unavailable")
+
+    configs = tmp_path / "configs"
+    configs.mkdir()
+    outside = tmp_path / "outside.yaml"
+    outside.write_text("secret: true\n", encoding="utf-8")
+    link = configs / "escape.yaml"
+    try:
+        link.symlink_to(outside)
+    except OSError:
+        pytest.skip("symlink creation unavailable")
+
+    monkeypatch.chdir(tmp_path)
+    response = client.get("/api/configs/raw", params={"path": "configs/escape.yaml"})
+
+    assert response.status_code == 400
+
+
+def test_ui_byte_tokenizer_visualizer_does_not_render_utf8_bytes_as_replacement_chars(
+    client: TestClient,
+):
+    response = client.post(
+        "/api/explorer/tokenize",
+        json={"text": "ă", "tokenizer_type": "byte"},
+    )
+
+    assert response.status_code == 200
+    raw = [item["raw"] for item in response.json()["tokens"]]
+    assert raw == ["0xC4", "0x83"]
+    assert "�" not in "".join(raw)

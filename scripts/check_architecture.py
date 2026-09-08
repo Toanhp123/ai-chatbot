@@ -215,8 +215,8 @@ def main() -> int:
         if not violations:
             console.print(
                 Panel(
-                    "[bold green]✅ KIẾN TRÚC TOÀN VẸN (CLEAN ARCHITECTURE 100% OK)[/bold green]\n"
-                    "Không phát hiện bất kỳ vi phạm phụ thuộc trái phép nào giữa các phân tầng!",
+                    "[bold green]✅ RANH GIỚI PHỤ THUỘC ĐÃ CẤU HÌNH: PASS[/bold green]\n"
+                    "Không phát hiện vi phạm nào đối với ma trận dependency hiện tại!",
                     title="🏛️ ARCHITECTURE GUARDIAN",
                     border_style="green",
                 )

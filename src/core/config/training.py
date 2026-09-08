@@ -74,6 +74,10 @@ class TrainingConfig(BaseConfig):
             _validate_filename_component(self.run_name, "run_name")
         if self.save_top_k < 0:
             raise ConfigurationError(f"save_top_k phải >= 0, nhận được {self.save_top_k}")
+        if self.early_stopping_patience <= 0:
+            raise ConfigurationError(
+                f"early_stopping_patience phải > 0, nhận được {self.early_stopping_patience}"
+            )
         if self.gradient_accumulation_steps <= 0:
             raise ConfigurationError(
                 f"gradient_accumulation_steps phải >= 1, nhận được {self.gradient_accumulation_steps}"

@@ -1,10 +1,11 @@
 """
-Bộ mã hóa tích hợp Gemini AI (GeminiTokenizer).
-Trang bị:
-- Disk Caching SHA-256: Lưu vết kết quả token hóa, không bao giờ tốn thời gian/token cho dữ liệu lặp lại.
-- Tự động đăng ký qua @TokenizerRegistry.register("gemini").
-- Dynamic import google-genai an toàn, không gây crash môi trường.
-- Graceful Fallback sang ByteTokenizer nếu chưa có API Key hoặc không có mạng.
+Legacy ``gemini`` tokenizer compatibility adapter.
+
+Historically this class initialized the Gemini SDK but token IDs were always produced by
+``ByteTokenizer``.  That made the configuration appear to select a remote tokenizer when
+runtime semantics never changed.  The adapter is now explicit: it is a deterministic,
+cached byte tokenizer and performs no external API calls.  The legacy registry name is
+kept so existing configs/vocab metadata remain loadable.
 """
 
 import hashlib
@@ -14,7 +15,7 @@ from typing import Any, Dict, List, Optional
 
 from src.core.exceptions import VocabularyMissingError
 from src.core.logging import get_logger
-from src.data.tokenizers.base import BaseTokenizer
+from src.data.tokenizers.base import BaseTokenizer, IncrementalTextDecoder
 from src.data.tokenizers.byte import ByteTokenizer
 from src.data.tokenizers.registry import TokenizerRegistry
 
@@ -23,7 +24,7 @@ logger = get_logger("GeminiTokenizer")
 
 @TokenizerRegistry.register("gemini", "gemini_ai")
 class GeminiTokenizer(BaseTokenizer):
-    """Bộ mã hóa tích hợp Gemini AI với bộ nhớ đệm Disk Caching SHA-256."""
+    """Backward-compatible cached-byte tokenizer under the historical ``gemini`` name."""
 
     def __init__(
         self,
@@ -37,49 +38,21 @@ class GeminiTokenizer(BaseTokenizer):
         vocab_size_limit: int = 32000,
         **kwargs: Any,
     ) -> None:
+        # api_key/model/vocab_size_limit are accepted only for legacy config compatibility.
+        del api_key, vocab_size_limit, kwargs
         self.model = model
         self.cache_dir = cache_dir
-        self.api_key = api_key or os.environ.get("GEMINI_API_KEY")
-        self.vocab_size_limit = vocab_size_limit
-
         self._pad_token = pad_token
         self._unk_token = unk_token
         self._bos_token = bos_token
         self._eos_token = eos_token
-
-        # Sử dụng ByteTokenizer làm fallback an toàn (Zero OOV)
         self._fallback = ByteTokenizer(
             pad_token=pad_token,
             unk_token=unk_token,
             bos_token=bos_token,
             eos_token=eos_token,
         )
-
         os.makedirs(self.cache_dir, exist_ok=True)
-        self._client: Any = None
-        self._init_client()
-
-    def _init_client(self) -> None:
-        """Khởi tạo Google GenAI Client nếu môi trường có sẵn khóa API."""
-        if not self.api_key:
-            logger.warning(
-                "Không tìm thấy GEMINI_API_KEY. GeminiTokenizer sẽ hoạt động ở chế độ Graceful Fallback."
-            )
-            return
-
-        try:
-            import importlib
-
-            genai = importlib.import_module("google.genai")
-            client_cls = getattr(genai, "Client", None)
-            if client_cls is not None:
-                self._client = client_cls(api_key=self.api_key)
-                logger.info(f"Khởi tạo Gemini Client thành công cho model: {self.model}")
-        except Exception as e:
-            logger.warning(
-                f"Không thể khởi tạo google-genai SDK ({e}). Chuyển sang Graceful Fallback."
-            )
-            self._client = None
 
     @property
     def vocab_size(self) -> int:
@@ -117,34 +90,38 @@ class GeminiTokenizer(BaseTokenizer):
     def eos_token_id(self) -> Optional[int]:
         return self._fallback.eos_token_id
 
+    def identity_payload(self) -> Dict[str, Any]:
+        # Token-ID semantics are exactly ByteTokenizer semantics, so checkpoints are compatible.
+        return self._fallback.identity_payload()
+
     def _get_cache_path(self, text: str) -> str:
         text_hash = hashlib.sha256(text.encode("utf-8")).hexdigest()
         return os.path.join(self.cache_dir, f"{text_hash}.json")
+
+    def create_incremental_decoder(self) -> IncrementalTextDecoder:
+        return self._fallback.create_incremental_decoder()
 
     def encode(self, text: str) -> List[int]:
         if not text:
             return []
 
-        # 1. Kiểm tra Disk Cache
         cache_path = self._get_cache_path(text)
         if os.path.exists(cache_path):
             try:
                 with open(cache_path, "r", encoding="utf-8") as f:
                     cached_data: Dict[str, Any] = json.load(f)
-                    return cached_data.get("tokens", [])
-            except Exception:
+                tokens = cached_data.get("tokens", [])
+                if isinstance(tokens, list) and all(isinstance(token, int) for token in tokens):
+                    return tokens
+            except (OSError, ValueError, TypeError, json.JSONDecodeError):
                 pass
 
-        # 2. Tokenize bằng Fallback an toàn (hoặc Gemini API khi có API)
         tokens = self._fallback.encode(text)
-
-        # 3. Ghi vào Disk Cache
         try:
             with open(cache_path, "w", encoding="utf-8") as f:
-                json.dump({"tokens": tokens, "model": self.model}, f)
-        except Exception as e:
-            logger.debug(f"Không thể ghi disk cache: {e}")
-
+                json.dump({"tokens": tokens, "backend": "byte"}, f)
+        except OSError as exc:
+            logger.debug(f"Không thể ghi disk cache: {exc}")
         return tokens
 
     def decode(self, tokens: List[int]) -> str:
@@ -153,8 +130,9 @@ class GeminiTokenizer(BaseTokenizer):
     def save_vocab(self, filepath: str) -> None:
         os.makedirs(os.path.dirname(os.path.abspath(filepath)), exist_ok=True)
         data = {
-            "version": "2.0",
+            "version": "2.1",
             "tokenizer_type": "gemini",
+            "backend": "byte",
             "model": self.model,
             "vocab_size": self.vocab_size,
             "special_tokens": {
@@ -183,5 +161,5 @@ class GeminiTokenizer(BaseTokenizer):
             unk_token=special.get("unk", "<unk>"),
             bos_token=special.get("bos", "<bos>"),
             eos_token=special.get("eos", "<eos>"),
+            **kwargs,
         )
-

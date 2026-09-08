@@ -8,9 +8,24 @@ Bao gồm:
 """
 
 from abc import ABC, abstractmethod
+import hashlib
+import json
 from typing import Any, Dict, List, Optional
 
 import torch
+
+
+class IncrementalTextDecoder:
+    """Stateful decoder used by streaming generation."""
+
+    def __init__(self, tokenizer: "BaseTokenizer") -> None:
+        self.tokenizer = tokenizer
+
+    def push(self, tokens: List[int]) -> str:
+        return self.tokenizer.decode(tokens) if tokens else ""
+
+    def finish(self) -> str:
+        return ""
 
 
 class BaseTokenizer(ABC):
@@ -71,6 +86,23 @@ class BaseTokenizer(ABC):
     def pad_token_id(self) -> Optional[int]:
         """ID của token đệm (Padding)."""
         return None
+
+    def create_incremental_decoder(self) -> IncrementalTextDecoder:
+        """Create a stateful decoder for token chunks emitted over time."""
+        return IncrementalTextDecoder(self)
+
+    def identity_payload(self) -> Dict[str, Any]:
+        """Canonical semantic identity used to bind checkpoints to token IDs."""
+        return {
+            "tokenizer_type": f"{type(self).__module__}.{type(self).__qualname__}",
+            "vocab_size": self.vocab_size,
+            "special_tokens": {
+                "pad": self.pad_token,
+                "unk": self.unk_token,
+                "bos": self.bos_token,
+                "eos": self.eos_token,
+            },
+        }
 
     def batch_encode(self, texts: List[str]) -> List[List[int]]:
         """Mã hóa một danh sách nhiều chuỗi văn bản thành danh sách token IDs."""
@@ -145,5 +177,18 @@ class BaseTokenizer(ABC):
         )
 
 
-__all__ = ["BaseTokenizer"]
+def get_tokenizer_identity(tokenizer: BaseTokenizer) -> Dict[str, Any]:
+    """Return a stable fingerprint plus canonical payload for checkpoint validation."""
+    payload = tokenizer.identity_payload()
+    canonical = json.dumps(
+        payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    return {
+        "schema_version": 1,
+        "fingerprint": hashlib.sha256(canonical).hexdigest(),
+        "payload": payload,
+    }
+
+
+__all__ = ["BaseTokenizer", "IncrementalTextDecoder", "get_tokenizer_identity"]
 

@@ -35,6 +35,19 @@ def extract_tensor_batch(
 class BaseBatchProvider(ABC):
     """Lớp cơ sở trừu tượng cung cấp các lô dữ liệu (Batch Provider)."""
 
+    def state_dict(self) -> dict[str, Any]:
+        """State required for exact resume; stateless providers return an empty dict."""
+        return {}
+
+    def load_state_dict(self, state: dict[str, Any]) -> None:
+        """Restore provider state; stateless providers intentionally ignore it."""
+        del state
+
+    @property
+    def supports_exact_resume(self) -> bool:
+        return True
+
+
     @abstractmethod
     def get_train_batch(
         self, batch_size: int, block_size: int, device: str
@@ -101,9 +114,135 @@ class DataLoaderBatchProvider(BaseBatchProvider):
         self._val_iter: Optional[Iterator[Any]] = None
         self._curr_val_batch_size: Optional[int] = None
 
+        self._manual_train_order: Optional[torch.Tensor] = None
+        self._manual_train_cursor = 0
+        self._manual_val_cursor = 0
+
+    @property
+    def supports_exact_resume(self) -> bool:
+        return (
+            self.num_workers == 0
+            and isinstance(self.train_dataset, Sized)
+            and isinstance(self.val_dataset, Sized)
+        )
+
+    def state_dict(self) -> dict[str, Any]:
+        if not self.supports_exact_resume:
+            return {"exact_resume": False, "num_workers": self.num_workers}
+        return {
+            "exact_resume": True,
+            "train_order": (
+                self._manual_train_order.clone()
+                if self._manual_train_order is not None
+                else None
+            ),
+            "train_cursor": self._manual_train_cursor,
+            "val_cursor": self._manual_val_cursor,
+            "train_batch_size": self._curr_train_batch_size,
+            "val_batch_size": self._curr_val_batch_size,
+        }
+
+    def load_state_dict(self, state: dict[str, Any]) -> None:
+        if not self.supports_exact_resume:
+            if state.get("exact_resume"):
+                raise ValueError(
+                    "Không thể exact-resume DataLoaderBatchProvider khi num_workers > 0 "
+                    "hoặc dataset không có kích thước xác định."
+                )
+            return
+        raw_order = state.get("train_order")
+        self._manual_train_order = (
+            raw_order.detach().cpu().to(dtype=torch.long).clone()
+            if isinstance(raw_order, torch.Tensor)
+            else None
+        )
+        self._manual_train_cursor = int(state.get("train_cursor", 0))
+        self._manual_val_cursor = int(state.get("val_cursor", 0))
+        train_bs = state.get("train_batch_size")
+        val_bs = state.get("val_batch_size")
+        self._curr_train_batch_size = int(train_bs) if train_bs is not None else None
+        self._curr_val_batch_size = int(val_bs) if val_bs is not None else None
+        self._train_loader = None
+        self._train_iter = None
+        self._val_loader = None
+        self._val_iter = None
+
+    @staticmethod
+    def _stack_dataset_items(
+        dataset: Dataset[Tuple[torch.Tensor, torch.Tensor]],
+        indices: list[int],
+        device: str,
+        non_blocking: bool,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        items = [dataset[index] for index in indices]
+        if not items:
+            raise DatasetEmptyError("Không thể tạo batch rỗng từ DataLoaderBatchProvider.")
+        xs, ys = zip(*items)
+        x = torch.stack(list(xs))
+        y = torch.stack(list(ys))
+        return x.to(device, non_blocking=non_blocking), y.to(
+            device, non_blocking=non_blocking
+        )
+
+    def _get_manual_train_batch(
+        self, batch_size: int, device: str
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        size = len(self.train_dataset)  # type: ignore[arg-type]
+        if size == 0:
+            raise DatasetEmptyError("Tập dữ liệu huấn luyện rỗng!")
+        if self._curr_train_batch_size != batch_size:
+            self._curr_train_batch_size = batch_size
+            self._manual_train_order = None
+            self._manual_train_cursor = 0
+
+        drop_last = size >= batch_size
+        needs_new_order = self._manual_train_order is None or self._manual_train_cursor >= size
+        if (
+            not needs_new_order
+            and drop_last
+            and self._manual_train_cursor + batch_size > size
+        ):
+            needs_new_order = True
+        if needs_new_order:
+            self._manual_train_order = torch.randperm(size)
+            self._manual_train_cursor = 0
+
+        assert self._manual_train_order is not None
+        end = min(size, self._manual_train_cursor + batch_size)
+        indices = self._manual_train_order[self._manual_train_cursor : end].tolist()
+        self._manual_train_cursor = end
+        return self._stack_dataset_items(
+            self.train_dataset, indices, device, self.pin_memory
+        )
+
+    def _get_manual_val_batch(
+        self, batch_size: int, device: str
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        size = len(self.val_dataset)  # type: ignore[arg-type]
+        if size == 0:
+            raise DatasetEmptyError("Tập dữ liệu đánh giá rỗng!")
+        if self._curr_val_batch_size != batch_size:
+            self._curr_val_batch_size = batch_size
+            self._manual_val_cursor = 0
+
+        drop_last = size >= batch_size
+        if self._manual_val_cursor >= size or (
+            drop_last and self._manual_val_cursor + batch_size > size
+        ):
+            self._manual_val_cursor = 0
+        end = min(size, self._manual_val_cursor + batch_size)
+        indices = list(range(self._manual_val_cursor, end))
+        self._manual_val_cursor = end
+        return self._stack_dataset_items(
+            self.val_dataset, indices, device, self.pin_memory
+        )
+
     def get_train_batch(
         self, batch_size: int, block_size: int, device: str
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if self.supports_exact_resume:
+            return self._get_manual_train_batch(batch_size, device)
+
         drop_last = False
         if isinstance(self.train_dataset, Sized):
             if len(self.train_dataset) == 0:
@@ -134,6 +273,9 @@ class DataLoaderBatchProvider(BaseBatchProvider):
     def get_val_batch(
         self, batch_size: int, block_size: int, device: str
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if self.supports_exact_resume:
+            return self._get_manual_val_batch(batch_size, device)
+
         drop_last = False
         if isinstance(self.val_dataset, Sized):
             if len(self.val_dataset) == 0:

@@ -17,9 +17,9 @@ router = APIRouter(prefix="/api", tags=["Inference"])
 
 def _resolve_config_path(path: str) -> str:
     """Normalize a config path and ensure it stays inside the real configs/ directory."""
-    base_dir = os.path.abspath("configs")
+    base_dir = os.path.realpath(os.path.abspath("configs"))
     norm_path = os.path.normpath(path)
-    candidate = os.path.abspath(norm_path)
+    candidate = os.path.realpath(os.path.abspath(norm_path))
     try:
         if os.path.commonpath([base_dir, candidate]) != base_dir:
             raise ValueError
@@ -28,7 +28,7 @@ def _resolve_config_path(path: str) -> str:
             status_code=400,
             detail="Chỉ cho phép truy cập các file cấu hình trong thư mục configs/",
         )
-    return norm_path
+    return candidate
 
 
 class GenerateRequest(BaseModel):
@@ -100,16 +100,12 @@ async def generate_stream_endpoint(req: GenerateRequest, request: Request):
                 detail=f"Generator backend không hợp lệ: '{req.backend}'.",
             )
 
-    stop_tokens: Optional[List[int]] = None
+    stop_sequences: Optional[List[List[int]]] = None
     if req.stop_words and inference_service.tokenizer:
-        token_set = set()
-        for word in req.stop_words:
-            if word:
-                encoded = inference_service.tokenizer.encode(word)
-                for tid in encoded:
-                    token_set.add(tid)
-        if token_set:
-            stop_tokens = list(token_set)
+        encoded_sequences = [
+            inference_service.tokenizer.encode(word) for word in req.stop_words if word
+        ]
+        stop_sequences = [sequence for sequence in encoded_sequences if sequence] or None
 
     gen_config = GenerationConfig(
         max_new_tokens=req.max_new_tokens,
@@ -120,7 +116,7 @@ async def generate_stream_endpoint(req: GenerateRequest, request: Request):
         repetition_penalty=req.repetition_penalty,
         do_sample=not req.greedy,
         use_cache=req.use_cache,
-        stop_tokens=stop_tokens,
+        stop_sequences=stop_sequences,
     )
 
     generator_stream = inference_service.stream_generate(
@@ -149,7 +145,8 @@ async def load_checkpoint_endpoint(req: LoadCheckpointRequest, request: Request)
     """Nạp một checkpoint cụ thể vào bộ suy luận."""
     inference_service = request.app.state.inference_service
     try:
-        inference_service.load_checkpoint(req.path, backend=req.backend)
+        managed_path = inference_service.resolve_checkpoint_path(req.path)
+        inference_service.load_checkpoint(managed_path, backend=req.backend)
         return {
             "status": "success",
             "message": f"Đã nạp checkpoint thành công: {req.path}",
@@ -180,14 +177,20 @@ async def delete_checkpoint_endpoint(filename: str, request: Request):
 
 
 @router.get("/checkpoints/{filename}/download")
-async def download_checkpoint_endpoint(filename: str):
+async def download_checkpoint_endpoint(filename: str, request: Request):
     """Tải file checkpoint trực tiếp về máy người dùng."""
     import os
 
     from fastapi.responses import FileResponse
 
     safe_filename = os.path.basename(filename)
-    checkpoint_path = os.path.join("checkpoints", safe_filename)
+    inference_service = request.app.state.inference_service
+    try:
+        checkpoint_path = inference_service.resolve_checkpoint_path(
+            safe_filename, filename_only=True
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     if not os.path.exists(checkpoint_path) or not os.path.isfile(checkpoint_path):
         raise HTTPException(
             status_code=404, detail=f"Không tìm thấy file checkpoint: {safe_filename}"

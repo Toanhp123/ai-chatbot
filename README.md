@@ -54,7 +54,7 @@ ai-train/
 │   │   │   ├── base.py                 # Lớp cơ sở trừu tượng BaseTokenizer
 │   │   │   ├── char.py                 # CharTokenizer (mã hóa cấp ký tự tiếng Việt)
 │   │   │   ├── byte.py                 # ByteTokenizer (mã hóa cấp byte UTF-8, zero OOV)
-│   │   │   ├── gemini.py               # Gemini-compatible Tokenizer
+│   │   │   ├── gemini.py               # Alias legacy tương thích, dùng semantics ByteTokenizer
 │   │   │   └── registry.py             # TokenizerRegistry & hàm tự nạp load_tokenizer
 │   │   ├── batch_provider.py           # BaseBatchProvider, TensorBatchProvider (GPU in-memory), DataLoaderBatchProvider
 │   │   ├── dataset.py                  # PyTorch TextDataset phục vụ batching

@@ -26,6 +26,7 @@ from src.training.callbacks import (
     TrainerProtocol,
 )
 from src.training.trainer import Trainer, TrainOutput
+from src.utils.device import resolve_device
 from src.utils.seed import set_seed
 
 logger = get_logger("TrainingService")
@@ -321,6 +322,7 @@ class TrainingService:
                     train_data, val_data, tokenizer = DataPipeline.setup_data(
                         config=config.data,
                         cleaner=cleaner,
+                        block_size=config.model.block_size,
                     )
 
                     if self._abort_requested.is_set():
@@ -347,14 +349,7 @@ class TrainingService:
                     model = ModelRegistry.create(config.model.name, config.model)
 
                     # 5. Callbacks
-                    device_str = (
-                        "cuda"
-                        if (
-                            config.system.device == "cuda"
-                            or (config.system.device == "auto" and torch.cuda.is_available())
-                        )
-                        else "cpu"
-                    )
+                    device_str = resolve_device(config.system.device)
                     sample_gen: BaseGenerator = get_generator(
                         "local", model=model, tokenizer=tokenizer, device=device_str
                     )
@@ -385,6 +380,13 @@ class TrainingService:
 
                     callbacks: List[BaseCallback] = [
                         web_cb,
+                        SampleGenerationCallback(sample_fn=sample_fn),
+                        EarlyStoppingCallback(
+                            monitor="val_loss",
+                            mode="min",
+                            patience=config.training.early_stopping_patience,
+                        ),
+                        # Persist after stateful callbacks so resume snapshot is coherent.
                         ModelCheckpointCallback(
                             save_dir=config.training.checkpoint_dir,
                             filename=config.training.checkpoint_name,
@@ -394,26 +396,23 @@ class TrainingService:
                             save_last=config.training.save_last,
                             run_name=config.training.run_name,
                         ),
-                        SampleGenerationCallback(sample_fn=sample_fn),
-                        EarlyStoppingCallback(
-                            monitor="val_loss",
-                            mode="min",
-                            patience=config.training.early_stopping_patience,
-                        ),
                     ]
 
                     # 6. Trainer
                     abort_before_trainer = False
+                    trainer: Optional[Trainer] = None
                     with self._lock:
                         if self._abort_requested.is_set():
                             abort_before_trainer = True
                         else:
-                            self.trainer = Trainer(
+                            trainer = Trainer(
                                 model=model,
                                 batch_provider=batch_provider,
                                 config=config,
                                 callbacks=callbacks,
+                                tokenizer=tokenizer,
                             )
+                            self.trainer = trainer
                             self.status = "RUNNING"
 
                     if abort_before_trainer:
@@ -429,7 +428,9 @@ class TrainingService:
                         }
                     )
 
-                    train_out: TrainOutput = self.trainer.train(resume_checkpoint=resume_checkpoint)
+                    if trainer is None:
+                        raise RuntimeError("Trainer initialization invariant violated.")
+                    train_out: TrainOutput = trainer.train(resume_checkpoint=resume_checkpoint)
 
                     with self._lock:
                         if (

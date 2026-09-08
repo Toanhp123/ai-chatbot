@@ -79,8 +79,8 @@ export const TokenizerVisualizerWidget: React.FC<TokenizerVisualizerProps> = ({
 							Trực Quan Hóa & Kiểm Thử Bộ Mã Hóa (Tokenizer)
 						</CardTitle>
 						<p className="text-xs text-stone-500 mt-0.5">
-							Phân rã token ID, tỷ lệ nén và đối chiếu trực tiếp 3
-							cơ chế mã hóa (Char, Byte, Gemini AI)
+							Phân rã token ID, tỷ lệ nén và đối chiếu trực tiếp
+							Char Tokenizer với Byte Tokenizer
 						</p>
 					</div>
 				</div>
@@ -95,7 +95,7 @@ export const TokenizerVisualizerWidget: React.FC<TokenizerVisualizerProps> = ({
 						<ArrowRightLeft
 							className={`w-3.5 h-3.5 mr-1.5 ${comparing ? "animate-spin" : ""}`}
 						/>
-						{comparing ? "Đang so sánh..." : "So Sánh 3 Tokenizer"}
+						{comparing ? "Đang so sánh..." : "So Sánh Tokenizer"}
 					</Button>
 					<Button
 						size="sm"
@@ -179,17 +179,6 @@ export const TokenizerVisualizerWidget: React.FC<TokenizerVisualizerProps> = ({
 							>
 								Byte Tokenizer (UTF-8)
 							</button>
-							<button
-								type="button"
-								onClick={() => setTokenizerType("gemini")}
-								className={`px-3 py-1 rounded-md text-xs font-medium transition-all ${
-									tokenizerType === "gemini"
-										? "bg-[#faf8f5] text-stone-900 shadow-warm-sm border border-stone-300/80 font-semibold"
-										: "text-stone-600 hover:text-stone-900"
-								}`}
-							>
-								Gemini LLM (BPE)
-							</button>
 						</div>
 					</div>
 
@@ -268,14 +257,14 @@ export const TokenizerVisualizerWidget: React.FC<TokenizerVisualizerProps> = ({
 					</div>
 				)}
 
-				{/* 3-Way Side-by-Side Comparison Grid */}
+				{/* Side-by-Side comparison of distinct tokenizer semantics */}
 				{comparisonData?.comparisons && (
 					<div className="pt-3 border-t border-stone-200/80 space-y-3">
 						<div className="text-xs font-semibold text-stone-800 flex items-center gap-2">
 							<ArrowRightLeft className="w-4 h-4 text-amber-600" />
-							So Sánh Đồng Thời 3 Bộ Mã Hóa (Side-by-Side):
+							So Sánh Các Bộ Mã Hóa (Side-by-Side):
 						</div>
-						<div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+						<div className="grid grid-cols-1 md:grid-cols-2 gap-3">
 							{Object.entries(comparisonData.comparisons).map(
 								([key, comp]) => (
 									<div
@@ -292,11 +281,9 @@ export const TokenizerVisualizerWidget: React.FC<TokenizerVisualizerProps> = ({
 											</span>
 											<Badge
 												variant={
-													key === "gemini"
-														? "info"
-														: key === "byte"
-															? "success"
-															: "neutral"
+													key === "byte"
+														? "success"
+														: "neutral"
 												}
 											>
 												{key.toUpperCase()}

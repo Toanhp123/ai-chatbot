@@ -1,4 +1,7 @@
-from src.models.architectures.llama import LlamaNano
-from src.models.architectures.minigpt import MiniGPT
+"""Built-in model architecture package.
 
-__all__ = ["MiniGPT", "LlamaNano"]
+Modules are discovered lazily by :class:`src.models.registry.ModelRegistry`; importing
+this package does not eagerly import concrete architectures.
+"""
+
+__all__: list[str] = []

@@ -169,3 +169,105 @@ def test_generator_registry_and_factory() -> None:
 
     with pytest.raises(AIEngineError, match="Không tìm thấy Generator"):
         GeneratorRegistry.get("non_existent_engine")
+
+
+def test_text_generator_stops_on_full_multi_token_sequence_without_emitting_it() -> None:
+    class SequenceModel(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.block_size = 16
+            self._next = [2, 3, 4]
+            self._index = 0
+
+        def forward(self, x: torch.Tensor, use_cache: bool = False):
+            logits = torch.full((x.size(0), x.size(1), 8), -100.0)
+            token = self._next[min(self._index, len(self._next) - 1)]
+            self._index += 1
+            logits[:, -1, token] = 100.0
+            return logits, None
+
+    class SequenceTokenizer:
+        def encode(self, text: str) -> List[int]:
+            return [0]
+
+        def decode(self, tokens: List[int]) -> str:
+            return "".join({2: "a", 3: "b", 4: "c"}.get(t, "") for t in tokens)
+
+    streamer = TextIteratorStreamer()
+    generator = TextGenerator(SequenceModel(), SequenceTokenizer(), device="cpu")
+    config = GenerationConfig(
+        max_new_tokens=3,
+        temperature=0.0,
+        stop_sequences=[[2, 3]],
+    )
+
+    output = generator.generate("P", config=config, streamer=streamer, return_output=True)
+
+    assert output.finish_reason == "stop_sequence"
+    assert output.generated_text == ""
+    assert output.token_ids == []
+    assert list(streamer) == []
+
+
+def test_text_generator_incrementally_decodes_multibyte_utf8() -> None:
+    from src.data.tokenizers import ByteTokenizer
+
+    class ByteSequenceModel(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.block_size = 16
+            self._next = [196, 131]  # UTF-8 bytes for "ă"
+            self._index = 0
+
+        def forward(self, x: torch.Tensor, use_cache: bool = False):
+            logits = torch.full((x.size(0), x.size(1), 260), -100.0)
+            token = self._next[min(self._index, 1)]
+            self._index += 1
+            logits[:, -1, token] = 100.0
+            return logits, None
+
+    streamer = TextIteratorStreamer()
+    generator = TextGenerator(ByteSequenceModel(), ByteTokenizer(), device="cpu")
+    output = generator.generate(
+        "x",
+        config=GenerationConfig(max_new_tokens=2, temperature=0.0),
+        streamer=streamer,
+        return_output=True,
+    )
+
+    assert output.generated_text == "ă"
+    assert "".join(list(streamer)) == "ă"
+
+
+def test_text_generator_restores_model_training_mode_after_generation() -> None:
+    model = MockModel()
+    model.train()
+    generator = TextGenerator(model, MockTokenizer(), device="cpu")
+    # Constructor switches to eval for standalone inference; simulate Trainer owning the same model.
+    model.train()
+
+    generator.generate("start", config=GenerationConfig(max_new_tokens=1, temperature=0.0))
+
+    assert model.training is True
+
+
+def test_internal_model_type_error_is_not_retried_without_use_cache() -> None:
+    class BrokenModel(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.block_size = 8
+            self.calls = 0
+
+        def forward(self, x: torch.Tensor, use_cache: bool = False):
+            self.calls += 1
+            raise TypeError("internal bug")
+
+    model = BrokenModel()
+    generator = TextGenerator(model, MockTokenizer(), device="cpu")
+
+    import pytest
+
+    with pytest.raises(TypeError, match="internal bug"):
+        generator.generate("x", config=GenerationConfig(max_new_tokens=1, use_cache=True))
+
+    assert model.calls == 1

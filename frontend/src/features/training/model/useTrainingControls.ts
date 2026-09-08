@@ -9,6 +9,18 @@ import type {
 	PreflightMemoryInfo,
 } from "@/entities/training";
 
+function numberOrDefault(value: unknown, fallback: number): number {
+	if (value === null || value === undefined || value === "") return fallback;
+	const parsed = Number(value);
+	return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+function optionalNumber(value: unknown): number | null {
+	if (value === null || value === undefined || value === "") return null;
+	const parsed = Number(value);
+	return Number.isFinite(parsed) ? parsed : null;
+}
+
 export function useTrainingControls() {
 	const [status, setStatus] = useState<TrainingStatus>("IDLE");
 	const [currentStep, setCurrentStep] = useState(0);
@@ -196,19 +208,19 @@ export function useTrainingControls() {
 		try {
 			const payload = {
 				config_path: config.config_path,
-				batch_size: Number(config.batch_size) || 64,
+				batch_size: numberOrDefault(config.batch_size, 64),
 				precision: config.precision,
 				optimizer_type: config.optimizer_type,
 				gradient_checkpointing: Boolean(config.gradient_checkpointing),
-				gradient_accumulation_steps:
-					Number(config.gradient_accumulation_steps) || 1,
+				gradient_accumulation_steps: numberOrDefault(
+					config.gradient_accumulation_steps,
+					1,
+				),
 				model_name: config.model_name || "minigpt",
-				n_layer: config.n_layer ? Number(config.n_layer) : null,
-				n_embd: config.n_embd ? Number(config.n_embd) : null,
-				n_head: config.n_head ? Number(config.n_head) : null,
-				block_size: config.block_size
-					? Number(config.block_size)
-					: null,
+				n_layer: optionalNumber(config.n_layer),
+				n_embd: optionalNumber(config.n_embd),
+				n_head: optionalNumber(config.n_head),
+				block_size: optionalNumber(config.block_size),
 			};
 			const res = await trainingApi.checkFeasibility(payload);
 			setPreflightInfo(res);
@@ -231,33 +243,34 @@ export function useTrainingControls() {
 				max_iters: Number(config.max_iters),
 				precision: config.precision,
 				optimizer_type: config.optimizer_type,
-				gradient_accumulation_steps:
-					Number(config.gradient_accumulation_steps) || 1,
+				gradient_accumulation_steps: numberOrDefault(
+					config.gradient_accumulation_steps,
+					1,
+				),
 				gradient_checkpointing: Boolean(config.gradient_checkpointing),
-				eval_interval: Number(config.eval_interval) || 300,
-				eval_iters: Number(config.eval_iters) || 50,
+				eval_interval: numberOrDefault(config.eval_interval, 300),
+				eval_iters: numberOrDefault(config.eval_iters, 50),
 				save_last: Boolean(config.save_last),
-				split_ratio: Number(config.split_ratio) || 0.9,
+				split_ratio: numberOrDefault(config.split_ratio, 0.9),
 				batch_provider_type: config.batch_provider_type || "tensor",
-				n_layer: config.n_layer ? Number(config.n_layer) : null,
-				n_embd: config.n_embd ? Number(config.n_embd) : null,
-				n_head: config.n_head ? Number(config.n_head) : null,
-				block_size: config.block_size
-					? Number(config.block_size)
-					: null,
-				dropout:
-					config.dropout !== null ? Number(config.dropout) : null,
-				seed: config.seed !== null ? Number(config.seed) : null,
+				n_layer: optionalNumber(config.n_layer),
+				n_embd: optionalNumber(config.n_embd),
+				n_head: optionalNumber(config.n_head),
+				block_size: optionalNumber(config.block_size),
+				dropout: optionalNumber(config.dropout),
+				seed: optionalNumber(config.seed),
 				lr_scheduler_type: config.lr_scheduler_type || "cosine",
-				warmup_iters: Number(config.warmup_iters) || 100,
-				min_lr: Number(config.min_lr) || 0.00003,
-				weight_decay: Number(config.weight_decay) || 0.1,
-				grad_clip: Number(config.grad_clip) || 1.0,
-				early_stopping_patience:
-					Number(config.early_stopping_patience) || 10,
+				warmup_iters: numberOrDefault(config.warmup_iters, 100),
+				min_lr: numberOrDefault(config.min_lr, 0.00003),
+				weight_decay: numberOrDefault(config.weight_decay, 0.1),
+				grad_clip: numberOrDefault(config.grad_clip, 1.0),
+				early_stopping_patience: numberOrDefault(
+					config.early_stopping_patience,
+					10,
+				),
 				resume_checkpoint: config.resume_checkpoint || null,
 				run_name: config.run_name?.trim() || null,
-				save_top_k: Number(config.save_top_k) || 3,
+				save_top_k: numberOrDefault(config.save_top_k, 3),
 				cleaner_type: config.cleaner_type || "default",
 				tokenizer_type: config.tokenizer_type || "char",
 			};

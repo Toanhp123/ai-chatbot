@@ -92,3 +92,20 @@ def test_architecture_boundary_checker_detects_relative_import_violations(tmp_pa
     assert len(violations) == 1
     assert violations[0]["forbidden_rule"] == "src.training"
     assert violations[0]["target_module"] == "src.training.trainer"
+
+
+def test_model_registry_discovery_does_not_eagerly_import_architecture_package() -> None:
+    from pathlib import Path
+
+    registry_source = Path("src/models/registry.py").read_text(encoding="utf-8")
+    architecture_init = Path("src/models/architectures/__init__.py").read_text(encoding="utf-8")
+
+    assert "import src.models.architectures" not in registry_source
+    assert "from src.models.architectures." not in architecture_init
+
+
+def test_architecture_guardian_does_not_claim_more_than_it_checks() -> None:
+    from pathlib import Path
+
+    source = Path("scripts/check_architecture.py").read_text(encoding="utf-8")
+    assert "CLEAN ARCHITECTURE 100% OK" not in source

@@ -34,7 +34,8 @@ from src.core.logging import setup_logger
 from src.data.batch_provider import get_batch_provider
 from src.data.cleaners import get_cleaner
 from src.data.pipeline import DataPipeline
-from src.data.tokenizers import load_tokenizer
+from src.data.tokenizers import load_tokenizer, load_tokenizer_state
+from src.data.tokenizers.base import get_tokenizer_identity
 from src.generation import BaseGenerator, ConsoleStreamer, get_generator
 from src.models.registry import ModelRegistry
 from src.training.callbacks import (
@@ -44,6 +45,7 @@ from src.training.callbacks import (
     SampleGenerationCallback,
 )
 from src.training.trainer import Trainer
+from src.utils.device import resolve_device
 from src.utils.seed import set_seed
 from src.utils.tensor_inspector import print_model_summary
 
@@ -112,6 +114,7 @@ def cmd_train(args: argparse.Namespace) -> None:
     train_data, val_data, tokenizer = DataPipeline.setup_data(
         config=config.data,
         cleaner=cleaner,
+        block_size=config.model.block_size,
     )
 
     # 3. Khởi tạo Batch Provider từ Config (tensor hoặc dataloader)
@@ -132,14 +135,7 @@ def cmd_train(args: argparse.Namespace) -> None:
     logger.info(f"Khởi tạo mô hình '{config.model.name}' với {model.get_num_params():,} tham số.")
 
     # 5. Thiết lập Callbacks (Dependency Injection: sample_fn được truyền vào từ Composition Root)
-    device_str = (
-        "cuda"
-        if (
-            config.system.device == "cuda"
-            or (config.system.device == "auto" and torch.cuda.is_available())
-        )
-        else "cpu"
-    )
+    device_str = resolve_device(config.system.device)
     sample_generator: BaseGenerator = get_generator(
         "local", model=model, tokenizer=tokenizer, device=device_str
     )
@@ -155,6 +151,13 @@ def cmd_train(args: argparse.Namespace) -> None:
 
     callbacks = [
         ConsoleProgressCallback(log_interval=100 if not args.quick_check else 10),
+        SampleGenerationCallback(sample_fn=sample_fn),
+        EarlyStoppingCallback(
+            monitor="val_loss",
+            mode="min",
+            patience=config.training.early_stopping_patience,
+        ),
+        # Checkpoint last: runtime snapshot sees the state changes of prior callbacks.
         ModelCheckpointCallback(
             save_dir=config.training.checkpoint_dir,
             filename=config.training.checkpoint_name,
@@ -164,12 +167,6 @@ def cmd_train(args: argparse.Namespace) -> None:
             save_last=config.training.save_last,
             run_name=config.training.run_name,
         ),
-        SampleGenerationCallback(sample_fn=sample_fn),
-        EarlyStoppingCallback(
-            monitor="val_loss",
-            mode="min",
-            patience=config.training.early_stopping_patience,
-        ),
     ]
 
     # 6. Khởi chạy Trainer
@@ -178,6 +175,7 @@ def cmd_train(args: argparse.Namespace) -> None:
         batch_provider=batch_provider,
         config=config,
         callbacks=callbacks,
+        tokenizer=tokenizer,
     )
     trainer.train()
 
@@ -190,18 +188,28 @@ def load_generator_from_checkpoint(
 ) -> BaseGenerator:
     if not os.path.exists(checkpoint_path):
         raise AIEngineError(f"Không tìm thấy file checkpoint tại: {checkpoint_path}")
-    if not os.path.exists(vocab_path):
-        raise AIEngineError(f"Không tìm thấy file từ vựng tại: {vocab_path}")
+    target_device = resolve_device(device)
+    checkpoint = torch.load(checkpoint_path, map_location=target_device, weights_only=True)
+    checkpoint_identity = checkpoint.get("tokenizer_identity")
+    if not isinstance(checkpoint_identity, dict):
+        raise AIEngineError(
+            "Checkpoint legacy không có tokenizer identity; từ chối nạp để tránh ánh xạ token sai."
+        )
+    checkpoint_version = int(checkpoint.get("checkpoint_version", 1))
+    embedded_state = checkpoint.get("tokenizer_state")
+    if checkpoint_version >= 3 and not isinstance(embedded_state, dict):
+        raise AIEngineError("Checkpoint v3 thiếu tokenizer state bắt buộc.")
+    if isinstance(embedded_state, dict):
+        tokenizer = load_tokenizer_state(embedded_state)
+    else:
+        if not os.path.exists(vocab_path):
+            raise AIEngineError(f"Không tìm thấy file từ vựng tại: {vocab_path}")
+        tokenizer = load_tokenizer(vocab_path)
 
-    # Tự động nạp đúng Tokenizer đa hình từ TokenizerRegistry
-    tokenizer = load_tokenizer(vocab_path)
-
-    target_device = (
-        "cuda"
-        if (device == "auto" and torch.cuda.is_available())
-        else ("cpu" if device == "auto" else device)
-    )
-    checkpoint = torch.load(checkpoint_path, map_location=target_device)
+    if checkpoint_identity.get("fingerprint") != get_tokenizer_identity(tokenizer).get(
+        "fingerprint"
+    ):
+        raise AIEngineError("Tokenizer/từ vựng không khớp checkpoint.")
     cfg_dict = checkpoint["config"]["model"]
     model_config = ModelConfig.from_kwargs_safe(cfg_dict, ignore_unknown=True)
     model = ModelRegistry.create(model_config.name, model_config)

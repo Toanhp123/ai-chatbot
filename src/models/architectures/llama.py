@@ -9,6 +9,7 @@ from typing import Any, Dict, Optional, Tuple, cast
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 from src.core.config import ModelConfig
 from src.core.exceptions import ContextLengthExceededError
@@ -59,6 +60,7 @@ class LlamaNano(BaseModel):
                     intermediate_size=intermediate_size,
                     multiple_of=multiple_of,
                     norm_eps=norm_eps,
+                    bias=config.bias,
                 )
                 for _ in range(config.n_layer)
             ]
@@ -68,11 +70,13 @@ class LlamaNano(BaseModel):
         self.norm = RMSNorm(config.n_embd, eps=norm_eps)
 
         # Output LM Head
-        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=config.bias)
 
         # Weight tying tùy chọn
         if config.tie_word_embeddings:
             self.tok_embeddings.weight = self.lm_head.weight
+
+        self.gradient_checkpointing = False
 
         self.apply(self._init_weights)
 
@@ -91,6 +95,10 @@ class LlamaNano(BaseModel):
     @property
     def dtype(self) -> torch.dtype:
         return next(self.parameters()).dtype
+
+    def set_gradient_checkpointing(self, enabled: bool) -> None:
+        """Bật/tắt activation checkpointing cho các LLaMA block khi train."""
+        self.gradient_checkpointing = bool(enabled)
 
     def reset_kv_cache(self) -> None:
         """Xóa sạch bộ nhớ đệm KV trên tất cả các block."""
@@ -150,12 +158,24 @@ class LlamaNano(BaseModel):
 
         for block in self.blocks:
             lb = cast(LlamaBlock, block)
-            x = lb(
-                x,
-                rotary_cos=rotary_cos,
-                rotary_sin=rotary_sin,
-                use_cache=use_cache,
-            )
+            if self.gradient_checkpointing and self.training and not use_cache:
+                x = checkpoint(
+                    lambda hidden, current_block=lb: current_block(
+                        hidden,
+                        rotary_cos=rotary_cos,
+                        rotary_sin=rotary_sin,
+                        use_cache=False,
+                    ),
+                    x,
+                    use_reentrant=False,
+                )
+            else:
+                x = lb(
+                    x,
+                    rotary_cos=rotary_cos,
+                    rotary_sin=rotary_sin,
+                    use_cache=use_cache,
+                )
 
         x = self.norm(x)
 

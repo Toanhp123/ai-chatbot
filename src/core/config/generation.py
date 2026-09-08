@@ -20,6 +20,7 @@ class GenerationConfig(BaseConfig):
     do_sample: bool = True
     eos_token_id: Optional[int] = None
     stop_tokens: Optional[List[int]] = None
+    stop_sequences: Optional[List[List[int]]] = None
     use_cache: bool = True
 
     def validate(self) -> None:
@@ -42,6 +43,17 @@ class GenerationConfig(BaseConfig):
             raise ConfigurationError(
                 f"repetition_penalty phải >= 1.0, nhận được {self.repetition_penalty}"
             )
+        if self.stop_tokens is not None:
+            if any((not isinstance(token, int)) or token < 0 for token in self.stop_tokens):
+                raise ConfigurationError("stop_tokens chỉ được chứa token id nguyên >= 0")
+        if self.stop_sequences is not None:
+            for sequence in self.stop_sequences:
+                if not sequence or any(
+                    (not isinstance(token, int)) or token < 0 for token in sequence
+                ):
+                    raise ConfigurationError(
+                        "stop_sequences phải là danh sách các chuỗi token id nguyên, không rỗng và >= 0"
+                    )
         if not isinstance(self.use_cache, bool):
             raise ConfigurationError(
                 f"use_cache phải là kiểu boolean, nhận được {type(self.use_cache).__name__}"

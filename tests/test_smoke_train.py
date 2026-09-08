@@ -1,7 +1,9 @@
 import os
 import tempfile
 
+import pytest
 import torch
+from torch.utils.checkpoint import checkpoint as torch_checkpoint
 
 from src.core.config import EngineConfig
 from src.data.batch_provider import BaseBatchProvider
@@ -182,3 +184,274 @@ def test_trainer_custom_optimizer_injection():
     assert output.total_steps == 2
     assert not output.interrupted
     assert output.elapsed_time_sec >= 0.0
+
+
+def test_trainer_stop_request_does_not_report_phantom_step() -> None:
+    from src.training.callbacks import BaseCallback
+
+    class StopAfterTwo(BaseCallback):
+        def on_step_end(self, trainer, step, loss):
+            if step == 2:
+                trainer.request_stop()
+
+    config = EngineConfig()
+    config.model.vocab_size = 20
+    config.model.block_size = 8
+    config.model.n_embd = 16
+    config.model.n_head = 2
+    config.model.n_layer = 1
+    config.training.batch_size = 2
+    config.training.max_iters = 5
+    config.training.eval_interval = 5
+    config.training.eval_iters = 1
+    model = ModelRegistry.create("minigpt", config.model)
+    provider = MockBatchProvider(config.model.vocab_size)
+    trainer = Trainer(
+        model=model,
+        batch_provider=provider,
+        config=config,
+        callbacks=[StopAfterTwo()],
+        device="cpu",
+    )
+
+    output = trainer.train()
+
+    assert output.global_step == 2
+    assert output.total_steps == 2
+    assert output.interrupted is True
+
+
+def test_trainer_uses_first_warmup_lr_on_first_training_step() -> None:
+    from src.training.callbacks import BaseCallback
+
+    seen = []
+
+    class CaptureLr(BaseCallback):
+        def on_step_end(self, trainer, step, loss):
+            seen.append((step, trainer.current_lr))
+
+    config = EngineConfig()
+    config.model.vocab_size = 20
+    config.model.block_size = 8
+    config.model.n_embd = 16
+    config.model.n_head = 2
+    config.model.n_layer = 1
+    config.training.batch_size = 2
+    config.training.max_iters = 3
+    config.training.eval_interval = 3
+    config.training.eval_iters = 1
+    config.training.learning_rate = 0.003
+    config.training.warmup_iters = 3
+    model = ModelRegistry.create("minigpt", config.model)
+    provider = MockBatchProvider(config.model.vocab_size)
+    trainer = Trainer(
+        model=model, batch_provider=provider, config=config, callbacks=[CaptureLr()], device="cpu"
+    )
+
+    trainer.train()
+
+    assert seen[0][1] == pytest.approx(0.001)
+
+
+def test_train_output_reports_historical_best_validation_loss(monkeypatch) -> None:
+    config = EngineConfig()
+    config.model.vocab_size = 20
+    config.model.block_size = 8
+    config.model.n_embd = 16
+    config.model.n_head = 2
+    config.model.n_layer = 1
+    config.training.batch_size = 2
+    config.training.max_iters = 3
+    config.training.eval_interval = 1
+    config.training.eval_iters = 1
+    model = ModelRegistry.create("minigpt", config.model)
+    provider = MockBatchProvider(config.model.vocab_size)
+    trainer = Trainer(model=model, batch_provider=provider, config=config, device="cpu")
+    metrics = iter(
+        [
+            {"train_loss": 3.0, "val_loss": 3.0},
+            {"train_loss": 1.0, "val_loss": 1.0},
+            {"train_loss": 2.0, "val_loss": 2.0},
+        ]
+    )
+    monkeypatch.setattr(trainer, "evaluate", lambda: next(metrics))
+
+    output = trainer.train()
+
+    assert output.metrics["val_loss"] == pytest.approx(2.0)
+    assert output.best_val_loss == pytest.approx(1.0)
+
+
+def test_gradient_checkpointing_executes_checkpoint_path(monkeypatch) -> None:
+    import src.models.architectures.minigpt as minigpt_module
+
+    config = EngineConfig()
+    config.model.vocab_size = 20
+    config.model.block_size = 8
+    config.model.n_embd = 16
+    config.model.n_head = 2
+    config.model.n_layer = 1
+    config.training.batch_size = 2
+    config.training.max_iters = 1
+    config.training.eval_interval = 1
+    config.training.eval_iters = 1
+    config.training.gradient_checkpointing = True
+    model = ModelRegistry.create("minigpt", config.model)
+    provider = MockBatchProvider(config.model.vocab_size)
+    calls = []
+    real_checkpoint = torch_checkpoint
+
+    def recording_checkpoint(function, *args, **kwargs):
+        calls.append(True)
+        return real_checkpoint(function, *args, **kwargs)
+
+    monkeypatch.setattr(minigpt_module, "checkpoint", recording_checkpoint, raising=False)
+    trainer = Trainer(model=model, batch_provider=provider, config=config, device="cpu")
+
+    trainer.train()
+
+    assert calls
+
+
+def test_resume_restores_exact_training_trajectory(tmp_path) -> None:
+    import random
+
+    import numpy as np
+
+    from src.training.callbacks import BaseCallback
+
+    class StopAtTwo(BaseCallback):
+        def on_step_end(self, trainer, step, loss):
+            if step == 2:
+                trainer.request_stop()
+
+    def make_config() -> EngineConfig:
+        cfg = EngineConfig()
+        cfg.system.seed = 1234
+        cfg.model.vocab_size = 23
+        cfg.model.block_size = 8
+        cfg.model.n_embd = 16
+        cfg.model.n_head = 2
+        cfg.model.n_layer = 1
+        cfg.model.dropout = 0.1
+        cfg.training.batch_size = 2
+        cfg.training.max_iters = 4
+        cfg.training.eval_interval = 2
+        cfg.training.eval_iters = 1
+        cfg.training.warmup_iters = 10
+        return cfg
+
+    # Uninterrupted reference.
+    random.seed(1234)
+    np.random.seed(1234)
+    torch.manual_seed(1234)
+    full_cfg = make_config()
+    full_model = ModelRegistry.create("minigpt", full_cfg.model)
+    full_provider = MockBatchProvider(full_cfg.model.vocab_size)
+    full_trainer = Trainer(
+        model=full_model, batch_provider=full_provider, config=full_cfg, device="cpu"
+    )
+    full_trainer.train()
+    expected = {key: value.detach().clone() for key, value in full_model.state_dict().items()}
+
+    # Same start, stop after step 2 and persist exact runtime state.
+    random.seed(1234)
+    np.random.seed(1234)
+    torch.manual_seed(1234)
+    split_cfg = make_config()
+    split_model = ModelRegistry.create("minigpt", split_cfg.model)
+    split_provider = MockBatchProvider(split_cfg.model.vocab_size)
+    checkpoint_cb = ModelCheckpointCallback(save_dir=str(tmp_path), save_top_k=0)
+    split_trainer = Trainer(
+        model=split_model,
+        batch_provider=split_provider,
+        config=split_cfg,
+        callbacks=[StopAtTwo(), checkpoint_cb],
+        device="cpu",
+    )
+    split_trainer.train()
+    checkpoint_path = tmp_path / "last_model.pt"
+    assert checkpoint_path.exists()
+
+    # Simulate a fresh process whose initialization has already consumed unrelated RNG.
+    random.seed(999)
+    np.random.seed(999)
+    torch.manual_seed(999)
+    resumed_cfg = make_config()
+    resumed_model = ModelRegistry.create("minigpt", resumed_cfg.model)
+    resumed_provider = MockBatchProvider(resumed_cfg.model.vocab_size)
+    resumed_trainer = Trainer(
+        model=resumed_model,
+        batch_provider=resumed_provider,
+        config=resumed_cfg,
+        device="cpu",
+    )
+    resumed_trainer.train(resume_checkpoint=str(checkpoint_path))
+
+    actual = resumed_model.state_dict()
+    assert actual.keys() == expected.keys()
+    for key in expected:
+        assert torch.equal(actual[key], expected[key]), key
+
+
+def test_resume_preserves_historical_best_validation_loss(tmp_path, monkeypatch) -> None:
+    from src.training.callbacks import BaseCallback
+
+    class StopAtOne(BaseCallback):
+        def on_step_end(self, trainer, step, loss):
+            if step == 1:
+                trainer.request_stop()
+
+    config = EngineConfig()
+    config.model.vocab_size = 20
+    config.model.block_size = 8
+    config.model.n_embd = 16
+    config.model.n_head = 2
+    config.model.n_layer = 1
+    config.training.batch_size = 2
+    config.training.max_iters = 2
+    config.training.eval_interval = 1
+    config.training.eval_iters = 1
+    model = ModelRegistry.create("minigpt", config.model)
+    provider = MockBatchProvider(config.model.vocab_size)
+    checkpoint_cb = ModelCheckpointCallback(save_dir=str(tmp_path), save_top_k=0)
+    trainer = Trainer(
+        model=model,
+        batch_provider=provider,
+        config=config,
+        callbacks=[StopAtOne(), checkpoint_cb],
+        device="cpu",
+    )
+    monkeypatch.setattr(trainer, "evaluate", lambda: {"train_loss": 1.0, "val_loss": 1.0})
+    trainer.train()
+
+    resumed_model = ModelRegistry.create("minigpt", config.model)
+    resumed = Trainer(
+        model=resumed_model,
+        batch_provider=MockBatchProvider(config.model.vocab_size),
+        config=config,
+        device="cpu",
+    )
+    monkeypatch.setattr(resumed, "evaluate", lambda: {"train_loss": 2.0, "val_loss": 2.0})
+    output = resumed.train(resume_checkpoint=str(tmp_path / "last_model.pt"))
+
+    assert output.best_val_loss == pytest.approx(1.0)
+
+
+def test_evaluate_restores_previous_model_mode() -> None:
+    config = EngineConfig()
+    config.model.vocab_size = 20
+    config.model.block_size = 8
+    config.model.n_embd = 16
+    config.model.n_head = 2
+    config.model.n_layer = 1
+    config.training.batch_size = 2
+    config.training.eval_iters = 1
+    model = ModelRegistry.create("minigpt", config.model)
+    provider = MockBatchProvider(config.model.vocab_size)
+    trainer = Trainer(model=model, batch_provider=provider, config=config, device="cpu")
+    model.eval()
+
+    trainer.evaluate()
+
+    assert model.training is False

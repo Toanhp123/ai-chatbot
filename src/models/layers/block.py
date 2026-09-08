@@ -18,12 +18,19 @@ from src.models.layers.norm import RMSNorm
 class TransformerBlock(nn.Module):
     """Khối Transformer Block tiêu chuẩn với Pre-LayerNorm và Residual Connection."""
 
-    def __init__(self, n_embd: int, n_head: int, block_size: int, dropout: float = 0.1):
+    def __init__(
+        self,
+        n_embd: int,
+        n_head: int,
+        block_size: int,
+        dropout: float = 0.1,
+        bias: bool = False,
+    ):
         super().__init__()
         self.ln_1 = nn.LayerNorm(n_embd)
-        self.attn = CausalSelfAttention(n_embd, n_head, block_size, dropout)
+        self.attn = CausalSelfAttention(n_embd, n_head, block_size, dropout, bias=bias)
         self.ln_2 = nn.LayerNorm(n_embd)
-        self.mlp = FeedForward(n_embd, dropout)
+        self.mlp = FeedForward(n_embd, dropout, bias=bias)
 
     def reset_kv_cache(self) -> None:
         self.attn.reset_kv_cache()
@@ -49,16 +56,18 @@ class LlamaBlock(nn.Module):
         intermediate_size: int = 0,
         multiple_of: int = 64,
         norm_eps: float = 1e-6,
+        bias: bool = False,
     ):
         super().__init__()
         self.attn_norm = RMSNorm(n_embd, eps=norm_eps)
-        self.attn = LlamaAttention(n_embd, n_head, dropout=dropout)
+        self.attn = LlamaAttention(n_embd, n_head, dropout=dropout, bias=bias)
         self.ffn_norm = RMSNorm(n_embd, eps=norm_eps)
         self.mlp = SwiGLUFeedForward(
             n_embd,
             intermediate_size=intermediate_size,
             multiple_of=multiple_of,
             dropout=dropout,
+            bias=bias,
         )
 
     def reset_kv_cache(self) -> None:

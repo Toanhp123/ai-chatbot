@@ -23,9 +23,13 @@ from src.core.config import EngineConfig
 from src.core.exceptions import CheckpointNotFoundError
 from src.core.logging import get_logger
 from src.data.batch_provider import BaseBatchProvider, TensorBatchProvider
+from src.data.tokenizers import load_tokenizer_state
+from src.data.tokenizers.base import BaseTokenizer, get_tokenizer_identity
 from src.models.base import BaseModel
 from src.training.callbacks import BaseCallback
 from src.training.optimizers import compute_scheduled_lr, configure_optimizer
+from src.utils.device import resolve_device
+from src.utils.seed import capture_rng_state, restore_rng_state
 from src.utils.tensor_inspector import assert_valid_tensor, check_model_gradients
 
 logger = get_logger("Trainer")
@@ -57,6 +61,7 @@ class Trainer:
         callbacks: Optional[List[BaseCallback]] = None,
         optimizer: Optional[torch.optim.Optimizer] = None,
         device: Optional[str] = None,
+        tokenizer: Optional[BaseTokenizer] = None,
         **kwargs: Any,
     ) -> None:
         if config is None:
@@ -64,6 +69,7 @@ class Trainer:
         self.config = config
         self.model = model
         self.callbacks = callbacks or []
+        self.tokenizer = tokenizer
 
         # Thiết lập nguồn dữ liệu
         if batch_provider is not None:
@@ -74,13 +80,7 @@ class Trainer:
             raise ValueError("Cần cung cấp batch_provider hoặc cặp (train_data, val_data).")
 
         # Xác định thiết bị
-        if device is None:
-            if config.system.device == "auto":
-                self.device = "cuda" if torch.cuda.is_available() else "cpu"
-            else:
-                self.device = config.system.device
-        else:
-            self.device = device
+        self.device = resolve_device(device if device is not None else config.system.device)
 
         self.device_type = (
             "cuda" if "cuda" in self.device else ("mps" if "mps" in self.device else "cpu")
@@ -103,6 +103,15 @@ class Trainer:
 
         self.model.to(self.device)
 
+        gradient_checkpointing = bool(config.training.gradient_checkpointing)
+        set_gradient_checkpointing = getattr(self.model, "set_gradient_checkpointing", None)
+        if gradient_checkpointing and not callable(set_gradient_checkpointing):
+            raise ValueError(
+                "Model hiện tại không hỗ trợ gradient_checkpointing nhưng cấu hình đã bật."
+            )
+        if callable(set_gradient_checkpointing):
+            set_gradient_checkpointing(gradient_checkpointing)
+
         # Hỗ trợ Dependency Injection cho Optimizer
         if optimizer is not None:
             self.optimizer = optimizer
@@ -112,6 +121,7 @@ class Trainer:
         self.current_lr = config.training.learning_rate
         self.should_stop = False
         self.start_step = 1
+        self.best_val_loss: Optional[float] = None
 
     @property
     def max_iters(self) -> int:
@@ -134,16 +144,157 @@ class Trainer:
         """Lấy cấu hình hiện tại dưới dạng dictionary."""
         return self.config.to_dict()
 
+    @staticmethod
+    def _callback_key(callback: BaseCallback) -> str:
+        callback_type = type(callback)
+        return f"{callback_type.__module__}.{callback_type.__qualname__}"
+
+    def get_runtime_state(self) -> Dict[str, Any]:
+        """Capture stochastic/runtime state required to continue the same trajectory."""
+        callback_states = []
+        for callback in self.callbacks:
+            state = callback.state_dict()
+            if state:
+                callback_states.append({"type": self._callback_key(callback), "state": state})
+
+        provider_state = self.batch_provider.state_dict()
+        return {
+            "trainer": {"best_val_loss": self.best_val_loss},
+            "rng": capture_rng_state(),
+            "grad_scaler": self.scaler.state_dict(),
+            "batch_provider": {
+                "type": f"{type(self.batch_provider).__module__}.{type(self.batch_provider).__qualname__}",
+                "supports_exact_resume": self.batch_provider.supports_exact_resume,
+                "state": provider_state,
+            },
+            "callbacks": callback_states,
+        }
+
+    def get_checkpoint_state(self) -> Dict[str, Any]:
+        """Build a portable checkpoint payload from trainer-owned runtime state."""
+        tokenizer_identity = (
+            get_tokenizer_identity(self.tokenizer) if self.tokenizer is not None else None
+        )
+        tokenizer_state = (
+            dict(tokenizer_identity["payload"]) if tokenizer_identity is not None else None
+        )
+        checkpoint_version = 3 if tokenizer_state is not None else 1
+        return {
+            "checkpoint_version": checkpoint_version,
+            "model_state_dict": self.get_model_state_dict(),
+            "optimizer_state_dict": self.get_optimizer_state_dict(),
+            "config": self.get_config_dict(),
+            "tokenizer_identity": tokenizer_identity,
+            "tokenizer_state": tokenizer_state,
+            "runtime_state": self.get_runtime_state(),
+        }
+
+    def _validate_runtime_state_compatibility(self, runtime_state: Dict[str, Any]) -> None:
+        """Preflight runtime-owned contracts before any checkpoint state is committed."""
+        provider_state = runtime_state.get("batch_provider")
+        if not isinstance(provider_state, dict):
+            return
+        saved_type = provider_state.get("type")
+        current_type = (
+            f"{type(self.batch_provider).__module__}.{type(self.batch_provider).__qualname__}"
+        )
+        if saved_type and saved_type != current_type:
+            raise ValueError(
+                f"Batch provider checkpoint không khớp: {saved_type} != {current_type}."
+            )
+        if provider_state.get("supports_exact_resume") is False:
+            raise ValueError("Checkpoint được tạo bởi batch provider không hỗ trợ exact resume.")
+
+    def _restore_runtime_state(self, runtime_state: Dict[str, Any]) -> None:
+        trainer_state = runtime_state.get("trainer")
+        if isinstance(trainer_state, dict):
+            raw_best = trainer_state.get("best_val_loss")
+            self.best_val_loss = float(raw_best) if raw_best is not None else None
+
+        scaler_state = runtime_state.get("grad_scaler")
+        if isinstance(scaler_state, dict):
+            self.scaler.load_state_dict(scaler_state)
+
+        self._validate_runtime_state_compatibility(runtime_state)
+        provider_state = runtime_state.get("batch_provider")
+        if isinstance(provider_state, dict):
+            raw_provider_state = provider_state.get("state")
+            if isinstance(raw_provider_state, dict):
+                self.batch_provider.load_state_dict(raw_provider_state)
+
+        saved_callbacks = runtime_state.get("callbacks", [])
+        if isinstance(saved_callbacks, list):
+            remaining = list(self.callbacks)
+            for item in saved_callbacks:
+                if not isinstance(item, dict) or not isinstance(item.get("state"), dict):
+                    continue
+                saved_type = item.get("type")
+                for index, callback in enumerate(remaining):
+                    if self._callback_key(callback) == saved_type:
+                        callback.load_state_dict(item["state"])
+                        remaining.pop(index)
+                        break
+
+        rng_state = runtime_state.get("rng")
+        if isinstance(rng_state, dict):
+            # Restore last: initialization/state loading above must not perturb the resumed stream.
+            restore_rng_state(rng_state)
+
     def resume_from_checkpoint(self, checkpoint_path: str) -> int:
         """Nạp trọng số mô hình và trạng thái optimizer từ checkpoint để tiếp tục huấn luyện."""
         if not os.path.exists(checkpoint_path):
             raise CheckpointNotFoundError(checkpoint_path=checkpoint_path)
 
         state = torch.load(checkpoint_path, map_location=self.device, weights_only=True)
+
+        # Validate semantic compatibility before mutating model/optimizer/runtime state.
+        # A rejected resume must be atomic from the caller's perspective.
+        checkpoint_version = int(state.get("checkpoint_version", 1))
+        checkpoint_identity = state.get("tokenizer_identity")
+        resume_tokenizer = self.tokenizer
+        if checkpoint_version >= 2:
+            if not isinstance(checkpoint_identity, dict):
+                raise ValueError("Checkpoint v2+ thiếu tokenizer identity bắt buộc.")
+            if checkpoint_version >= 3:
+                embedded_state = state.get("tokenizer_state")
+                if not isinstance(embedded_state, dict):
+                    raise ValueError("Checkpoint v3 thiếu tokenizer state bắt buộc.")
+                embedded_tokenizer = load_tokenizer_state(embedded_state)
+                embedded_identity = get_tokenizer_identity(embedded_tokenizer)
+                if checkpoint_identity.get("fingerprint") != embedded_identity.get("fingerprint"):
+                    raise ValueError(
+                        "Tokenizer state nhúng không khớp tokenizer identity của checkpoint."
+                    )
+                if resume_tokenizer is None:
+                    resume_tokenizer = embedded_tokenizer
+            if resume_tokenizer is None:
+                raise ValueError("Trainer phải được cung cấp tokenizer để xác minh checkpoint v2.")
+            current_identity = get_tokenizer_identity(resume_tokenizer)
+            if checkpoint_identity.get("fingerprint") != current_identity.get("fingerprint"):
+                raise ValueError("Tokenizer hiện tại không khớp tokenizer identity của checkpoint.")
+        elif resume_tokenizer is not None and isinstance(checkpoint_identity, dict):
+            current_identity = get_tokenizer_identity(resume_tokenizer)
+            if checkpoint_identity.get("fingerprint") != current_identity.get("fingerprint"):
+                raise ValueError("Tokenizer hiện tại không khớp tokenizer identity của checkpoint.")
+
+        runtime_state = state.get("runtime_state")
+        if isinstance(runtime_state, dict):
+            self._validate_runtime_state_compatibility(runtime_state)
+
         if "model_state_dict" in state:
             self.model.load_state_dict(state["model_state_dict"])
         if "optimizer_state_dict" in state and state["optimizer_state_dict"] is not None:
             self.optimizer.load_state_dict(state["optimizer_state_dict"])
+        if self.tokenizer is None and resume_tokenizer is not None:
+            self.tokenizer = resume_tokenizer
+
+        if isinstance(runtime_state, dict):
+            self._restore_runtime_state(runtime_state)
+        else:
+            logger.warning(
+                "Checkpoint legacy không có runtime_state; chỉ model/optimizer được khôi phục, "
+                "không thể đảm bảo trajectory lossless."
+            )
 
         resumed_step = int(state.get("step", 0))
         self.start_step = resumed_step + 1
@@ -154,36 +305,46 @@ class Trainer:
 
     @torch.no_grad()
     def evaluate(self) -> Dict[str, float]:
-        """Đánh giá loss trung bình trên tập train và val thông qua batch_provider."""
+        """Đánh giá loss trung bình và khôi phục mode mô hình của caller."""
+        was_training = bool(self.model.training)
         self.model.eval()
         eval_iters = self.config.training.eval_iters
         block_size = self.config.model.block_size
         batch_size = self.config.training.batch_size
 
         metrics: Dict[str, float] = {}
-        for split_name, getter in [
-            ("train", self.batch_provider.get_train_batch),
-            ("val", self.batch_provider.get_val_batch),
-        ]:
-            losses = torch.zeros(eval_iters)
-            for k in range(eval_iters):
-                X, Y = getter(batch_size, block_size, self.device)
-                with autocast(
-                    device_type=self.device_type,
-                    dtype=self.amp_dtype,
-                    enabled=self.use_amp,
-                ):
-                    _, loss = self.model(X, Y)
-                assert loss is not None, "Evaluation step returned None loss"
-                losses[k] = loss.item()
-            metrics[f"{split_name}_loss"] = float(losses.mean().item())
+        try:
+            for split_name, getter in [
+                ("train", self.batch_provider.get_train_batch),
+                ("val", self.batch_provider.get_val_batch),
+            ]:
+                losses = torch.zeros(eval_iters)
+                for k in range(eval_iters):
+                    X, Y = getter(batch_size, block_size, self.device)
+                    with autocast(
+                        device_type=self.device_type,
+                        dtype=self.amp_dtype,
+                        enabled=self.use_amp,
+                    ):
+                        _, loss = self.model(X, Y)
+                    assert loss is not None, "Evaluation step returned None loss"
+                    losses[k] = loss.item()
+                metrics[f"{split_name}_loss"] = float(losses.mean().item())
+        finally:
+            self.model.train(was_training)
 
-        self.model.train()
         return metrics
 
     def train(self, resume_checkpoint: Optional[str] = None) -> TrainOutput:
         """Vòng lặp huấn luyện chính với Gradient Accumulation, AMP và Graceful Shutdown."""
         start_time = time.time()
+
+        # Initialize callback-owned resources/default state before restoring a resume
+        # checkpoint.  Restoring first would let on_train_begin() overwrite the
+        # checkpointed callback state immediately afterwards.
+        for cb in self.callbacks:
+            cb.on_train_begin(self)
+
         if resume_checkpoint is not None:
             self.resume_from_checkpoint(resume_checkpoint)
 
@@ -199,14 +360,9 @@ class Trainer:
         effective_step_loss = 0.0
         last_metrics: Dict[str, float] = {}
 
-        # Trigger hook on_train_begin
-        for cb in self.callbacks:
-            cb.on_train_begin(self)
-
         self.model.train()
         try:
             for step in range(self.start_step, max_iters + 1):
-                last_step = step
                 if self.should_stop:
                     logger.info(
                         f"Đã nhận tín hiệu dừng sớm (request_stop) tại bước {step}. Đang ngắt vòng lặp an toàn."
@@ -214,8 +370,9 @@ class Trainer:
                     interrupted = True
                     break
 
-                # 1. Cập nhật Learning Rate
-                self.current_lr = compute_scheduled_lr(step, self.config.training)
+                last_step = step
+                # Scheduler uses zero-based update indices; public training steps remain one-based.
+                self.current_lr = compute_scheduled_lr(step - 1, self.config.training)
                 for param_group in self.optimizer.param_groups:
                     param_group["lr"] = self.current_lr
 
@@ -263,6 +420,13 @@ class Trainer:
                 # 5. Đánh giá định kỳ
                 if step % eval_interval == 0 or step == max_iters:
                     last_metrics = self.evaluate()
+                    val_loss = last_metrics.get("val_loss")
+                    if val_loss is not None:
+                        self.best_val_loss = (
+                            val_loss
+                            if self.best_val_loss is None
+                            else min(self.best_val_loss, val_loss)
+                        )
                     for cb in self.callbacks:
                         cb.on_eval_end(self, step, last_metrics)
 
@@ -279,13 +443,11 @@ class Trainer:
                 torch.cuda.empty_cache()
 
         elapsed_time = time.time() - start_time
-        best_val_loss = last_metrics.get("val_loss")
-
         return TrainOutput(
             global_step=last_step,
             total_steps=max(0, last_step - self.start_step + 1),
             final_train_loss=effective_step_loss,
-            best_val_loss=best_val_loss,
+            best_val_loss=self.best_val_loss,
             metrics=last_metrics,
             elapsed_time_sec=elapsed_time,
             interrupted=interrupted,

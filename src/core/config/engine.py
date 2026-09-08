@@ -122,10 +122,18 @@ class EngineConfig(BaseConfig):
                 {"unknown_domains": unknown_domains},
             )
 
-        system_cfg = SystemConfig.from_kwargs_safe(data.get("system", {}) or {})
+        system_data = dict(data.get("system", {}) or {})
+        training_data = dict(data.get("training", {}) or {})
+        legacy_mixed_precision = system_data.pop("mixed_precision", None)
+        if legacy_mixed_precision is not None and not isinstance(legacy_mixed_precision, bool):
+            raise ConfigurationError("system.mixed_precision legacy phải là boolean.")
+        if legacy_mixed_precision is True and "precision" not in training_data:
+            training_data["precision"] = "amp_fp16"
+
+        system_cfg = SystemConfig.from_kwargs_safe(system_data)
         data_cfg = DataConfig.from_kwargs_safe(data.get("data", {}) or {})
         model_cfg = ModelConfig.from_kwargs_safe(data.get("model", {}) or {})
-        train_cfg = TrainingConfig.from_kwargs_safe(data.get("training", {}) or {})
+        train_cfg = TrainingConfig.from_kwargs_safe(training_data)
         gen_cfg = GenerationConfig.from_kwargs_safe(data.get("generation", {}) or {})
 
         cfg = cls(

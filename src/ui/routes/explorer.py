@@ -19,7 +19,8 @@ router = APIRouter(prefix="/api/explorer", tags=["Explorer"])
 class TokenizeRequest(BaseModel):
     text: str = Field(default="Trăm năm trong cõi người ta,", description="Văn bản cần token hóa")
     tokenizer_type: str = Field(
-        default="char", description="Loại tokenizer: 'char', 'byte', hoặc 'gemini'"
+        default="char",
+        description="Loại tokenizer: 'char', 'byte'; 'gemini' chỉ là alias legacy của byte",
     )
 
 
@@ -67,7 +68,7 @@ async def clean_endpoint(req: CleanRequest):
 
 @router.post("/tokenize")
 async def tokenize_endpoint(req: TokenizeRequest, request: Request):
-    """Mã hóa văn bản thành mảng Token ID và chi tiết từng ký tự (Hỗ trợ Char, Byte & Gemini AI Tokenizer)."""
+    """Mã hóa văn bản thành Token ID; ``gemini`` được giữ như alias legacy của ByteTokenizer."""
     if req.tokenizer_type == "byte":
         tokenizer = ByteTokenizer()
     elif req.tokenizer_type == "gemini":
@@ -86,12 +87,27 @@ async def tokenize_endpoint(req: TokenizeRequest, request: Request):
 
     token_ids = tokenizer.encode(req.text)
 
-    # Giải mã từng token đơn lẻ để hiển thị chip
+    # Byte token IDs are UTF-8 bytes, not standalone Unicode characters.
+    # Rendering each byte through decode([id]) would display replacement glyphs for
+    # multibyte Vietnamese/emoji sequences, so expose non-ASCII bytes as hex chips.
+    byte_semantics = tokenizer.identity_payload().get("tokenizer_type") == "byte"
     tokens_detail: List[Dict[str, Any]] = []
     for tid in token_ids:
         try:
-            char_repr = tokenizer.decode([tid])
-            display_char = "␣" if char_repr == " " else ("⏎\n" if char_repr == "\n" else char_repr)
+            if byte_semantics and 0 <= tid < 256:
+                if tid == 32:
+                    display_char = "␣"
+                elif tid == 10:
+                    display_char = "⏎\n"
+                elif 33 <= tid <= 126:
+                    display_char = chr(tid)
+                else:
+                    display_char = f"0x{tid:02X}"
+            else:
+                char_repr = tokenizer.decode([tid])
+                display_char = (
+                    "␣" if char_repr == " " else ("⏎\n" if char_repr == "\n" else char_repr)
+                )
         except Exception:
             display_char = f"<{tid}>"
 
@@ -187,16 +203,14 @@ class CompareTokenizersRequest(BaseModel):
 
 @router.post("/compare-tokenizers")
 async def compare_tokenizers_endpoint(req: CompareTokenizersRequest):
-    """So sánh đồng thời 3 bộ mã hóa Char, Byte và Gemini trên cùng một chuỗi văn bản."""
+    """So sánh các tokenizer có semantics khác nhau; bỏ alias Gemini trùng Byte."""
     char_tok = load_tokenizer("data/vocab.json") if os.path.exists("data/vocab.json") else None
     byte_tok = ByteTokenizer()
-    gemini_tok = GeminiTokenizer()
 
     results: Dict[str, Any] = {}
     for key, label, tok in [
         ("char", "Char Tokenizer", char_tok),
         ("byte", "Byte Tokenizer (Zero-OOV)", byte_tok),
-        ("gemini", "Gemini AI Tokenizer", gemini_tok),
     ]:
         if tok is None:
             continue

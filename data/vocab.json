@@ -1,13 +1,14 @@
 {
   "version": "2.0",
   "tokenizer_type": "char",
-  "vocab_size": 129,
+  "vocab_size": 128,
   "add_special_tokens": false,
   "special_tokens": {},
   "vocab": [
     "\n",
     " ",
     "!",
+    "\"",
     "'",
     ",",
     "-",
@@ -131,8 +132,6 @@
     "ự",
     "ỳ",
     "ỷ",
-    "ỹ",
-    "“",
-    "”"
+    "ỹ"
   ]
 }

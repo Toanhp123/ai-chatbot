@@ -54,3 +54,47 @@ class ModelConfig(BaseConfig):
             raise ConfigurationError(
                 f"model_kwargs phải là một dictionary, nhận được {type(self.model_kwargs).__name__}"
             )
+
+        model_name = self.name.lower().strip()
+        if model_name in {"llama", "llama_nano"}:
+            head_dim = self.n_embd // self.n_head
+            if head_dim % 2 != 0:
+                raise ConfigurationError(
+                    "LLaMA yêu cầu head_dim chẵn để áp dụng Rotary Position Embedding.",
+                    {"head_dim": head_dim, "n_embd": self.n_embd, "n_head": self.n_head},
+                )
+
+            raw_multiple_of = self.model_kwargs.get("multiple_of", 64)
+            if isinstance(raw_multiple_of, bool):
+                raise ConfigurationError("LLaMA multiple_of phải là số nguyên > 0.")
+            try:
+                multiple_of = int(raw_multiple_of)
+            except (TypeError, ValueError) as exc:
+                raise ConfigurationError("LLaMA multiple_of phải là số nguyên > 0.") from exc
+            if multiple_of <= 0:
+                raise ConfigurationError(f"LLaMA multiple_of phải > 0, nhận được {raw_multiple_of}")
+
+            raw_norm_eps = self.model_kwargs.get("norm_eps", 1e-6)
+            if isinstance(raw_norm_eps, bool):
+                raise ConfigurationError("LLaMA norm_eps phải là số thực > 0.")
+            try:
+                norm_eps = float(raw_norm_eps)
+            except (TypeError, ValueError) as exc:
+                raise ConfigurationError("LLaMA norm_eps phải là số thực > 0.") from exc
+            if norm_eps <= 0.0:
+                raise ConfigurationError(f"LLaMA norm_eps phải > 0, nhận được {raw_norm_eps}")
+
+            if "intermediate_size" in self.model_kwargs:
+                raw_intermediate = self.model_kwargs["intermediate_size"]
+                if isinstance(raw_intermediate, bool):
+                    raise ConfigurationError("LLaMA intermediate_size phải là số nguyên >= 0.")
+                try:
+                    intermediate_size = int(raw_intermediate)
+                except (TypeError, ValueError) as exc:
+                    raise ConfigurationError(
+                        "LLaMA intermediate_size phải là số nguyên >= 0."
+                    ) from exc
+                if intermediate_size < 0:
+                    raise ConfigurationError(
+                        f"LLaMA intermediate_size phải >= 0, nhận được {raw_intermediate}"
+                    )

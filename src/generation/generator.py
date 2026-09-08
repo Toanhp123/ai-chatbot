@@ -10,8 +10,9 @@ Hỗ trợ:
 - Đăng ký vào GeneratorRegistry với các bí danh: 'local', 'pytorch', 'default'.
 """
 
+import inspect
 import time
-from typing import Any, List, Literal, Optional, Union, cast, overload
+from typing import Any, List, Literal, Optional, Protocol, Union, cast, overload
 
 import torch
 import torch.nn as nn
@@ -24,6 +25,13 @@ from src.generation.samplers import (
     apply_repetition_penalty,
 )
 from src.generation.streamers import BaseStreamer
+from src.utils.device import resolve_device
+
+
+class _IncrementalDecoder(Protocol):
+    def push(self, tokens: List[int]) -> str: ...
+
+    def finish(self) -> str: ...
 
 
 @GeneratorRegistry.register("local", "pytorch", "default")
@@ -34,26 +42,29 @@ class TextGenerator(BaseGenerator):
         self,
         model: nn.Module,
         tokenizer: Any,
-        device: str = "cuda",
+        device: str = "auto",
     ) -> None:
         self.model = model
         self.tokenizer = tokenizer
-        self.device = device if (device == "cuda" and torch.cuda.is_available()) else "cpu"
+        self.device = resolve_device(device)
         if isinstance(self.model, nn.Module):
             self.model.to(self.device)
             self.model.eval()
+        try:
+            signature = inspect.signature(self.model.forward)
+            self._supports_use_cache = "use_cache" in signature.parameters or any(
+                parameter.kind == inspect.Parameter.VAR_KEYWORD
+                for parameter in signature.parameters.values()
+            )
+        except (TypeError, ValueError):
+            self._supports_use_cache = True
 
     def _call_model(self, x: torch.Tensor, use_cache: bool) -> Any:
-        """Gọi forward của mô hình với kiểm tra tương thích tham số use_cache."""
-        try:
-            if callable(self.model):
-                return self.model(x, use_cache=use_cache)
-            return getattr(self.model, "forward")(x, use_cache=use_cache)
-        except TypeError:
-            # Fallback nếu mô hình bên ngoài không hỗ trợ cờ use_cache
-            if callable(self.model):
-                return self.model(x)
-            return getattr(self.model, "forward")(x)
+        """Call the model once; never hide an internal TypeError by retrying forward."""
+        forward = self.model if callable(self.model) else getattr(self.model, "forward")
+        if self._supports_use_cache:
+            return forward(x, use_cache=use_cache)
+        return forward(x)
 
     @overload
     def generate(
@@ -116,26 +127,53 @@ class TextGenerator(BaseGenerator):
         if streamer:
             streamer.on_prompt(prompt)
 
-        # Xóa sạch KV-Cache trước khi sinh văn bản mới
         reset_fn = getattr(self.model, "reset_kv_cache", None)
         if callable(reset_fn):
             reset_fn()
 
+        stop_sequences: List[List[int]] = []
+        if config.stop_sequences:
+            stop_sequences.extend(
+                [list(sequence) for sequence in config.stop_sequences if sequence]
+            )
+        if config.stop_tokens:
+            stop_sequences.extend([[token] for token in config.stop_tokens])
+        max_stop_len = max((len(sequence) for sequence in stop_sequences), default=1)
+
         generated_token_ids: List[int] = []
         generated_chars: List[str] = []
+        streamed_token_count = 0
+        decoder_factory = getattr(self.tokenizer, "create_incremental_decoder", None)
+        decoder: Optional[_IncrementalDecoder] = (
+            cast(_IncrementalDecoder, decoder_factory()) if callable(decoder_factory) else None
+        )
         block_size: int = int(getattr(self.model, "block_size", 1024))
         use_cache = config.use_cache and callable(getattr(self.model, "reset_kv_cache", None))
         finish_reason = "length"
+        was_training = bool(getattr(self.model, "training", False))
+        if isinstance(self.model, nn.Module):
+            self.model.eval()
+
+        def emit_tokens(token_chunk: List[int]) -> None:
+            if not token_chunk:
+                return
+            text = (
+                decoder.push(token_chunk)
+                if decoder is not None
+                else self.tokenizer.decode(token_chunk)
+            )
+            if text:
+                generated_chars.append(text)
+                if streamer:
+                    streamer.on_token(text)
 
         start_time = time.time()
         try:
             for step in range(config.max_new_tokens):
-                # Khi dùng KV-Cache: Bước đầu đưa prompt đầy đủ, các bước sau chỉ đưa token mới nhất (1 token)
                 if use_cache and idx.size(1) <= block_size:
                     idx_cond = idx if step == 0 else idx[:, [-1]]
                     model_out = self._call_model(idx_cond, use_cache=True)
                 else:
-                    # Fallback tính toán full-attention khi vượt context hoặc không bật cache
                     idx_cond = idx if idx.size(1) <= block_size else idx[:, -block_size:]
                     model_out = self._call_model(idx_cond, use_cache=False)
 
@@ -144,43 +182,59 @@ class TextGenerator(BaseGenerator):
                     model_out[0] if isinstance(model_out, tuple) else model_out,
                 )
 
-                # 1. Áp dụng hệ số phạt lặp từ (Repetition Penalty)
                 if config.repetition_penalty > 1.0:
                     context_tokens = idx[0].tolist()
                     logits = apply_repetition_penalty(
                         logits, context_tokens, penalty=config.repetition_penalty
                     )
 
-                # 2. Lấy mẫu token tiếp theo
                 next_token = sampler.sample(logits[:, -1, :])
                 next_token_id = int(next_token.item())
 
-                # 3. Kiểm tra điều kiện dừng tự nhiên (EOS Token & Stop Sequences)
                 if config.eos_token_id is not None and next_token_id == config.eos_token_id:
                     finish_reason = "eos_token"
                     break
 
-                if config.stop_tokens is not None and next_token_id in config.stop_tokens:
-                    finish_reason = "stop_sequence"
-                    break
-
-                # 4. Ghi nhận token và decode
                 next_token_tensor = torch.tensor(
                     [[next_token_id]], dtype=torch.long, device=self.device
                 )
                 idx = torch.cat((idx, next_token_tensor), dim=1)
                 generated_token_ids.append(next_token_id)
 
-                char = self.tokenizer.decode([next_token_id])
-                generated_chars.append(char)
-                if streamer:
-                    streamer.on_token(char)
+                matched_stop: Optional[List[int]] = None
+                for sequence in stop_sequences:
+                    if (
+                        len(generated_token_ids) >= len(sequence)
+                        and generated_token_ids[-len(sequence) :] == sequence
+                    ):
+                        matched_stop = sequence
+                        break
+                if matched_stop is not None:
+                    del generated_token_ids[-len(matched_stop) :]
+                    finish_reason = "stop_sequence"
+                    break
+
+                safe_end = max(0, len(generated_token_ids) - (max_stop_len - 1))
+                if safe_end > streamed_token_count:
+                    emit_tokens(generated_token_ids[streamed_token_count:safe_end])
+                    streamed_token_count = safe_end
+
+            if len(generated_token_ids) > streamed_token_count:
+                emit_tokens(generated_token_ids[streamed_token_count:])
+                streamed_token_count = len(generated_token_ids)
+            if decoder is not None:
+                tail = decoder.finish()
+                if tail:
+                    generated_chars.append(tail)
+                    if streamer:
+                        streamer.on_token(tail)
 
         finally:
-            # Thu dọn bộ nhớ cache sau khi sinh xong
             cleanup_fn = getattr(self.model, "reset_kv_cache", None)
             if callable(cleanup_fn):
                 cleanup_fn()
+            if isinstance(self.model, nn.Module) and was_training:
+                self.model.train()
 
         if streamer:
             streamer.on_finish()

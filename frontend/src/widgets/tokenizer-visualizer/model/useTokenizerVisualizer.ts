@@ -9,9 +9,7 @@ export function useTokenizerVisualizer(
 	initialText = "Trăm năm trong cõi người ta, chữ tài chữ mệnh khéo là ghét nhau.",
 ) {
 	const [text, setText] = useState(initialText);
-	const [tokenizerType, setTokenizerType] = useState<
-		"char" | "byte" | "gemini"
-	>("char");
+	const [tokenizerType, setTokenizerType] = useState<"char" | "byte">("char");
 	const [tokenData, setTokenData] = useState<TokenizeResult | null>(null);
 	const [comparisonData, setComparisonData] =
 		useState<CompareTokenizersResult | null>(null);
@@ -43,7 +41,7 @@ export function useTokenizerVisualizer(
 			setComparisonData(res);
 		} catch (err: unknown) {
 			const errObj = err as Error;
-			setError(errObj.message || "Lỗi khi so sánh 3 bộ mã hóa");
+			setError(errObj.message || "Lỗi khi so sánh các bộ mã hóa");
 		} finally {
 			setComparing(false);
 		}

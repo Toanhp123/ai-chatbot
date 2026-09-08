@@ -45,9 +45,21 @@ class TrainerProtocol(Protocol):
         """Lấy cấu hình huấn luyện dưới dạng dict thuần túy."""
         ...
 
+    def get_checkpoint_state(self) -> Dict[str, Any]:
+        """Lấy checkpoint payload hoàn chỉnh do Trainer sở hữu."""
+        ...
+
 
 class BaseCallback:
     """Lớp cơ sở (Abstract Base Class) cho tất cả các Callbacks trong hệ thống."""
+
+    def state_dict(self) -> Dict[str, Any]:
+        """Trạng thái tối thiểu cần thiết để callback resume chính xác."""
+        return {}
+
+    def load_state_dict(self, state: Dict[str, Any]) -> None:
+        """Khôi phục trạng thái callback; mặc định callback là stateless."""
+        del state
 
     def on_train_begin(self, trainer: TrainerProtocol) -> None:
         """Được gọi khi bắt đầu phiên huấn luyện."""

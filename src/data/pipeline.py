@@ -53,7 +53,8 @@ class DataPipeline:
         if os.path.exists(config.input_file) and os.path.getsize(config.input_file) > 100:
             logger.info(f"Đọc dữ liệu từ file có sẵn: {config.input_file}")
             with open(config.input_file, "r", encoding="utf-8", errors="replace") as f:
-                return f.read()
+                raw_text = f.read()
+            return cleaner(raw_text)
 
         # 2. Tải dữ liệu từ URL nếu có
         if config.source_url:
@@ -91,6 +92,7 @@ class DataPipeline:
         config: DataConfig,
         cleaner: Optional[BaseTextPreprocessor] = None,
         tokenizer: Optional[BaseTokenizer] = None,
+        block_size: Optional[int] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, BaseTokenizer]:
         """Thiết lập pipeline dữ liệu hoàn chỉnh: nạp text, tokenize, lưu vocab, chia train/val.
 
@@ -117,6 +119,18 @@ class DataPipeline:
         split_idx = int(config.split_ratio * len(data_tensor))
         train_data = data_tensor[:split_idx]
         val_data = data_tensor[split_idx:]
+
+        if block_size is not None:
+            if block_size <= 0:
+                raise DataPipelineError(f"block_size phải > 0, nhận được {block_size}")
+            if len(train_data) <= block_size:
+                raise DatasetEmptyError(
+                    f"Tập train chỉ có {len(train_data)} tokens, không đủ cho block_size={block_size}."
+                )
+            if len(val_data) <= block_size:
+                raise DatasetEmptyError(
+                    f"Tập đánh giá/validation chỉ có {len(val_data)} tokens, không đủ cho block_size={block_size}."
+                )
 
         logger.info(
             f"Dữ liệu sẵn sàng: {len(data_tensor):,} tokens | Vocab: {tokenizer.vocab_size} | "

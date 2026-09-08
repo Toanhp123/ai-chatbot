@@ -237,9 +237,37 @@ def test_training_config_rejects_invalid_runtime_ranges(field: str, value: objec
         ("run_name", r"..\\escape"),
     ],
 )
-def test_training_config_rejects_unsafe_checkpoint_path_components(
-    field: str, value: str
-) -> None:
+def test_training_config_rejects_unsafe_checkpoint_path_components(field: str, value: str) -> None:
     cfg = TrainingConfig(**{field: value})  # type: ignore[arg-type]
     with pytest.raises(ConfigurationError):
         cfg.validate()
+
+
+def test_early_stopping_patience_must_be_positive() -> None:
+    with pytest.raises(ConfigurationError, match="early_stopping_patience"):
+        TrainingConfig(early_stopping_patience=0).validate()
+
+
+def test_system_config_accepts_explicit_mps_device() -> None:
+    from src.core.config import SystemConfig
+
+    cfg = SystemConfig(device="mps")
+    cfg.validate()
+    assert cfg.device == "mps"
+
+
+def test_legacy_system_mixed_precision_maps_to_training_precision() -> None:
+    cfg = EngineConfig.from_dict({"system": {"mixed_precision": True}})
+
+    assert cfg.training.precision == "amp_fp16"
+    assert not hasattr(cfg.system, "mixed_precision")
+
+
+def test_resolve_device_prefers_mps_when_auto_and_cuda_unavailable(monkeypatch) -> None:
+    import src.utils.device as device_utils
+
+    monkeypatch.setattr(device_utils.torch.cuda, "is_available", lambda: False)
+    monkeypatch.setattr(device_utils, "_mps_available", lambda: True)
+
+    assert device_utils.resolve_device("auto") == "mps"
+    assert device_utils.resolve_device("mps") == "mps"

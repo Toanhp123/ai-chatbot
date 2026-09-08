@@ -6,6 +6,7 @@ Tự động khám phá (Auto-discovery) các kiến trúc có sẵn trong thư 
 
 import importlib
 import pkgutil
+from pathlib import Path
 from typing import Callable, Dict, List, Type
 
 from src.core.config import ModelConfig
@@ -21,13 +22,14 @@ class ModelRegistry:
     @classmethod
     def _ensure_builtins(cls) -> None:
         """Tự động quét và nạp toàn bộ các kiến trúc mô hình trong package architectures."""
+        architecture_dir = Path(__file__).with_name("architectures")
         try:
-            import src.models.architectures as arch_pkg
-
-            for _, module_name, _ in pkgutil.iter_modules(arch_pkg.__path__):
+            for _, module_name, _ in pkgutil.iter_modules([str(architecture_dir)]):
                 if not module_name.startswith("_"):
                     importlib.import_module(f"src.models.architectures.{module_name}")
         except Exception:
+            # Discovery failure is surfaced as ModelNotFoundError by create(), preserving
+            # a stable public error without a registry↔package eager-import cycle.
             pass
 
     @classmethod

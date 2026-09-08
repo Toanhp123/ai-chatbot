@@ -141,13 +141,13 @@ def run_architecture_gate() -> Dict[str, Any]:
     passed = len(violations) == 0
     arch_err = ""
     if not passed:
-        arch_err = "\n".join([f"• {v['file']}:{v['line']} - {v['message']}" for v in violations])
+        arch_err = "\n".join(f"• {v['filepath']}:{v['lineno']} - {v['reason']}" for v in violations)
     return {
         "name": "4. Architecture Gate",
         "tool": "AST Boundary Linter",
         "passed": passed,
         "elapsed": elapsed,
-        "details": "Ranh giới các tầng hoàn toàn phân lập"
+        "details": "Không phát hiện vi phạm trong ma trận dependency đã cấu hình"
         if passed
         else f"Có {len(violations)} câu lệnh import sai phân tầng",
         "error_output": arch_err,
