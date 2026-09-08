@@ -2,6 +2,7 @@
 Base contracts and abstractions for the Text Generation subsystem.
 """
 
+import threading
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Any, List, Literal, Optional, Union, overload
@@ -21,10 +22,26 @@ class GenerationOutput:
     tokens_generated: int
     tokens_per_second: float
     elapsed_time_sec: float
-    finish_reason: str  # "length", "eos_token", "stop_sequence"
+    finish_reason: str  # "length", "eos_token", "stop_sequence", "cancelled"
+    prompt_tokens_input: int = 0
+    prompt_tokens_used: int = 0
+    prompt_truncated: bool = False
 
     def __str__(self) -> str:
         return self.text
+
+
+class GenerationCancellation:
+    """Small thread-safe cancellation primitive shared across API and generators."""
+
+    def __init__(self) -> None:
+        self._event = threading.Event()
+
+    def cancel(self) -> None:
+        self._event.set()
+
+    def is_cancelled(self) -> bool:
+        return self._event.is_set()
 
 
 class BaseGenerator(ABC):
@@ -32,6 +49,17 @@ class BaseGenerator(ABC):
     Lớp cơ sở trừu tượng cho mọi công cụ sinh văn bản (Inference Engine).
     Hỗ trợ cắm rút đa dạng: Mô hình PyTorch cục bộ, vLLM, TensorRT-LLM, hoặc Cloud APIs (Gemini/OpenAI).
     """
+
+    @classmethod
+    def from_inference_context(
+        cls,
+        *,
+        model: Any,
+        tokenizer: Any,
+        device: str,
+    ) -> "BaseGenerator":
+        """Build a backend from the local inference context; remote backends may override."""
+        return cls(model=model, tokenizer=tokenizer, device=device)  # type: ignore[call-arg]
 
     @overload
     def generate(
@@ -41,6 +69,7 @@ class BaseGenerator(ABC):
         sampler: Optional[Any] = None,
         streamer: Optional[BaseStreamer] = None,
         *,
+        cancellation: Optional[GenerationCancellation] = None,
         return_output: Literal[True],
         **kwargs: Any,
     ) -> GenerationOutput: ...
@@ -52,6 +81,7 @@ class BaseGenerator(ABC):
         config: Optional[GenerationConfig] = None,
         sampler: Optional[Any] = None,
         streamer: Optional[BaseStreamer] = None,
+        cancellation: Optional[GenerationCancellation] = None,
         return_output: Literal[False] = False,
         **kwargs: Any,
     ) -> str: ...
@@ -63,6 +93,7 @@ class BaseGenerator(ABC):
         config: Optional[GenerationConfig] = None,
         sampler: Optional[Any] = None,
         streamer: Optional[BaseStreamer] = None,
+        cancellation: Optional[GenerationCancellation] = None,
         return_output: bool = False,
         **kwargs: Any,
     ) -> Union[str, GenerationOutput]:
@@ -70,4 +101,4 @@ class BaseGenerator(ABC):
         pass
 
 
-__all__ = ["GenerationOutput", "BaseGenerator"]
+__all__ = ["GenerationOutput", "GenerationCancellation", "BaseGenerator"]

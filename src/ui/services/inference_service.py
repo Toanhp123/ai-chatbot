@@ -2,28 +2,27 @@
 Inference Service: Quản lý nạp mô hình, hoán đổi checkpoint và điều phối sinh văn bản theo luồng (Streaming).
 """
 
-import json
 import math
 import os
 import threading
 import time
-from typing import Any, Dict, Iterator, List, Optional
+from dataclasses import replace
+from typing import Any, Callable, Dict, Generator, List, Optional
 
 import torch
 
 from src.core.config import GenerationConfig, ModelConfig
+from src.core.exceptions import EmptyPromptError, GenerationBusyError, GenerationNotReadyError
 from src.core.logging import get_logger
 from src.data.tokenizers import BaseTokenizer, load_tokenizer, load_tokenizer_state
 from src.data.tokenizers.base import get_tokenizer_identity
 from src.generation import (
     BaseGenerator,
-    GenerationOutput,
     GeneratorRegistry,
-    TextIteratorStreamer,
-    get_generator,
 )
 from src.models.base import BaseModel
 from src.models.registry import ModelRegistry
+from src.ui.services.generation_session import GenerationSession
 from src.utils.device import resolve_device
 
 logger = get_logger("InferenceService")
@@ -39,7 +38,10 @@ class InferenceService:
         vocab_path: str = "data/vocab.json",
         device: str = "auto",
         backend: str = "local",
+        max_generation_sessions: int = 2,
     ) -> None:
+        if max_generation_sessions <= 0:
+            raise ValueError("max_generation_sessions phải > 0")
         self.checkpoint_dir = checkpoint_dir
         self.current_checkpoint_path: Optional[str] = None
         self.vocab_path = vocab_path
@@ -49,8 +51,9 @@ class InferenceService:
         self.model: Optional[BaseModel] = None
         self.generator: Optional[BaseGenerator] = None
         self._lock = threading.Lock()
-        # Model/generator instances own mutable KV-cache state; serialize generation
-        # sessions so concurrent HTTP requests cannot corrupt one another.
+        self._max_generation_sessions = max_generation_sessions
+        self._generation_sessions = 0
+        # Model instances own mutable KV-cache state, so workers execute one at a time.
         self._generation_lock = threading.Lock()
 
         # Nạp mặc định nếu checkpoint và từ vựng tồn tại
@@ -193,16 +196,34 @@ class InferenceService:
         """Danh sách tất cả các generator backend đã đăng ký trong GeneratorRegistry."""
         return GeneratorRegistry.list_generators()
 
+    @staticmethod
+    def _empty_accelerator_cache(device: str) -> None:
+        """Best-effort allocator cleanup after moving inference models off an accelerator."""
+        if device.startswith("cuda") and torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            return
+        if device.startswith("mps"):
+            mps = getattr(torch, "mps", None)
+            empty_cache = getattr(mps, "empty_cache", None)
+            if callable(empty_cache):
+                empty_cache()
+
     def set_backend(self, backend: str) -> None:
         """Chuyển đổi generator backend sang một backend khác trong GeneratorRegistry."""
         with self._lock:
+            if self._generation_sessions:
+                raise GenerationBusyError(
+                    active=self._generation_sessions,
+                    limit=self._max_generation_sessions,
+                    operation="set_backend",
+                )
             backend_clean = backend.lower().strip()
             # Luôn xác thực tên backend, kể cả khi model/tokenizer chưa được nạp.
             # Nếu không, UI có thể lưu một backend không tồn tại và chỉ lỗi muộn
             # ở lần load checkpoint/generate tiếp theo.
             GeneratorRegistry.get(backend_clean)
             if self.model is not None and self.tokenizer is not None:
-                self.generator = get_generator(
+                self.generator = GeneratorRegistry.create_for_inference(
                     backend_clean,
                     model=self.model,
                     tokenizer=self.tokenizer,
@@ -214,6 +235,12 @@ class InferenceService:
     def load_checkpoint(self, checkpoint_path: str, backend: Optional[str] = None) -> None:
         """Nạp checkpoint mới và chỉ commit state sau khi toàn bộ quá trình thành công."""
         with self._lock:
+            if self._generation_sessions:
+                raise GenerationBusyError(
+                    active=self._generation_sessions,
+                    limit=self._max_generation_sessions,
+                    operation="load_checkpoint",
+                )
             target_backend = self.current_backend
             if backend:
                 target_backend = backend.lower().strip()
@@ -222,9 +249,10 @@ class InferenceService:
             if not os.path.exists(checkpoint_path):
                 raise FileNotFoundError(f"Không tìm thấy file checkpoint: {checkpoint_path}")
 
-            checkpoint = torch.load(
-                checkpoint_path, map_location=self.device_str, weights_only=True
-            )
+            # Stage checkpoint tensors on CPU first. Loading directly onto the active
+            # inference device would temporarily duplicate checkpoint + old model + new model
+            # in VRAM before the atomic service-state commit.
+            checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
             checkpoint_identity = checkpoint.get("tokenizer_identity")
             if not isinstance(checkpoint_identity, dict):
                 raise ValueError(
@@ -258,15 +286,50 @@ class InferenceService:
 
             if isinstance(model, torch.nn.Module):
                 model.load_state_dict(checkpoint["model_state_dict"])
-                model.to(self.device_str)
-                model.eval()
 
-            generator = get_generator(
-                target_backend,
-                model=model,
-                tokenizer=tokenizer,
-                device=self.device_str,
-            )
+            # The checkpoint payload is no longer needed after the CPU model has been
+            # populated. Drop it before an accelerator swap to avoid retaining another
+            # full copy of the weights in host memory during the handoff.
+            del checkpoint
+
+            previous_model = self.model
+            previous_model_to_restore: Optional[BaseModel] = None
+            accelerator_target = self.device_str != "cpu"
+            if accelerator_target and previous_model is not None:
+                previous_model.to("cpu")
+                previous_model_to_restore = previous_model
+                self._empty_accelerator_cache(self.device_str)
+
+            try:
+                if isinstance(model, torch.nn.Module):
+                    model.to(self.device_str)
+                    model.eval()
+
+                generator = GeneratorRegistry.create_for_inference(
+                    target_backend,
+                    model=model,
+                    tokenizer=tokenizer,
+                    device=self.device_str,
+                )
+            except Exception:
+                if previous_model_to_restore is not None:
+                    if isinstance(model, torch.nn.Module):
+                        try:
+                            model.to("cpu")
+                        except Exception as cleanup_exc:
+                            logger.warning(
+                                "Không thể offload model mới sau khi checkpoint swap lỗi: %s",
+                                cleanup_exc,
+                            )
+                    self._empty_accelerator_cache(self.device_str)
+                    try:
+                        previous_model_to_restore.to(self.device_str)
+                    except Exception as restore_exc:
+                        raise RuntimeError(
+                            "Checkpoint swap thất bại và không thể khôi phục model trước đó "
+                            "lên inference device."
+                        ) from restore_exc
+                raise
 
             # Atomic state commit: failed validation/load above must leave the active service untouched.
             self.tokenizer = tokenizer
@@ -295,78 +358,98 @@ class InferenceService:
             logger.info(f"🗑️ Đã xóa checkpoint: {safe_filename}")
             return True
 
+    def _release_generation_admission(self) -> None:
+        with self._lock:
+            self._generation_sessions = max(0, self._generation_sessions - 1)
+
+    def begin_generation(
+        self,
+        prompt: str,
+        config: GenerationConfig,
+        backend: Optional[str] = None,
+        stop_words: Optional[List[str]] = None,
+    ) -> GenerationSession:
+        """Reserve bounded admission and freeze all mutable inference inputs for one request."""
+        if not prompt.strip():
+            raise EmptyPromptError()
+        config.validate()
+        with self._lock:
+            current_backend = self.current_backend
+            requested_backend = backend.lower().strip() if backend else current_backend
+            # Validate request input before admission/readiness so an invalid backend
+            # cannot be masked by a transient busy or not-ready service state.
+            requested_generator_cls = GeneratorRegistry.get(requested_backend)
+
+            if self._generation_sessions >= self._max_generation_sessions:
+                raise GenerationBusyError(
+                    active=self._generation_sessions,
+                    limit=self._max_generation_sessions,
+                )
+
+            generator = self.generator
+            tokenizer = self.tokenizer
+            model = self.model
+            if generator is None or tokenizer is None:
+                raise GenerationNotReadyError()
+            generator_provider: Callable[[], BaseGenerator]
+            if requested_backend == current_backend:
+                generator_snapshot = generator
+
+                def current_generator_provider() -> BaseGenerator:
+                    return generator_snapshot
+
+                generator_provider = current_generator_provider
+            else:
+                if model is None:
+                    raise GenerationNotReadyError()
+                generator_cls_snapshot = requested_generator_cls
+                model_snapshot = model
+                tokenizer_snapshot = tokenizer
+                device_snapshot = self.device_str
+
+                def requested_generator_provider() -> BaseGenerator:
+                    return generator_cls_snapshot.from_inference_context(
+                        model=model_snapshot,
+                        tokenizer=tokenizer_snapshot,
+                        device=device_snapshot,
+                    )
+
+                generator_provider = requested_generator_provider
+
+            stop_sequences = (
+                [list(sequence) for sequence in config.stop_sequences]
+                if config.stop_sequences
+                else []
+            )
+            if stop_words:
+                stop_sequences.extend(
+                    sequence for word in stop_words if word and (sequence := tokenizer.encode(word))
+                )
+            frozen_config = replace(
+                config,
+                stop_tokens=list(config.stop_tokens) if config.stop_tokens else None,
+                stop_sequences=stop_sequences or None,
+            )
+            session = GenerationSession(
+                generator_provider=generator_provider,
+                prompt=prompt,
+                config=frozen_config,
+                execution_lock=self._generation_lock,
+                release_admission=self._release_generation_admission,
+            )
+            self._generation_sessions += 1
+            return session
+
     def stream_generate(
         self,
         prompt: str,
         config: GenerationConfig,
         backend: Optional[str] = None,
-    ) -> Iterator[str]:
-        """
-        Thực hiện sinh văn bản trên worker thread và yield dữ liệu SSE format:
-        event: token
-        data: {"token": "..."}
-        """
-        if backend and backend.lower().strip() != self.current_backend:
-            self.set_backend(backend)
-        with self._lock:
-            generator = self.generator
-            tokenizer = self.tokenizer
-        if generator is None or tokenizer is None:
-            error_payload = json.dumps(
-                {
-                    "error": "Chưa có mô hình hoặc từ vựng nào được nạp. Hãy kiểm tra lại checkpoint.",
-                }
-            )
-            yield f"data: {error_payload}\n\n"
-            return
-
-        streamer = TextIteratorStreamer(timeout=30.0)
-        generation_error: List[Exception] = []
-        generation_output: List[GenerationOutput] = []
-        tokens_emitted: List[str] = []
-        t0 = time.time()
-
-        def worker() -> None:
-            try:
-                with self._generation_lock:
-                    result = generator.generate(
-                        prompt=prompt,
-                        config=config,
-                        streamer=streamer,
-                        return_output=True,
-                    )
-                    if isinstance(result, GenerationOutput):
-                        generation_output.append(result)
-            except Exception as e:
-                logger.exception(f"Lỗi worker suy luận: {e}")
-                generation_error.append(e)
-                # Đảm bảo streamer dừng để không treo hàng đợi
-                streamer.on_finish()
-
-        thread = threading.Thread(target=worker, daemon=True)
-        thread.start()
-
-        # Đẩy prompt ban đầu
-        yield f"data: {json.dumps({'type': 'start', 'prompt': prompt})}\n\n"
-
-        for token in streamer:
-            tokens_emitted.append(token)
-            yield f"data: {json.dumps({'type': 'token', 'token': token})}\n\n"
-
-        thread.join(timeout=1.0)
-        elapsed = time.time() - t0
-        token_count = (
-            generation_output[0].tokens_generated if generation_output else len(tokens_emitted)
-        )
-        tps = round(
-            generation_output[0].tokens_per_second
-            if generation_output
-            else (token_count / elapsed if elapsed > 0 else 0.0),
-            2,
-        )
-
-        if generation_error:
-            yield f"data: {json.dumps({'type': 'error', 'message': str(generation_error[0])})}\n\n"
-        else:
-            full_text = prompt + "".join(tokens_emitted)
-            yield f"data: {json.dumps({'type': 'done', 'full_text': full_text, 'token_count': token_count, 'elapsed_sec': round(elapsed, 3), 'tps': tps})}\n\n"
+        stop_words: Optional[List[str]] = None,
+    ) -> Generator[str, None, None]:
+        """Compatibility generator around the explicit GenerationSession lifecycle."""
+        session = self.begin_generation(prompt, config, backend=backend, stop_words=stop_words)
+        try:
+            yield from session.iter_sse()
+        finally:
+            session.close()

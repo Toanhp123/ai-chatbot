@@ -59,6 +59,8 @@ class ErrorCode(str, Enum):
     GEN_BACKEND_NOT_FOUND = "ERR_GEN_BACKEND_NOT_FOUND"
     GEN_EMPTY_PROMPT = "ERR_GEN_EMPTY_PROMPT"
     GEN_CONTEXT_EXCEEDED = "ERR_GEN_CONTEXT_EXCEEDED"
+    GEN_BUSY = "ERR_GEN_BUSY"
+    GEN_NOT_READY = "ERR_GEN_NOT_READY"
 
     # Lỗi tương thích giao thức (Protocols)
     PROTO_VIOLATION = "ERR_PROTO_VIOLATION"
@@ -403,6 +405,44 @@ class GeneratorBackendNotFoundError(GenerationError):
         )
 
 
+class GenerationBusyError(GenerationError):
+    """Raised when the bounded generation admission queue is full or mutable state is busy."""
+
+    def __init__(self, active: int, limit: int, operation: str = "generate"):
+        super().__init__(
+            message="Hệ thống suy luận đang bận; hãy thử lại sau khi phiên hiện tại kết thúc.",
+            details={"active": active, "limit": limit, "operation": operation},
+            error_code=ErrorCode.GEN_BUSY,
+            suggestion="Chờ phiên sinh văn bản hiện tại hoàn tất hoặc dừng phiên đó trước khi thử lại.",
+            severity=ErrorSeverity.WARNING,
+            is_recoverable=True,
+        )
+
+
+class GenerationNotReadyError(GenerationError):
+    """Raised when generation is requested without an active model/tokenizer pair."""
+
+    def __init__(self):
+        super().__init__(
+            message="Chưa có mô hình hoặc tokenizer sẵn sàng cho suy luận.",
+            error_code=ErrorCode.GEN_NOT_READY,
+            suggestion="Nạp một checkpoint hợp lệ trước khi sinh văn bản.",
+            is_recoverable=True,
+        )
+
+
+class EmptyPromptError(GenerationError):
+    """Raised when a generation request has no meaningful prompt text."""
+
+    def __init__(self):
+        super().__init__(
+            message="Câu mồi prompt không được để trống.",
+            error_code=ErrorCode.GEN_EMPTY_PROMPT,
+            suggestion="Nhập ít nhất một ký tự không phải khoảng trắng trước khi sinh văn bản.",
+            is_recoverable=True,
+        )
+
+
 class SamplingError(GenerationError):
     """Ngoại lệ khi thuật toán lấy mẫu xác suất gặp lỗi (Logits chứa NaN, tổng xác suất bằng 0...)."""
 
@@ -570,6 +610,9 @@ __all__ = [
     "CheckpointCorruptedError",
     "GenerationError",
     "GeneratorBackendNotFoundError",
+    "GenerationBusyError",
+    "GenerationNotReadyError",
+    "EmptyPromptError",
     "SamplingError",
     "DiagnosticError",
     "VRAMBudgetExceededError",

@@ -3,15 +3,15 @@ Inference API Routes: Quản lý sinh văn bản streaming và tải checkpoint.
 """
 
 import os
-from typing import List, Optional
+from typing import Annotated, List, Optional
 
 from fastapi import APIRouter, HTTPException, Request
-from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from src.core.config import GenerationConfig
-from src.core.exceptions import AIEngineError, GeneratorBackendNotFoundError
+from src.core.exceptions import AIEngineError
 from src.ui.path_policy import resolve_path_within_root
+from src.ui.responses import GenerationStreamingResponse
 
 router = APIRouter(prefix="/api", tags=["Inference"])
 
@@ -28,20 +28,26 @@ def _resolve_config_path(path: str) -> str:
 
 
 class GenerateRequest(BaseModel):
-    prompt: str = Field(default="Trăm năm trong cõi người ta,", description="Câu mồi bắt đầu")
+    prompt: str = Field(
+        default="Trăm năm trong cõi người ta,",
+        max_length=65_536,
+        description="Câu mồi bắt đầu",
+    )
     temperature: float = Field(default=0.75, ge=0.0, le=2.0)
-    top_k: int = Field(default=40, ge=1, le=200)
+    top_k: int = Field(default=40, ge=0, le=200)
     top_p: float = Field(default=0.9, ge=0.0, le=1.0)
     min_p: Optional[float] = Field(default=None, ge=0.0, le=1.0)
     repetition_penalty: float = Field(default=1.0, ge=1.0, le=2.0)
-    max_new_tokens: int = Field(default=200, ge=10, le=1000)
+    max_new_tokens: int = Field(default=200, ge=1, le=1000)
     greedy: bool = Field(default=False)
     use_cache: bool = Field(default=True)
     backend: Optional[str] = Field(
         default=None, description="Tên Generator backend trong GeneratorRegistry"
     )
-    stop_words: Optional[List[str]] = Field(
-        default=None, description="Danh sách từ khóa dừng sinh văn bản"
+    stop_words: Optional[List[Annotated[str, Field(max_length=256)]]] = Field(
+        default=None,
+        max_length=64,
+        description="Danh sách từ khóa dừng sinh văn bản",
     )
 
 
@@ -86,23 +92,7 @@ async def generate_stream_endpoint(req: GenerateRequest, request: Request):
     """Kênh phát sóng token theo thời gian thực (SSE) sử dụng TextIteratorStreamer."""
     inference_service = request.app.state.inference_service
 
-    if not req.prompt.strip():
-        raise HTTPException(status_code=400, detail="Câu mồi prompt không được để trống.")
-
     requested_backend = req.backend
-    if requested_backend is not None:
-        requested_backend = requested_backend.lower().strip()
-        available_backends = inference_service.list_generators()
-        if requested_backend not in available_backends:
-            raise GeneratorBackendNotFoundError(requested_backend, available_backends)
-
-    stop_sequences: Optional[List[List[int]]] = None
-    if req.stop_words and inference_service.tokenizer:
-        encoded_sequences = [
-            inference_service.tokenizer.encode(word) for word in req.stop_words if word
-        ]
-        stop_sequences = [sequence for sequence in encoded_sequences if sequence] or None
-
     gen_config = GenerationConfig(
         max_new_tokens=req.max_new_tokens,
         temperature=0.0 if req.greedy else req.temperature,
@@ -112,14 +102,16 @@ async def generate_stream_endpoint(req: GenerateRequest, request: Request):
         repetition_penalty=req.repetition_penalty,
         do_sample=not req.greedy,
         use_cache=req.use_cache,
-        stop_sequences=stop_sequences,
     )
 
-    generator_stream = inference_service.stream_generate(
-        req.prompt, gen_config, backend=requested_backend
+    session = inference_service.begin_generation(
+        req.prompt,
+        gen_config,
+        backend=requested_backend,
+        stop_words=req.stop_words,
     )
-    return StreamingResponse(
-        generator_stream,
+    return GenerationStreamingResponse(
+        session=session,
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",

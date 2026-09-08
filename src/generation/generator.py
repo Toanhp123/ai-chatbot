@@ -18,7 +18,8 @@ import torch
 import torch.nn as nn
 
 from src.core.config import GenerationConfig
-from src.generation.base import BaseGenerator, GenerationOutput
+from src.core.exceptions import EmptyPromptError
+from src.generation.base import BaseGenerator, GenerationCancellation, GenerationOutput
 from src.generation.registry import GeneratorRegistry
 from src.generation.samplers import (
     TopKTopPSampler,
@@ -74,6 +75,7 @@ class TextGenerator(BaseGenerator):
         sampler: Optional[Any] = None,
         streamer: Optional[BaseStreamer] = None,
         *,
+        cancellation: Optional[GenerationCancellation] = None,
         return_output: Literal[True],
         **kwargs: Any,
     ) -> GenerationOutput: ...
@@ -85,6 +87,7 @@ class TextGenerator(BaseGenerator):
         config: Optional[GenerationConfig] = None,
         sampler: Optional[Any] = None,
         streamer: Optional[BaseStreamer] = None,
+        cancellation: Optional[GenerationCancellation] = None,
         return_output: Literal[False] = False,
         **kwargs: Any,
     ) -> str: ...
@@ -96,6 +99,7 @@ class TextGenerator(BaseGenerator):
         config: Optional[GenerationConfig] = None,
         sampler: Optional[Any] = None,
         streamer: Optional[BaseStreamer] = None,
+        cancellation: Optional[GenerationCancellation] = None,
         return_output: bool = False,
         **kwargs: Any,
     ) -> Union[str, GenerationOutput]:
@@ -109,6 +113,9 @@ class TextGenerator(BaseGenerator):
         """
         if config is None:
             config = GenerationConfig()
+        config.validate()
+        if not prompt.strip():
+            raise EmptyPromptError()
 
         if sampler is None:
             sampler = TopKTopPSampler(
@@ -123,7 +130,15 @@ class TextGenerator(BaseGenerator):
         if not tokens:
             tokens = [0]
 
-        idx = torch.tensor([tokens], dtype=torch.long, device=self.device)
+        block_size: int = int(getattr(self.model, "block_size", 1024))
+        if block_size <= 0:
+            raise ValueError(f"model.block_size phải > 0, nhận được {block_size}")
+        prompt_tokens_input = len(tokens)
+        effective_tokens = tokens[-block_size:]
+        prompt_tokens_used = len(effective_tokens)
+        prompt_truncated = prompt_tokens_input > prompt_tokens_used
+        context_window = list(effective_tokens)
+        repetition_history = set(effective_tokens)
         if streamer:
             streamer.on_prompt(prompt)
 
@@ -147,8 +162,17 @@ class TextGenerator(BaseGenerator):
         decoder: Optional[_IncrementalDecoder] = (
             cast(_IncrementalDecoder, decoder_factory()) if callable(decoder_factory) else None
         )
-        block_size: int = int(getattr(self.model, "block_size", 1024))
-        use_cache = config.use_cache and callable(getattr(self.model, "reset_kv_cache", None))
+        use_cache = (
+            config.use_cache
+            and self._supports_use_cache
+            and callable(getattr(self.model, "reset_kv_cache", None))
+        )
+        cache_active = use_cache
+        eos_token_id = (
+            config.eos_token_id
+            if config.eos_token_id is not None
+            else getattr(self.tokenizer, "eos_token_id", None)
+        )
         finish_reason = "length"
         was_training = bool(getattr(self.model, "training", False))
         if isinstance(self.model, nn.Module):
@@ -170,36 +194,55 @@ class TextGenerator(BaseGenerator):
         start_time = time.time()
         try:
             for step in range(config.max_new_tokens):
-                if use_cache and idx.size(1) <= block_size:
-                    idx_cond = idx if step == 0 else idx[:, [-1]]
+                if cancellation is not None and cancellation.is_cancelled():
+                    finish_reason = "cancelled"
+                    break
+
+                if cache_active:
+                    input_tokens = context_window if step == 0 else [context_window[-1]]
+                    idx_cond = torch.tensor([input_tokens], dtype=torch.long, device=self.device)
                     model_out = self._call_model(idx_cond, use_cache=True)
                 else:
-                    idx_cond = idx if idx.size(1) <= block_size else idx[:, -block_size:]
+                    idx_cond = torch.tensor([context_window], dtype=torch.long, device=self.device)
                     model_out = self._call_model(idx_cond, use_cache=False)
+
+                if cancellation is not None and cancellation.is_cancelled():
+                    finish_reason = "cancelled"
+                    break
 
                 logits = cast(
                     torch.Tensor,
                     model_out[0] if isinstance(model_out, tuple) else model_out,
                 )
+                step_logits = logits[:, -1, :]
 
                 if config.repetition_penalty > 1.0:
-                    context_tokens = idx[0].tolist()
-                    logits = apply_repetition_penalty(
-                        logits, context_tokens, penalty=config.repetition_penalty
+                    step_logits = apply_repetition_penalty(
+                        step_logits,
+                        repetition_history,
+                        penalty=config.repetition_penalty,
                     )
 
-                next_token = sampler.sample(logits[:, -1, :])
+                next_token = sampler.sample(step_logits)
                 next_token_id = int(next_token.item())
 
-                if config.eos_token_id is not None and next_token_id == config.eos_token_id:
+                if cancellation is not None and cancellation.is_cancelled():
+                    finish_reason = "cancelled"
+                    break
+
+                if eos_token_id is not None and next_token_id == eos_token_id:
                     finish_reason = "eos_token"
                     break
 
-                next_token_tensor = torch.tensor(
-                    [[next_token_id]], dtype=torch.long, device=self.device
-                )
-                idx = torch.cat((idx, next_token_tensor), dim=1)
                 generated_token_ids.append(next_token_id)
+                repetition_history.add(next_token_id)
+                context_window.append(next_token_id)
+                if len(context_window) > block_size:
+                    context_window = context_window[-block_size:]
+                    if cache_active:
+                        cache_active = False
+                        if callable(reset_fn):
+                            reset_fn()
 
                 matched_stop: Optional[List[int]] = None
                 for sequence in stop_sequences:
@@ -235,9 +278,8 @@ class TextGenerator(BaseGenerator):
                 cleanup_fn()
             if isinstance(self.model, nn.Module) and was_training:
                 self.model.train()
-
-        if streamer:
-            streamer.on_finish()
+            if streamer:
+                streamer.on_finish()
 
         elapsed_time = time.time() - start_time
         tokens_count = len(generated_token_ids)
@@ -255,6 +297,9 @@ class TextGenerator(BaseGenerator):
                 tokens_per_second=tps,
                 elapsed_time_sec=elapsed_time,
                 finish_reason=finish_reason,
+                prompt_tokens_input=prompt_tokens_input,
+                prompt_tokens_used=prompt_tokens_used,
+                prompt_truncated=prompt_truncated,
             )
 
         return full_text

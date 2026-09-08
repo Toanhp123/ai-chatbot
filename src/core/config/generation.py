@@ -2,6 +2,7 @@
 Cấu hình suy luận và sinh văn bản (Generation Configuration).
 """
 
+import math
 from dataclasses import dataclass
 from typing import List, Optional
 
@@ -24,13 +25,26 @@ class GenerationConfig(BaseConfig):
     use_cache: bool = True
 
     def validate(self) -> None:
+        finite_fields = {
+            "temperature": self.temperature,
+            "top_p": self.top_p,
+            "min_p": self.min_p,
+            "repetition_penalty": self.repetition_penalty,
+        }
+        for field_name, value in finite_fields.items():
+            if value is not None and not math.isfinite(value):
+                raise ConfigurationError(
+                    f"{field_name} phải là số hữu hạn, nhận được {value}",
+                    {field_name: value},
+                )
+
         if self.max_new_tokens <= 0:
             raise ConfigurationError(f"max_new_tokens phải > 0, nhận được {self.max_new_tokens}")
         if self.temperature < 0.0:
             raise ConfigurationError(f"temperature phải >= 0.0, nhận được {self.temperature}")
-        if self.top_p is not None and (self.top_p <= 0.0 or self.top_p > 1.0):
+        if self.top_p is not None and (self.top_p < 0.0 or self.top_p > 1.0):
             raise ConfigurationError(
-                f"top_p phải nằm trong khoảng (0.0, 1.0], nhận được {self.top_p}",
+                f"top_p phải nằm trong khoảng [0.0, 1.0], nhận được {self.top_p}",
                 {"top_p": self.top_p},
             )
         if self.min_p is not None and (self.min_p < 0.0 or self.min_p > 1.0):

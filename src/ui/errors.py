@@ -30,6 +30,8 @@ _BAD_REQUEST_CODES = {
     ErrorCode.PROTO_SIGNATURE_MISMATCH,
     ErrorCode.DIAG_VRAM_OVERFLOW,
 }
+_TOO_MANY_REQUESTS_CODES = {ErrorCode.GEN_BUSY}
+_SERVICE_UNAVAILABLE_CODES = {ErrorCode.GEN_NOT_READY}
 _HARDWARE_CODES = {
     ErrorCode.HARDWARE_CUDA_UNAVAILABLE,
     ErrorCode.HARDWARE_OOM,
@@ -44,6 +46,10 @@ def status_code_for_ai_error(error: AIEngineError) -> int:
         return 404
     if error.error_code in _BAD_REQUEST_CODES:
         return 400
+    if error.error_code in _TOO_MANY_REQUESTS_CODES:
+        return 429
+    if error.error_code in _SERVICE_UNAVAILABLE_CODES:
+        return 503
     if error.error_code in _HARDWARE_CODES:
         return 503
     return 500

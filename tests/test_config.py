@@ -312,3 +312,19 @@ def test_training_warmup_may_exceed_short_run_for_quick_checks() -> None:
     config.validate()
 
     assert config.warmup_iters == 100
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("temperature", float("nan")),
+        ("temperature", float("inf")),
+        ("top_p", float("nan")),
+        ("min_p", float("inf")),
+        ("repetition_penalty", float("nan")),
+    ],
+)
+def test_generation_config_rejects_non_finite_sampling_values(field, value):
+    config = GenerationConfig(**{field: value})
+    with pytest.raises(ConfigurationError):
+        config.validate()

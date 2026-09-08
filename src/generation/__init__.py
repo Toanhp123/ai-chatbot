@@ -4,7 +4,7 @@ Hỗ trợ Kiến trúc Cắm rút Đa Backend (GeneratorRegistry), KV-Cache, St
 Samplers nâng cao (Greedy, Top-K, Top-P, Min-P) và Chống lặp từ.
 """
 
-from src.generation.base import BaseGenerator, GenerationOutput
+from src.generation.base import BaseGenerator, GenerationCancellation, GenerationOutput
 from src.generation.generator import LocalTextGenerator, TextGenerator
 from src.generation.registry import GeneratorRegistry, get_generator
 from src.generation.samplers import (
@@ -25,6 +25,7 @@ __all__ = [
     "LocalTextGenerator",
     "TextGenerator",
     "GenerationOutput",
+    "GenerationCancellation",
     "TopKTopPSampler",
     "sample_next_token",
     "apply_repetition_penalty",

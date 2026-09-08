@@ -51,8 +51,8 @@ export function usePlayground({
 				if (!isMounted) return;
 				const list = data.checkpoints || [];
 				setCheckpoints(list);
-				if (list.length > 0 && !selectedCheckpoint) {
-					setSelectedCheckpoint(list[0].path);
+				if (list.length > 0) {
+					setSelectedCheckpoint((current) => current || list[0].path);
 				}
 			})
 			.catch(() => {});
@@ -70,14 +70,16 @@ export function usePlayground({
 		return () => {
 			isMounted = false;
 		};
-	}, [selectedCheckpoint]);
+	}, []);
 
 	const handleSelectGenerator = async (gen: string) => {
-		setSelectedGenerator(gen);
+		if (isGenerating || gen === selectedGenerator) return;
 		try {
 			await checkpointApi.selectGenerator(gen);
-		} catch {
-			// ignore
+			setSelectedGenerator(gen);
+		} catch (err: unknown) {
+			const error = err as Error;
+			alert(`Không thể đổi generator: ${error.message}`);
 		}
 	};
 
@@ -127,7 +129,7 @@ export function usePlayground({
 					min_p: params.minP > 0 ? params.minP : null,
 					repetition_penalty: params.repetitionPenalty,
 					max_new_tokens: params.maxNewTokens,
-					greedy: params.temperature <= 0.05,
+					greedy: params.temperature <= 0,
 					use_cache: params.useCache,
 					backend: selectedGenerator,
 					stop_words: stops.length > 0 ? stops : undefined,

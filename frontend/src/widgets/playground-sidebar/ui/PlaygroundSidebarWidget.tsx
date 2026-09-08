@@ -110,11 +110,12 @@ export const PlaygroundSidebarWidget: React.FC<
 									key={gen}
 									type="button"
 									onClick={() => onSelectGenerator(gen)}
+									disabled={isGenerating}
 									className={`px-2 py-1.5 rounded-lg text-xs font-medium font-mono capitalize transition-all ${
 										selectedGenerator === gen
 											? "bg-amber-600 text-white shadow-warm-sm"
 											: "bg-[#f4f3ed] border border-stone-300/80 text-stone-700 hover:text-stone-900 hover:bg-[#ebe8df]"
-									}`}
+									} ${isGenerating ? "opacity-50 cursor-not-allowed" : ""}`}
 								>
 									{gen}
 								</button>
@@ -137,7 +138,7 @@ export const PlaygroundSidebarWidget: React.FC<
 					{/* Temperature Slider */}
 					<Slider
 						label="Temperature (Độ phong phú)"
-						min={0.1}
+						min={0.0}
 						max={2.0}
 						step={0.05}
 						value={params.temperature}
@@ -152,7 +153,7 @@ export const PlaygroundSidebarWidget: React.FC<
 					{/* Top-P Slider */}
 					<Slider
 						label="Top-P (Nucleus Sampling)"
-						min={0.1}
+						min={0.0}
 						max={1.0}
 						step={0.05}
 						value={params.topP}

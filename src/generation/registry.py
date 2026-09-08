@@ -4,9 +4,14 @@ Hỗ trợ đa bí danh, tự động khám phá và cắm rút linh hoạt gi�
 """
 
 import importlib
+import inspect
 from typing import Any, Callable, Dict, List, Type, TypeVar
 
-from src.core.exceptions import AIEngineError, GeneratorBackendNotFoundError
+from src.core.exceptions import (
+    AIEngineError,
+    GeneratorBackendNotFoundError,
+    SignatureMismatchError,
+)
 from src.generation.base import BaseGenerator
 
 T = TypeVar("T", bound=BaseGenerator)
@@ -20,16 +25,23 @@ class GeneratorRegistry:
     @classmethod
     def _ensure_builtins(cls) -> None:
         """Tự động nạp generator mặc định (TextGenerator)."""
-        try:
-            importlib.import_module("src.generation.generator")
-        except Exception:
-            pass
+        importlib.import_module("src.generation.generator")
 
     @classmethod
     def register(cls, *names: str) -> Callable[[Type[T]], Type[T]]:
         """Decorator đăng ký Generator mới vào hệ thống với một hoặc nhiều tên gọi."""
 
         def decorator(subclass: Type[T]) -> Type[T]:
+            signature = inspect.signature(subclass.generate)
+            accepts_cancellation = "cancellation" in signature.parameters or any(
+                parameter.kind == inspect.Parameter.VAR_KEYWORD
+                for parameter in signature.parameters.values()
+            )
+            if not accepts_cancellation:
+                raise SignatureMismatchError(
+                    method_name=f"{subclass.__name__}.generate",
+                    reason="generator backend phải nhận tham số cancellation hoặc **kwargs",
+                )
             for name in names:
                 name_clean = name.lower().strip()
                 if name_clean in cls._registry:
@@ -58,6 +70,23 @@ class GeneratorRegistry:
         """Khởi tạo một Generator instance theo tên định danh và các tham số khởi tạo."""
         generator_cls = cls.get(name)
         return generator_cls(*args, **kwargs)
+
+    @classmethod
+    def create_for_inference(
+        cls,
+        name: str,
+        *,
+        model: Any,
+        tokenizer: Any,
+        device: str,
+    ) -> BaseGenerator:
+        """Create a backend through its inference-context factory hook."""
+        generator_cls = cls.get(name)
+        return generator_cls.from_inference_context(
+            model=model,
+            tokenizer=tokenizer,
+            device=device,
+        )
 
     @classmethod
     def list_generators(cls) -> List[str]:

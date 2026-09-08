@@ -5,6 +5,7 @@ Hỗ trợ cả Console Output (CLI) và Iterator Output (cho Web API / FastAPI 
 
 import queue
 import sys
+import threading
 import time
 from abc import ABC, abstractmethod
 from typing import Iterator, Optional
@@ -59,25 +60,44 @@ class TextIteratorStreamer(BaseStreamer):
         self.text_queue: queue.Queue[Optional[str]] = queue.Queue()
         self.stop_signal = None
         self.timeout = timeout
+        self._finished = threading.Event()
+        self._finish_lock = threading.Lock()
 
     def on_prompt(self, text: str) -> None:
         # Tùy chọn bỏ qua hoặc đẩy prompt vào queue nếu cần
         pass
 
     def on_token(self, token_str: str) -> None:
+        if self._finished.is_set():
+            return
         self.text_queue.put(token_str)
 
     def on_finish(self) -> None:
-        self.text_queue.put(self.stop_signal)
+        with self._finish_lock:
+            if self._finished.is_set():
+                return
+            self._finished.set()
+            self.text_queue.put(self.stop_signal)
+
+    def cancel(self) -> None:
+        """Wake a waiting iterator and ignore any later tokens."""
+        self.on_finish()
 
     def __iter__(self) -> Iterator[str]:
         return self
 
     def __next__(self) -> str:
-        value = self.text_queue.get(timeout=self.timeout)
-        if value is None:
-            raise StopIteration
-        return value
+        while True:
+            try:
+                value = self.text_queue.get(timeout=self.timeout)
+            except queue.Empty:
+                # timeout is a polling interval, not a terminal stream failure.
+                if self._finished.is_set():
+                    raise StopIteration
+                continue
+            if value is None:
+                raise StopIteration
+            return value
 
 
 __all__ = ["BaseStreamer", "ConsoleStreamer", "TextIteratorStreamer"]

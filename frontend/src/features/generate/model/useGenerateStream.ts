@@ -1,4 +1,5 @@
-import { useState, useRef, useCallback } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { parseSseDataLine, resolveDoneGeneratedText } from "./protocol";
 import type { GenerationParams, GenerationStats } from "./types";
 
 export function useGenerateStream() {
@@ -10,37 +11,33 @@ export function useGenerateStream() {
 		useRef<ReadableStreamDefaultReader<Uint8Array> | null>(null);
 	const generationIdRef = useRef(0);
 
-	const stop = useCallback(() => {
+	const cancelTransport = useCallback((updateState: boolean) => {
 		generationIdRef.current++;
-		if (activeReaderRef.current) {
-			activeReaderRef.current.cancel().catch(() => {});
-			activeReaderRef.current = null;
-		}
-		if (abortControllerRef.current) {
-			abortControllerRef.current.abort();
-			abortControllerRef.current = null;
-		}
-		setIsGenerating(false);
+		const reader = activeReaderRef.current;
+		activeReaderRef.current = null;
+		if (reader) reader.cancel().catch(() => {});
+		const controller = abortControllerRef.current;
+		abortControllerRef.current = null;
+		if (controller) controller.abort();
+		if (updateState) setIsGenerating(false);
 	}, []);
 
+	const stop = useCallback(() => {
+		cancelTransport(true);
+	}, [cancelTransport]);
+
 	const clear = useCallback(() => {
-		generationIdRef.current++;
-		if (activeReaderRef.current) {
-			activeReaderRef.current.cancel().catch(() => {});
-			activeReaderRef.current = null;
-		}
-		if (abortControllerRef.current) {
-			abortControllerRef.current.abort();
-			abortControllerRef.current = null;
-		}
-		setIsGenerating(false);
+		cancelTransport(true);
 		setGeneratedText("");
 		setStats(null);
-	}, []);
+	}, [cancelTransport]);
+
+	useEffect(() => {
+		return () => cancelTransport(false);
+	}, [cancelTransport]);
 
 	const generate = useCallback(
 		async (params: GenerationParams, onError?: (err: string) => void) => {
-			// Hủy bỏ luồng đang chạy trước đó nếu có
 			stop();
 
 			const currentGenId = ++generationIdRef.current;
@@ -52,9 +49,9 @@ export function useGenerateStream() {
 			abortControllerRef.current = abortController;
 			const startTime = performance.now();
 			let tokensReceived = 0;
+			let backendError = false;
 
 			try {
-				// Endpoint backend: /api/generate/stream
 				const response = await fetch("/api/generate/stream", {
 					method: "POST",
 					headers: { "Content-Type": "application/json" },
@@ -70,7 +67,7 @@ export function useGenerateStream() {
 						const errJson = await response.json();
 						errMsg = errJson.detail || errJson.message || errMsg;
 					} catch {
-						// ignore
+						// Response is not JSON; keep the status-based message.
 					}
 					throw new Error(errMsg);
 				}
@@ -99,81 +96,61 @@ export function useGenerateStream() {
 
 					for (const line of lines) {
 						if (currentGenId !== generationIdRef.current) break;
-						if (line.startsWith("data: ")) {
-							const dataStr = line.slice(6).trim();
-							if (!dataStr) continue;
+						let parsed;
+						try {
+							parsed = parseSseDataLine(line);
+						} catch {
+							continue;
+						}
+						if (!parsed) continue;
 
-							try {
-								const parsed = JSON.parse(dataStr);
+						if (parsed.error || parsed.type === "error") {
+							const errMsg =
+								typeof parsed.error === "string"
+									? parsed.error
+									: typeof parsed.message === "string"
+										? parsed.message
+										: "Lỗi khi sinh văn bản";
+							backendError = true;
+							onError?.(errMsg);
+							continue;
+						}
 
-								// 1. Kiểm tra lỗi trả về từ backend
-								if (parsed.error || parsed.type === "error") {
-									const errMsg =
-										parsed.error ||
-										parsed.message ||
-										"Lỗi khi sinh văn bản";
-									if (
-										currentGenId === generationIdRef.current
-									) {
-										onError?.(errMsg);
-									}
-									continue;
-								}
+						const token = parsed.token ?? parsed.text;
+						if (typeof token === "string") {
+							setGeneratedText((prev) => prev + token);
+							tokensReceived += 1;
+						}
 
-								// 2. Thu nhận token
-								const token = parsed.token ?? parsed.text;
-								if (
-									typeof token === "string" &&
-									currentGenId === generationIdRef.current
-								) {
-									setGeneratedText((prev) => prev + token);
-									tokensReceived += 1;
-								}
-
-								// 3. Xử lý sự kiện hoàn tất
-								if (
-									parsed.type === "done" &&
-									currentGenId === generationIdRef.current
-								) {
-									if (
-										parsed.full_text &&
-										tokensReceived === 0
-									) {
-										setGeneratedText(parsed.full_text);
-									}
-									setStats({
-										tps:
-											typeof parsed.tps === "number"
-												? parsed.tps
-												: 0,
-										elapsed_sec:
-											typeof parsed.elapsed_sec ===
-											"number"
-												? parsed.elapsed_sec
-												: 0,
-										token_count:
-											typeof parsed.token_count ===
-											"number"
-												? parsed.token_count
-												: tokensReceived,
-									});
-								} else if (
-									parsed.stats &&
-									currentGenId === generationIdRef.current
-								) {
-									setStats(parsed.stats);
-								}
-							} catch {
-								if (currentGenId === generationIdRef.current) {
-									setGeneratedText((prev) => prev + dataStr);
-									tokensReceived += 1;
-								}
+						if (parsed.type === "done") {
+							if (tokensReceived === 0) {
+								const fallback = resolveDoneGeneratedText(
+									parsed,
+									params.prompt,
+								);
+								if (fallback !== undefined) setGeneratedText(fallback);
 							}
+							setStats({
+								tps: typeof parsed.tps === "number" ? parsed.tps : 0,
+								elapsed_sec:
+									typeof parsed.elapsed_sec === "number"
+										? parsed.elapsed_sec
+										: 0,
+								token_count:
+									typeof parsed.token_count === "number"
+										? parsed.token_count
+										: tokensReceived,
+							});
+						} else if (
+							typeof parsed.stats === "object" &&
+							parsed.stats !== null
+						) {
+							setStats(parsed.stats as GenerationStats);
 						}
 					}
 				}
 
-				if (currentGenId === generationIdRef.current) {
+				if (currentGenId === generationIdRef.current && !backendError) {
 					const elapsedSec = Math.max(
 						(performance.now() - startTime) / 1000,
 						0.01,
@@ -200,6 +177,7 @@ export function useGenerateStream() {
 				if (currentGenId === generationIdRef.current) {
 					setIsGenerating(false);
 					activeReaderRef.current = null;
+					abortControllerRef.current = null;
 				}
 			}
 		},

@@ -5,15 +5,17 @@ Các chiến lược lấy mẫu xác suất (Sampling Strategies):
 - apply_repetition_penalty: Thuật toán phạt lặp từ theo chuẩn Keskar et al. (CTRL / Hugging Face).
 """
 
-from typing import List, Optional
+from typing import Collection, Optional
 
 import torch
 import torch.nn.functional as F
 
+from src.core.exceptions import SamplingError
+
 
 def apply_repetition_penalty(
     logits: torch.Tensor,
-    generated_tokens: List[int],
+    generated_tokens: Collection[int],
     penalty: float = 1.0,
 ) -> torch.Tensor:
     """
@@ -25,12 +27,18 @@ def apply_repetition_penalty(
     if penalty == 1.0 or not generated_tokens:
         return logits
 
-    unique_tokens = list(set(generated_tokens))
-    for token_id in unique_tokens:
-        if token_id >= logits.size(-1):
-            continue
-        score = logits[..., token_id]
-        logits[..., token_id] = torch.where(score > 0, score / penalty, score * penalty)
+    unique_tokens = sorted(
+        token_id
+        for token_id in set(generated_tokens)
+        if isinstance(token_id, int) and 0 <= token_id < logits.size(-1)
+    )
+    if not unique_tokens:
+        return logits
+
+    token_index = torch.tensor(unique_tokens, dtype=torch.long, device=logits.device)
+    scores = logits.index_select(-1, token_index)
+    penalized = torch.where(scores > 0, scores / penalty, scores * penalty)
+    logits.index_copy_(-1, token_index, penalized)
 
     return logits
 
@@ -119,7 +127,10 @@ def sample_next_token(
 
     # 6. Lấy mẫu ngẫu nhiên theo phân phối xác suất
     probs = F.softmax(logits, dim=-1)
-    next_token = torch.multinomial(probs, num_samples=1)
+    try:
+        next_token = torch.multinomial(probs, num_samples=1)
+    except RuntimeError as exc:
+        raise SamplingError(cause=exc) from exc
     return next_token.squeeze(-1)
 
 

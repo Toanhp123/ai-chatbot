@@ -609,31 +609,30 @@ def test_ui_checkpoint_load_invalid_backend_is_400(client: TestClient):
 
 
 def test_ui_stop_words_preserve_multi_token_sequences(client: TestClient, monkeypatch):
-    from src.data.tokenizers import CharTokenizer
-
     service = _app_state(client).inference_service
-    old_tokenizer = service.tokenizer
-    tokenizer = CharTokenizer(vocab=list("abc"))
-    service.tokenizer = tokenizer
     captured = {}
 
-    def fake_stream(prompt, config, backend=None):
-        captured["config"] = config
-        yield 'data: {"done": true}\n\n'
+    class FakeSession:
+        def iter_sse(self):
+            yield 'data: {"type":"done","generated_text":"","full_text":"c","token_count":0,"elapsed_sec":0.0,"tps":0.0}\n\n'
 
-    monkeypatch.setattr(service, "stream_generate", fake_stream)
-    try:
-        response = client.post(
-            "/api/generate/stream",
-            json={"prompt": "c", "max_new_tokens": 10, "stop_words": ["ab"]},
-        )
-    finally:
-        service.tokenizer = old_tokenizer
+        def close(self):
+            pass
+
+    def fake_begin(prompt, config, backend=None, stop_words=None):
+        captured["config"] = config
+        captured["stop_words"] = stop_words
+        return FakeSession()
+
+    monkeypatch.setattr(service, "begin_generation", fake_begin)
+    response = client.post(
+        "/api/generate/stream",
+        json={"prompt": "c", "max_new_tokens": 10, "stop_words": ["ab"]},
+    )
 
     assert response.status_code == 200
-    config = captured["config"]
-    assert config.stop_sequences == [tokenizer.encode("ab")]
-    assert config.stop_tokens is None
+    assert captured["stop_words"] == ["ab"]
+    assert captured["config"].stop_sequences is None
 
 
 def test_ui_checkpoint_download_uses_inference_service_directory(client: TestClient, tmp_path):
@@ -950,3 +949,86 @@ def test_ui_training_resume_rejects_checkpoint_outside_configured_dir(
     assert response.status_code == 400
     assert "checkpoint_dir" in response.json()["detail"]
     assert start_calls == []
+
+
+def test_ui_generate_accepts_zero_top_k_as_disabled_filter(client: TestClient, monkeypatch):
+    service = _app_state(client).inference_service
+
+    class FakeSession:
+        def iter_sse(self):
+            yield 'data: {"type":"done","generated_text":"","full_text":"x","token_count":0,"elapsed_sec":0.0,"tps":0.0}\n\n'
+
+        def close(self):
+            pass
+
+    captured = {}
+
+    def fake_begin(prompt, config, backend=None, stop_words=None):
+        captured["config"] = config
+        return FakeSession()
+
+    monkeypatch.setattr(service, "begin_generation", fake_begin, raising=False)
+    response = client.post(
+        "/api/generate/stream",
+        json={"prompt": "x", "top_k": 0, "top_p": 0.0, "max_new_tokens": 1},
+    )
+
+    assert response.status_code == 200
+    assert captured["config"].top_k == 0
+    assert captured["config"].top_p == 0.0
+
+
+def test_ui_generation_busy_is_rejected_before_sse_response(client: TestClient, monkeypatch):
+    from src.core.exceptions import GenerationBusyError
+
+    service = _app_state(client).inference_service
+
+    def busy(*args, **kwargs):
+        raise GenerationBusyError(active=2, limit=2)
+
+    monkeypatch.setattr(service, "begin_generation", busy, raising=False)
+    response = client.post(
+        "/api/generate/stream",
+        json={"prompt": "x", "max_new_tokens": 1},
+    )
+
+    assert response.status_code == 429
+    assert response.json()["error_code"] == "ERR_GEN_BUSY"
+
+
+def test_ui_generate_rejects_too_many_stop_words_before_service(client: TestClient, monkeypatch):
+    service = _app_state(client).inference_service
+    calls = []
+    monkeypatch.setattr(
+        service,
+        "begin_generation",
+        lambda *args, **kwargs: calls.append((args, kwargs)),
+        raising=False,
+    )
+
+    response = client.post(
+        "/api/generate/stream",
+        json={"prompt": "x", "stop_words": ["stop"] * 65, "max_new_tokens": 1},
+    )
+
+    assert response.status_code == 422
+    assert calls == []
+
+
+def test_ui_generate_rejects_oversized_stop_word_before_service(client: TestClient, monkeypatch):
+    service = _app_state(client).inference_service
+    calls = []
+    monkeypatch.setattr(
+        service,
+        "begin_generation",
+        lambda *args, **kwargs: calls.append((args, kwargs)),
+        raising=False,
+    )
+
+    response = client.post(
+        "/api/generate/stream",
+        json={"prompt": "x", "stop_words": ["s" * 257], "max_new_tokens": 1},
+    )
+
+    assert response.status_code == 422
+    assert calls == []
