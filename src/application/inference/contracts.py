@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+import threading
 from dataclasses import dataclass
-from typing import Optional, Sequence
+from typing import Callable, Optional, Sequence
 
 
 @dataclass(frozen=True)
@@ -40,3 +41,29 @@ class GenerationCommand:
             backend=backend,
             stop_words=tuple(stop_words) if stop_words is not None else None,
         )
+
+
+class InferenceTrainingHandoff:
+    """Reversible runtime handoff used while a training start is still uncommitted."""
+
+    def __init__(
+        self,
+        *,
+        training_admission_reserved: bool = False,
+        rollback: Optional[Callable[[], None]] = None,
+    ) -> None:
+        self.training_admission_reserved = training_admission_reserved
+        self._rollback = rollback
+        self._lock = threading.Lock()
+        self._rolled_back = False
+
+    def rollback(self) -> None:
+        with self._lock:
+            if self._rolled_back:
+                return
+            self._rolled_back = True
+        if self._rollback is not None:
+            self._rollback()
+
+
+__all__ = ["GenerationCommand", "GenerationOverrides", "InferenceTrainingHandoff"]

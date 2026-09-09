@@ -4,8 +4,6 @@ HTTP/SSE adapters call this service; concrete training assembly is delegated to
 TrainingApplicationService so Web and CLI share one canonical run graph.
 """
 
-import json
-import queue
 import threading
 import time
 from typing import Any, Dict, Generator, List, Optional
@@ -14,14 +12,13 @@ import torch
 
 from src.application.runtime.accelerator import AcceleratorCoordinator
 from src.application.training.contracts import (
-    TrainingCommand,
     TrainingPlan,
     TrainingPreparationAborted,
 )
+from src.application.training.events import TrainingEventHub
 from src.application.training.service import TrainingApplicationService
 from src.core.config import EngineConfig
 from src.core.logging import get_logger
-from src.core.runtime import ResolvedTrainingPlan
 from src.training.trainer import Trainer, TrainingTerminationReason
 
 logger = get_logger("TrainingService")
@@ -71,36 +68,15 @@ class TrainingService:
         self._accelerator_coordinator = accelerator_coordinator
         self._training_application = training_application or TrainingApplicationService()
 
-        # Hệ thống Pub/Sub phát sóng đa thuê bao
-        self._subscribers: List["queue.Queue[Dict[str, Any]]"] = []
-        self._sub_lock = threading.Lock()
+        self._events = TrainingEventHub(queue_size=500)
 
         self.history_steps: List[Dict[str, Any]] = []
         self.history_evals: List[Dict[str, Any]] = []
         self.sample_history: List[Dict[str, Any]] = []
 
-    def register_subscriber(self) -> "queue.Queue[Dict[str, Any]]":
-        """Đăng ký một subscriber mới cho kết nối SSE độc lập."""
-        q: "queue.Queue[Dict[str, Any]]" = queue.Queue(maxsize=500)
-        with self._sub_lock:
-            self._subscribers.append(q)
-        return q
-
-    def unregister_subscriber(self, q: "queue.Queue[Dict[str, Any]]") -> None:
-        """Hủy đăng ký subscriber khi client ngắt kết nối."""
-        with self._sub_lock:
-            if q in self._subscribers:
-                self._subscribers.remove(q)
-
     def broadcast(self, evt: Dict[str, Any]) -> None:
-        """Phát sóng sự kiện tới 100% tất cả các client đang kết nối."""
-        with self._sub_lock:
-            for q in list(self._subscribers):
-                try:
-                    q.put_nowait(evt)
-                except queue.Full:
-                    # Bỏ qua nếu buffer client bị đầy để tránh nghẽn
-                    pass
+        """Publish one transport-neutral event to all current subscribers."""
+        self._events.publish(evt)
 
     def _snapshot_locked(self) -> Dict[str, Any]:
         """Return one coherent UI snapshot. Caller must hold ``_lock``."""
@@ -252,16 +228,11 @@ class TrainingService:
 
     def start_training(
         self,
-        config_path: Optional[str] = None,
-        overrides: Optional[List[str]] = None,
-        quick_check: bool = False,
-        resume_checkpoint: Optional[str] = None,
-        resume_checkpoint_identity: Optional[tuple[int, int, int, int]] = None,
-        runtime_plan: Optional[ResolvedTrainingPlan] = None,
-        config_snapshot: Optional[EngineConfig] = None,
-        plan: Optional[TrainingPlan] = None,
+        *,
+        plan: TrainingPlan,
+        admission_reserved: bool = False,
     ) -> None:
-        """Start one exclusive background run using the canonical application flow."""
+        """Start one exclusive background run from an already-resolved application plan."""
         old_thread: Optional[threading.Thread] = None
         with self._lock:
             if self.status in ("RUNNING", "STARTING"):
@@ -281,90 +252,60 @@ class TrainingService:
                     "Vui lòng đợi 1-2 giây rồi thử lại."
                 )
 
-        # Compatibility: callers that already resolved a runtime plan can perform
-        # accelerator admission without requiring a config provider.  This keeps
-        # Web lifecycle ownership (busy/idle) ahead of application preparation.
-        reserved_accelerator = False
-        early_admission_device = (
-            runtime_plan.device if plan is None and runtime_plan is not None else None
+        frozen_plan = TrainingPlan(
+            requested_config=EngineConfig.from_dict(plan.requested_config.to_dict()),
+            config=EngineConfig.from_dict(plan.config.to_dict()),
+            runtime_plan=plan.runtime_plan,
+            feasibility=plan.feasibility,
+            resume_checkpoint=plan.resume_checkpoint,
+            resume_checkpoint_identity=plan.resume_checkpoint_identity,
         )
-        if early_admission_device is not None and self._accelerator_coordinator is not None:
-            self._accelerator_coordinator.reserve_training(early_admission_device)
-            reserved_accelerator = True
-
+        admission_device = frozen_plan.runtime_plan.device
+        reserved_accelerator = admission_reserved
+        externally_reserved_admission = admission_reserved
         try:
-            if plan is None:
-                if self._training_application is None:
+            with self._lock:
+                if self.status in ("RUNNING", "STARTING", "STOPPING"):
                     raise RuntimeError(
-                        "TrainingService cần TrainingApplicationService khi chưa truyền TrainingPlan."
+                        f"Không thể khởi chạy: Tiến trình đang ở trạng thái '{self.status}'. "
+                        "Vui lòng đợi tiến trình hoàn tất hoặc dừng hẳn trước khi bắt đầu lại."
                     )
-                command = TrainingCommand(
-                    config_path=config_path,
-                    overrides=tuple(overrides or ()),
-                    quick_check=quick_check,
-                    resume_checkpoint=resume_checkpoint,
-                    resume_checkpoint_identity=resume_checkpoint_identity,
-                )
-                plan = self._training_application.plan(
-                    command,
-                    config_snapshot=config_snapshot,
-                    runtime_plan=runtime_plan,
-                )
-            elif self._training_application is None:
-                raise RuntimeError("TrainingService chưa được cấu hình TrainingApplicationService.")
+                if self._thread and self._thread.is_alive():
+                    raise RuntimeError(
+                        "Tiến trình huấn luyện trước đó vẫn đang trong quá trình giải phóng tài nguyên. "
+                        "Vui lòng đợi 1-2 giây."
+                    )
+                if self._accelerator_coordinator is not None and not reserved_accelerator:
+                    self._accelerator_coordinator.reserve_training(admission_device)
+                    reserved_accelerator = True
 
-            frozen_plan = TrainingPlan(
-                requested_config=EngineConfig.from_dict(plan.requested_config.to_dict()),
-                config=EngineConfig.from_dict(plan.config.to_dict()),
-                runtime_plan=plan.runtime_plan,
-                feasibility=plan.feasibility,
-                resume_checkpoint=plan.resume_checkpoint,
-                resume_checkpoint_identity=plan.resume_checkpoint_identity,
-            )
+                self._abort_requested.clear()
+                self.run_id += 1
+                self.sequence = 0
+                self.status = "STARTING"
+                self.termination_reason = None
+                self.error_message = None
+                self.current_step = 0
+                self.max_iters = frozen_plan.config.training.max_iters
+                self.current_loss = None
+                self.current_val_loss = None
+                self.current_lr = None
+                self.last_sample_text = ""
+                self.trainer = None
+                self.history_steps.clear()
+                self.history_evals.clear()
+                self.sample_history.clear()
+                starting_event = self._status_event_locked(
+                    "Đang chuẩn bị dữ liệu và khởi tạo kiến trúc mạng..."
+                )
         except Exception:
             if (
                 reserved_accelerator
-                and early_admission_device is not None
+                and not externally_reserved_admission
                 and self._accelerator_coordinator is not None
             ):
-                self._accelerator_coordinator.release_training(early_admission_device)
+                self._accelerator_coordinator.release_training(admission_device)
             raise
-
-        admission_device = frozen_plan.runtime_plan.device
-        with self._lock:
-            if self.status in ("RUNNING", "STARTING", "STOPPING"):
-                raise RuntimeError(
-                    f"Không thể khởi chạy: Tiến trình đang ở trạng thái '{self.status}'. "
-                    "Vui lòng đợi tiến trình hoàn tất hoặc dừng hẳn trước khi bắt đầu lại."
-                )
-            if self._thread and self._thread.is_alive():
-                raise RuntimeError(
-                    "Tiến trình huấn luyện trước đó vẫn đang trong quá trình giải phóng tài nguyên. "
-                    "Vui lòng đợi 1-2 giây."
-                )
-            if self._accelerator_coordinator is not None and not reserved_accelerator:
-                self._accelerator_coordinator.reserve_training(admission_device)
-                reserved_accelerator = True
-
-            self._abort_requested.clear()
-            self.run_id += 1
-            self.sequence = 0
-            self.status = "STARTING"
-            self.termination_reason = None
-            self.error_message = None
-            self.current_step = 0
-            self.max_iters = frozen_plan.config.training.max_iters
-            self.current_loss = None
-            self.current_val_loss = None
-            self.current_lr = None
-            self.last_sample_text = ""
-            self.trainer = None
-            self.history_steps.clear()
-            self.history_evals.clear()
-            self.sample_history.clear()
-            starting_event = self._status_event_locked(
-                "Đang chuẩn bị dữ liệu và khởi tạo kiến trúc mạng..."
-            )
 
         self.broadcast(starting_event)
 
@@ -462,7 +403,11 @@ class TrainingService:
                 rollback_event = self._status_event_locked(
                     "Không thể khởi chạy luồng huấn luyện; trạng thái đã được hoàn nguyên."
                 )
-            if reserved_accelerator and self._accelerator_coordinator is not None:
+            if (
+                reserved_accelerator
+                and not externally_reserved_admission
+                and self._accelerator_coordinator is not None
+            ):
                 self._accelerator_coordinator.release_training(admission_device)
             self.broadcast(rollback_event)
             raise
@@ -497,19 +442,6 @@ class TrainingService:
             self.broadcast(event)
         logger.info("Đã gửi tín hiệu dừng huấn luyện an toàn.")
 
-    def stream_events(self) -> Generator[str, None, None]:
-        """SSE stream with an authoritative versioned snapshot followed by deltas."""
-        client_q = self.register_subscriber()
-
-        try:
-            initial_payload = json.dumps({"type": "init", **self.get_state()})
-            yield f"data: {initial_payload}\n\n"
-
-            while True:
-                try:
-                    evt = client_q.get(timeout=1.0)
-                    yield f"data: {json.dumps(evt)}\n\n"
-                except queue.Empty:
-                    yield f": heartbeat {time.time()}\n\n"
-        finally:
-            self.unregister_subscriber(client_q)
+    def iter_events(self) -> Generator[Dict[str, Any], None, None]:
+        """Yield an authoritative snapshot followed by transport-neutral lifecycle events."""
+        yield from self._events.iter_events(self.get_state)

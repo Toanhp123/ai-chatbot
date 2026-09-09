@@ -76,7 +76,7 @@ async def get_hardware_advisor_endpoint(request: Request):
 
 @router.post("/gates/run")
 async def run_quality_gates_endpoint(request: Request):
-    return await asyncio.to_thread(request.app.state.diagnostics_service.run_quality_gates)
+    return await asyncio.to_thread(request.app.state.diagnostics_runtime_adapter.run_quality_gates)
 
 
 @router.get("/inspect")
@@ -102,4 +102,4 @@ async def inspect_model_endpoint(
 
 @router.get("/logs")
 async def get_system_logs_endpoint(request: Request, lines: int = 80):
-    return await asyncio.to_thread(request.app.state.diagnostics_service.logs, lines)
+    return await asyncio.to_thread(request.app.state.diagnostics_runtime_adapter.logs, lines)

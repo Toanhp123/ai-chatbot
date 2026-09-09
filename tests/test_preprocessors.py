@@ -4,6 +4,7 @@ Bộ kiểm thử toàn diện cho hệ thống Tiền xử lý dữ liệu (cle
 """
 
 import unicodedata
+from typing import cast
 
 import pytest
 
@@ -44,14 +45,21 @@ def test_cleaner_hierarchy_and_factory():
 def test_cleaner_registry_extensibility(tmp_path):
     # Kiểm tra gemini đã đăng ký tự động vào CleanerRegistry
     assert "gemini" in CleanerRegistry.list_available()
-    gemini_c = CleanerRegistry.create("gemini", cache_dir=str(tmp_path / "gemini_cache"))
+    gemini_c = cast(
+        GeminiTextCleaner,
+        CleanerRegistry.create(
+            "gemini",
+            api_key="test-key",
+            cache_dir=str(tmp_path / "gemini_cache"),
+        ),
+    )
     assert isinstance(gemini_c, GeminiTextCleaner)
 
-    # Thử nghiệm tính năng Disk Cache SHA-256 của GeminiTextCleaner
+    # Capability Gemini owns caching, but not fallback policy.
     sample_text = "1.. Trăm năm trong cõi người ta,"
+    gemini_c._call_gemini_api = lambda text: "Trăm năm trong cõi người ta,"
     cleaned_1 = gemini_c(sample_text)
-    assert "1.." not in cleaned_1
-    assert "Trăm năm trong cõi người ta" in cleaned_1
+    assert cleaned_1 == "Trăm năm trong cõi người ta,"
     assert gemini_c.get_stats()["cache_hits"] == 0
 
     # Lần 2: Phải hit disk cache ngay tức thì
@@ -237,3 +245,11 @@ def test_streaming_file_cleaning(tmp_path):
     # Test file không tồn tại
     with pytest.raises(DataPipelineError):
         cleaner.clean_file("non_existent_file.txt", str(output_file))
+
+
+def test_gemini_cleaner_reports_unavailable_instead_of_choosing_fallback(tmp_path, monkeypatch):
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    cleaner = GeminiTextCleaner(api_key=None, cache_dir=str(tmp_path / "gemini-strict"))
+
+    with pytest.raises(DataPipelineError, match="GEMINI_API_KEY|Gemini"):
+        cleaner("1.. Trăm năm trong cõi người ta")

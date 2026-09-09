@@ -4,7 +4,7 @@ Tự động đăng ký vào CleanerRegistry qua decorator @CleanerRegistry.regi
 
 Trang bị:
 - Disk Caching SHA-256: Lưu đệm kết quả vào đĩa, tiết kiệm 100% chi phí token và chống trùng lặp.
-- Graceful Fallback: Tự động chuyển về TextCleaner chuẩn nếu chưa cấu hình GEMINI_API_KEY.
+- Failure signaling: báo lỗi rõ ràng để Application quyết định fallback policy.
 """
 
 import hashlib
@@ -12,10 +12,10 @@ import importlib
 import os
 from typing import Any, Optional
 
+from src.core.exceptions import DataPipelineError
 from src.core.logging import get_logger
 from src.data.cleaners.base import BaseTextPreprocessor
 from src.data.cleaners.registry import CleanerRegistry
-from src.data.cleaners.standard import TextCleaner
 
 logger = get_logger("GeminiCleaner")
 
@@ -43,14 +43,6 @@ class GeminiTextCleaner(BaseTextPreprocessor):
             "Hãy loại bỏ rác, thẻ HTML, ký tự dị thường, giữ nguyên vần điệu và nội dung văn học."
         )
 
-        # Bộ làm sạch fallback khi offline hoặc không có API key
-        self._fallback_cleaner = TextCleaner(
-            clean_line_numbers=clean_line_numbers,
-            normalize_ws=True,
-            normalize_uni=True,
-            normalize_punct=True,
-        )
-
         os.makedirs(self.cache_dir, exist_ok=True)
         self._cache_hits = 0
         self._api_calls = 0
@@ -72,26 +64,29 @@ class GeminiTextCleaner(BaseTextPreprocessor):
             with open(cache_file, "r", encoding="utf-8", errors="replace") as f:
                 return f.read()
 
-        # 2. Kiểm tra API Key
+        # 2. Capability chỉ báo availability; fallback là policy của Application.
         if not self.api_key:
-            logger.warning(
-                "⚠️ Chưa thiết lập GEMINI_API_KEY! Tự động chuyển về TextCleaner chuẩn (NFC/Regex)."
+            raise DataPipelineError(
+                "Gemini cleaner cần GEMINI_API_KEY nhưng chưa được cấu hình.",
+                details={"cleaner": "gemini", "model": self.model},
+                suggestion="Cấu hình GEMINI_API_KEY hoặc để Application chọn cleaner fallback.",
             )
-            cleaned = self._fallback_cleaner(text)
-            with open(cache_file, "w", encoding="utf-8") as f:
-                f.write(cleaned)
-            return cleaned
 
         # 3. Gọi Gemini API
         try:
             cleaned = self._call_gemini_api(text)
-            self._api_calls += 1
-            with open(cache_file, "w", encoding="utf-8") as f:
-                f.write(cleaned)
-            return cleaned
+        except DataPipelineError:
+            raise
         except Exception as e:
-            logger.error(f"❌ Lỗi khi gọi Gemini API ({e}). Kích hoạt Fallback Cleaner an toàn.")
-            return self._fallback_cleaner(text)
+            raise DataPipelineError(
+                "Gemini cleaner không thể xử lý dữ liệu.",
+                details={"cleaner": "gemini", "model": self.model},
+                suggestion="Kiểm tra API/SDK hoặc để Application chọn cleaner fallback.",
+            ) from e
+        self._api_calls += 1
+        with open(cache_file, "w", encoding="utf-8") as f:
+            f.write(cleaned)
+        return cleaned
 
     def _call_gemini_api(self, text: str) -> str:
         """Hàm nội bộ gọi Gemini API bằng dynamic import an toàn."""
@@ -116,11 +111,12 @@ class GeminiTextCleaner(BaseTextPreprocessor):
                 f"{self.system_instruction}\n\nVăn bản đầu vào:\n{text}"
             )
             return str(getattr(response, "text", text) or text)
-        except (ImportError, AttributeError, ModuleNotFoundError):
-            logger.warning(
-                "Chưa cài đặt SDK 'google-genai' hoặc 'google-generativeai'. Chạy: pip install google-genai"
-            )
-            return self._fallback_cleaner(text)
+        except (ImportError, AttributeError, ModuleNotFoundError) as exc:
+            raise DataPipelineError(
+                "Gemini cleaner không tìm thấy SDK hỗ trợ.",
+                details={"cleaner": "gemini", "model": self.model},
+                suggestion="Cài 'google-genai' hoặc để Application chọn cleaner fallback.",
+            ) from exc
 
     def get_stats(self) -> dict[str, Any]:
         stats = super().get_stats()

@@ -13,6 +13,22 @@ def _service_without_assets(tmp_path) -> InferenceService:
     )
 
 
+def test_inference_service_loads_existing_configured_vocab_on_startup(tmp_path):
+    from src.data.tokenizers import CharTokenizer
+
+    vocab_path = tmp_path / "vocab.json"
+    CharTokenizer(vocab=list("abcd")).save_vocab(str(vocab_path))
+
+    service = InferenceService(
+        checkpoint_dir=str(tmp_path / "checkpoints"),
+        default_checkpoint=str(tmp_path / "missing_default.pt"),
+        vocab_path=str(vocab_path),
+    )
+
+    assert service.tokenizer is not None
+    assert service.tokenizer.vocab_size == 4
+
+
 def test_failed_checkpoint_load_does_not_mutate_backend(tmp_path):
     service = _service_without_assets(tmp_path)
 
@@ -97,7 +113,6 @@ def test_checkpoint_load_requires_tokenizer_before_committing_state(tmp_path):
 
 
 def test_stream_generate_serializes_shared_generator_state(tmp_path):
-    import json
     import threading
     import time
 
@@ -137,7 +152,7 @@ def test_stream_generate_serializes_shared_generator_state(tmp_path):
     def consume(prompt: str) -> None:
         start.wait()
         events = list(service.stream_generate(prompt, GenerationConfig(max_new_tokens=1)))
-        outputs.append([json.loads(item.removeprefix("data: ").strip()) for item in events])
+        outputs.append(events)
 
     threads = [
         threading.Thread(target=consume, args=("A",)),
@@ -266,8 +281,6 @@ def test_checkpoint_listing_preserves_zero_validation_loss(tmp_path):
 
 
 def test_stream_done_counts_generated_token_ids_not_text_chunks(tmp_path):
-    import json
-
     from src.core.config import GenerationConfig
     from src.generation.base import GenerationOutput
 
@@ -294,10 +307,7 @@ def test_stream_done_counts_generated_token_ids_not_text_chunks(tmp_path):
     service.tokenizer = DummyTokenizer()  # type: ignore[assignment]
     service.generator = ChunkingGenerator()  # type: ignore[assignment]
 
-    events = [
-        json.loads(item.removeprefix("data: ").strip())
-        for item in service.stream_generate("A", GenerationConfig(max_new_tokens=2))
-    ]
+    events = list(service.stream_generate("A", GenerationConfig(max_new_tokens=2)))
     done = next(event for event in events if event.get("type") == "done")
 
     assert done["token_count"] == 2
@@ -491,7 +501,7 @@ def test_generation_rejected_while_training_owns_same_accelerator(tmp_path):
     with pytest.raises(AcceleratorBusyError):
         service.begin_generation("hello", GenerationConfig(max_new_tokens=1))
 
-    assert service._generation_sessions == 0
+    assert service._generation_admission.active_sessions == 0
     coordinator.release_training("cuda")
 
 
@@ -622,7 +632,7 @@ def test_checkpoint_load_binds_active_revision_to_exact_loaded_inode(tmp_path, m
         return tokenizer
 
     monkeypatch.setattr(
-        "src.ui.services.inference_service.load_tokenizer_state",
+        "src.application.inference.checkpoint_loader.load_tokenizer_state",
         replace_after_payload_was_loaded,
     )
 
@@ -709,7 +719,8 @@ def test_prepare_for_training_offloads_idle_inference_model_from_shared_accelera
         create_for_inference,
     )
 
-    assert service.prepare_for_training("cuda:0") is True
+    handoff = service.prepare_for_training("cuda:0")
+    assert handoff.training_admission_reserved is False
     assert service.device_str == "cpu"
     assert created and created[-1][3] == "cpu"
     assert service.current_checkpoint_path == "checkpoints/model.pt"
@@ -717,6 +728,8 @@ def test_prepare_for_training_offloads_idle_inference_model_from_shared_accelera
 
 
 def test_prepare_for_training_refuses_to_move_model_during_active_generation(tmp_path):
+    from unittest.mock import Mock
+
     from src.core.exceptions import GenerationBusyError
     from src.ui.services.inference_service import InferenceService
 
@@ -726,14 +739,19 @@ def test_prepare_for_training_refuses_to_move_model_during_active_generation(tmp
         vocab_path=str(tmp_path / "missing.json"),
         device="cpu",
     )
+    from src.core.config import GenerationConfig
+
     service.device_str = "cuda"
     service.model = object()  # type: ignore[assignment]
-    service.tokenizer = object()  # type: ignore[assignment]
-    service._generation_sessions = 1
-
-    with pytest.raises(GenerationBusyError):
-        service.prepare_for_training("cuda")
-    assert service.device_str == "cuda"
+    service.tokenizer = Mock()  # type: ignore[assignment]
+    service.generator = Mock()  # type: ignore[assignment]
+    session = service.begin_generation("hello", GenerationConfig(max_new_tokens=1))
+    try:
+        with pytest.raises(GenerationBusyError):
+            service.prepare_for_training("cuda")
+        assert service.device_str == "cuda"
+    finally:
+        session.close()
 
 
 def test_checkpoint_loaded_on_accelerator_holds_residency_until_offloaded(tmp_path, monkeypatch):
@@ -781,8 +799,9 @@ def test_checkpoint_loaded_on_accelerator_holds_residency_until_offloaded(tmp_pa
     with pytest.raises(AcceleratorBusyError):
         coordinator.reserve_training("cuda")
 
-    service.prepare_for_training("cuda")
-    coordinator.reserve_training("cuda")
+    handoff = service.prepare_for_training("cuda")
+    assert handoff.training_admission_reserved is True
+    assert coordinator.snapshot()["cuda"]["training"] is True
     coordinator.release_training("cuda")
 
 
@@ -865,3 +884,55 @@ def test_checkpoint_swap_to_cpu_offloads_previous_accelerator_model_before_relea
     assert service._residency_device is None
     coordinator.reserve_training("cuda")
     coordinator.release_training("cuda")
+
+
+def test_training_handoff_rollback_restores_inference_residency_and_runtime(tmp_path, monkeypatch):
+    import torch
+
+    from src.ui.services.accelerator_coordinator import AcceleratorCoordinator
+
+    coordinator = AcceleratorCoordinator()
+    service = InferenceService(
+        checkpoint_dir=str(tmp_path),
+        default_checkpoint=str(tmp_path / "missing.pt"),
+        vocab_path=str(tmp_path / "missing.json"),
+        device="cpu",
+        accelerator_coordinator=coordinator,
+    )
+
+    class DummyTokenizer:
+        pass
+
+    previous_generator = object()
+
+    class FakeModel(torch.nn.Module):
+        def to(self, device, *args, **kwargs):
+            return self
+
+    model = FakeModel()
+    service.model = model  # type: ignore[assignment]
+    service.tokenizer = DummyTokenizer()  # type: ignore[assignment]
+    service.generator = previous_generator  # type: ignore[assignment]
+    service.current_backend = "local"
+    service.device_str = "cuda"
+    service._residency_device = "cuda"
+    coordinator.reserve_inference_residency("cuda")
+    monkeypatch.setattr(
+        "src.ui.services.inference_service.GeneratorRegistry.create_for_inference",
+        lambda *args, **kwargs: object(),
+    )
+
+    handoff = service.prepare_for_training("cuda")
+    assert service.device_str == "cpu"
+    assert coordinator.snapshot()["cuda"]["training"] is True
+
+    handoff.rollback()
+
+    assert service.device_str == "cuda"
+    assert service.generator is previous_generator
+    assert service._residency_device == "cuda"
+    assert coordinator.snapshot()["cuda"] == {
+        "training": False,
+        "generation": 0,
+        "inference_residency": 1,
+    }

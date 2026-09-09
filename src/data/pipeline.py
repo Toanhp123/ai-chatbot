@@ -6,7 +6,7 @@ Bao gồm:
 
 import os
 import urllib.request
-from typing import Optional, Tuple
+from typing import Callable, Optional, Protocol, Tuple
 
 import numpy as np
 import torch
@@ -15,12 +15,16 @@ from src.core.config import DataConfig
 from src.core.exceptions import DataPipelineError, DatasetEmptyError
 from src.core.logging import get_logger
 from src.data.batch_provider import extract_tensor_batch
-from src.data.cleaners import BaseTextPreprocessor, get_cleaner
-from src.data.constants import FALLBACK_CORPUS
 from src.data.dtypes import resolve_numpy_dtype
-from src.data.tokenizers import BaseTokenizer, get_tokenizer
+from src.data.tokenizers import BaseTokenizer
 
 logger = get_logger("DataPipeline")
+
+
+class TextPreprocessor(Protocol):
+    """Minimal capability contract DataPipeline needs from an injected cleaner."""
+
+    def __call__(self, text: str, /) -> str: ...
 
 
 class DataPipeline:
@@ -29,25 +33,18 @@ class DataPipeline:
     @staticmethod
     def fetch_or_load_text(
         config: DataConfig,
-        cleaner: Optional[BaseTextPreprocessor] = None,
+        cleaner: TextPreprocessor,
+        *,
+        fallback_text: Optional[str] = None,
+        persist_fallback: bool = False,
     ) -> str:
-        """Đọc dữ liệu từ file có sẵn, tải từ URL, hoặc sử dụng dữ liệu dự phòng.
+        """Đọc dữ liệu local hoặc tải từ URL.
 
-        Cho phép nhận bộ làm sạch (cleaner) tùy biến tiêm từ bên ngoài (ví dụ Gemini / AI / regex).
-        Nếu không truyền cleaner, tự động khởi tạo theo config.cleaner_type.
+        Capability này không tự quyết định fallback corpus. Caller phải truyền
+        ``fallback_text`` một cách explicit nếu use case cho phép fallback.
         """
         os.makedirs(config.data_dir, exist_ok=True)
         os.makedirs(os.path.dirname(os.path.abspath(config.input_file)), exist_ok=True)
-
-        # Quyết định bộ làm sạch từ tham số hoặc cấu hình
-        if cleaner is None:
-            cleaner_type = getattr(config, "cleaner_type", "default")
-            cleaner_kwargs = dict(getattr(config, "cleaner_kwargs", {}))
-            cleaner_kwargs.setdefault("clean_line_numbers", config.clean_line_numbers)
-            cleaner_kwargs.setdefault("normalize_ws", True)
-            cleaner_kwargs.setdefault("normalize_uni", True)
-            cleaner_kwargs.setdefault("normalize_punct", True)
-            cleaner = get_cleaner(cleaner_type, **cleaner_kwargs)
 
         # 1. Existing local data is authoritative regardless of size. Never overwrite
         # a user-provided corpus merely because it is small; downstream validation
@@ -67,48 +64,71 @@ class DataPipeline:
                 )
                 with urllib.request.urlopen(req, timeout=15) as resp:
                     raw_text = resp.read().decode("utf-8", errors="replace")
-
+            except Exception as e:
+                if fallback_text is None:
+                    raise DataPipelineError(
+                        f"Không thể tải corpus từ nguồn đã cấu hình: {config.source_url}",
+                        details={"source_url": config.source_url},
+                    ) from e
+                logger.warning(
+                    "Không thể tải dữ liệu từ internet (%s). "
+                    "Application đã cho phép dùng corpus dự phòng.",
+                    e,
+                )
+            else:
+                # Cleaning and persistence are separate mechanisms. Their failures must
+                # not be reclassified as a remote-source failure.
                 cleaned_text = cleaner(raw_text)
-
                 with open(config.input_file, "w", encoding="utf-8") as f:
                     f.write(cleaned_text)
                 logger.info(
                     f"Tải và lưu thành công {len(cleaned_text):,} ký tự vào {config.input_file}"
                 )
                 return cleaned_text
-            except Exception as e:
-                logger.warning(
-                    f"Không thể tải dữ liệu từ internet ({e}). Chuyển sang dữ liệu dự phòng."
-                )
 
-        # 3. Sử dụng dữ liệu dự phòng
-        cleaned_fallback = cleaner(FALLBACK_CORPUS)
-        with open(config.input_file, "w", encoding="utf-8") as f:
-            f.write(cleaned_fallback)
-        logger.info(f"Đã tạo file dữ liệu dự phòng tại: {config.input_file}")
+        if fallback_text is None:
+            raise DataPipelineError(
+                "Không có dữ liệu local và Application không cung cấp corpus dự phòng.",
+                details={"input_file": config.input_file, "source_url": config.source_url},
+            )
+
+        cleaned_fallback = cleaner(fallback_text)
+        if persist_fallback:
+            with open(config.input_file, "w", encoding="utf-8") as f:
+                f.write(cleaned_fallback)
+            logger.info(f"Đã lưu dữ liệu dự phòng tại: {config.input_file}")
         return cleaned_fallback
 
     @classmethod
     def setup_data(
         cls,
         config: DataConfig,
-        cleaner: Optional[BaseTextPreprocessor] = None,
+        cleaner: TextPreprocessor,
         tokenizer: Optional[BaseTokenizer] = None,
+        tokenizer_factory: Optional[Callable[[str], BaseTokenizer]] = None,
         block_size: Optional[int] = None,
+        *,
+        fallback_text: Optional[str] = None,
+        persist_fallback: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor, BaseTokenizer]:
         """Thiết lập pipeline dữ liệu hoàn chỉnh: nạp text, tokenize, lưu vocab, chia train/val.
 
-        Các linh kiện (cleaner, tokenizer) có thể tiêm trực tiếp từ bên ngoài hoặc
-        tự động suy diễn từ config.
+        Cleaner phải do caller cung cấp. Tokenizer phải được caller cung cấp trực tiếp
+        hoặc qua tokenizer_factory; capability này không tự chọn implementation từ config.
         """
-        text = cls.fetch_or_load_text(config, cleaner=cleaner)
+        text = cls.fetch_or_load_text(
+            config,
+            cleaner=cleaner,
+            fallback_text=fallback_text,
+            persist_fallback=persist_fallback,
+        )
 
-        # Quyết định Tokenizer từ tham số hoặc cấu hình
         if tokenizer is None:
-            tokenizer_type = getattr(config, "tokenizer_type", "char")
-            tokenizer_kwargs = dict(getattr(config, "tokenizer_kwargs", {}))
-            tokenizer_kwargs.setdefault("text", text)
-            tokenizer = get_tokenizer(tokenizer_type, **tokenizer_kwargs)
+            if tokenizer_factory is None:
+                raise DataPipelineError(
+                    "Application/caller phải cung cấp tokenizer hoặc tokenizer_factory explicit."
+                )
+            tokenizer = tokenizer_factory(text)
 
         tokenizer.save_vocab(config.vocab_file)
 

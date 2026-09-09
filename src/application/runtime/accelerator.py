@@ -126,6 +126,38 @@ class AcceleratorCoordinator:
             state["inference_residency"] = max(0, int(state["inference_residency"]) - 1)
             self._cleanup_locked(key)
 
+    def transfer_inference_to_training(self, device: str) -> None:
+        """Atomically convert the sole inference-residency lease into training ownership."""
+        key = accelerator_key(device)
+        if key is None:
+            return
+        with self._lock:
+            state = self._state.setdefault(key, self._empty_state())
+            if bool(state["training"]) or int(state["generation"]) > 0:
+                owner = "training" if bool(state["training"]) else "generation"
+                raise AcceleratorBusyError(key, owner, "training_handoff")
+            residency = int(state["inference_residency"])
+            if residency != 1:
+                owner = "inference_residency" if residency > 1 else "none"
+                raise AcceleratorBusyError(key, owner, "training_handoff")
+            state["inference_residency"] = 0
+            state["training"] = True
+
+    def transfer_training_to_inference(self, device: str) -> None:
+        """Atomically roll an uncommitted training handoff back to inference residency."""
+        key = accelerator_key(device)
+        if key is None:
+            return
+        with self._lock:
+            state = self._state.setdefault(key, self._empty_state())
+            if not bool(state["training"]):
+                raise AcceleratorBusyError(key, "none", "inference_handoff_rollback")
+            if int(state["generation"]) > 0 or int(state["inference_residency"]) > 0:
+                owner = "generation" if int(state["generation"]) > 0 else "inference_residency"
+                raise AcceleratorBusyError(key, owner, "inference_handoff_rollback")
+            state["training"] = False
+            state["inference_residency"] = 1
+
     def snapshot(self) -> Dict[str, Dict[str, int | bool]]:
         with self._lock:
             return {key: dict(value) for key, value in self._state.items()}

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import inspect
-import json
 import threading
 import time
 from typing import Any, Callable, Iterator, List, Optional
@@ -22,7 +21,7 @@ logger = get_logger("GenerationSession")
 
 
 class GenerationSession:
-    """Own one request's snapshot, worker, cancellation and SSE lifecycle."""
+    """Own one request's snapshot, worker, cancellation and event lifecycle."""
 
     def __init__(
         self,
@@ -195,11 +194,6 @@ class GenerationSession:
             yield payload
         finally:
             self.close()
-
-    def iter_sse(self) -> Iterator[str]:
-        """Serialize transport-neutral events for the legacy SSE adapter."""
-        for event in self.iter_events():
-            yield f"data: {json.dumps(event)}\n\n"
 
 
 __all__ = ["GenerationSession"]

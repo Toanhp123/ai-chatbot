@@ -616,8 +616,15 @@ def test_ui_stop_words_preserve_multi_token_sequences(client: TestClient, monkey
     captured = {}
 
     class FakeSession:
-        def iter_sse(self):
-            yield 'data: {"type":"done","generated_text":"","full_text":"c","token_count":0,"elapsed_sec":0.0,"tps":0.0}\n\n'
+        def iter_events(self):
+            yield {
+                "type": "done",
+                "generated_text": "",
+                "full_text": "c",
+                "token_count": 0,
+                "elapsed_sec": 0.0,
+                "tps": 0.0,
+            }
 
         def close(self):
             pass
@@ -955,8 +962,15 @@ def test_ui_generate_accepts_zero_top_k_as_disabled_filter(client: TestClient, m
     service = _app_state(client).inference_service
 
     class FakeSession:
-        def iter_sse(self):
-            yield 'data: {"type":"done","generated_text":"","full_text":"x","token_count":0,"elapsed_sec":0.0,"tps":0.0}\n\n'
+        def iter_events(self):
+            yield {
+                "type": "done",
+                "generated_text": "",
+                "full_text": "x",
+                "token_count": 0,
+                "elapsed_sec": 0.0,
+                "tps": 0.0,
+            }
 
         def close(self):
             pass
@@ -1137,8 +1151,15 @@ def test_ui_generate_omitted_sampling_fields_inherit_canonical_generation_config
     captured = {}
 
     class FakeSession:
-        def iter_sse(self):
-            yield 'data: {"type":"done","generated_text":"","full_text":"x","token_count":0,"elapsed_sec":0.0,"tps":0.0}\n\n'
+        def iter_events(self):
+            yield {
+                "type": "done",
+                "generated_text": "",
+                "full_text": "x",
+                "token_count": 0,
+                "elapsed_sec": 0.0,
+                "tps": 0.0,
+            }
 
         def close(self):
             pass
@@ -1581,10 +1602,16 @@ def test_ui_training_start_prepares_inference_residency_before_gpu_training(
         "src.application.training.service.check_memory_feasibility",
         lambda **kwargs: (True, "ok", {"total_estimated_gb": 0.1, "total_estimated_mb": 100}),
     )
+    from src.application.inference import InferenceTrainingHandoff
+
+    def fake_prepare_for_training(device):
+        calls.append(("prepare", device))
+        return InferenceTrainingHandoff()
+
     monkeypatch.setattr(
         inference_service,
         "prepare_for_training",
-        lambda device: calls.append(("prepare", device)),
+        fake_prepare_for_training,
         raising=False,
     )
     monkeypatch.setattr(
@@ -1638,7 +1665,13 @@ def test_ui_training_start_pins_resume_checkpoint_revision(
         "src.application.training.service.check_memory_feasibility",
         lambda **kwargs: (True, "ok", {"total_estimated_gb": 0.1, "total_estimated_mb": 100}),
     )
-    monkeypatch.setattr(inference_service, "prepare_for_training", lambda device: False)
+    from src.application.inference import InferenceTrainingHandoff
+
+    monkeypatch.setattr(
+        inference_service,
+        "prepare_for_training",
+        lambda device: InferenceTrainingHandoff(),
+    )
     monkeypatch.setattr(inference_service, "apply_engine_config", lambda config: None)
 
     def fake_start(*args, **kwargs):
@@ -1668,12 +1701,20 @@ def test_ui_training_start_reports_resume_disappeared_during_revision_pin(
     checkpoint = checkpoint_dir / "resume.pt"
     checkpoint.write_bytes(b"exists-at-validation")
 
+    launch_service = _app_state(client).training_launch_service
     monkeypatch.setattr(
-        "src.ui.routes.training._capture_resume_checkpoint_identity",
+        launch_service,
+        "_capture_checkpoint_identity",
         lambda path: (_ for _ in ()).throw(FileNotFoundError(path)),
-        raising=False,
     )
-    monkeypatch.setattr(inference_service, "prepare_for_training", lambda device: False)
+
+    from src.application.inference import InferenceTrainingHandoff
+
+    monkeypatch.setattr(
+        inference_service,
+        "prepare_for_training",
+        lambda device: InferenceTrainingHandoff(),
+    )
     monkeypatch.setattr(inference_service, "apply_engine_config", lambda config: None)
     monkeypatch.setattr(training_service, "start_training", lambda *args, **kwargs: None)
 

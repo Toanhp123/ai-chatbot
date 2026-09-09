@@ -1,4 +1,3 @@
-import json
 import threading
 import time
 from typing import Any, List, cast
@@ -200,7 +199,7 @@ def test_stream_close_cancels_worker_and_releases_admission(tmp_path) -> None:
 
     stream = service.stream_generate("A", GenerationConfig(max_new_tokens=100))
     first = next(stream)
-    assert json.loads(first.removeprefix("data: ").strip())["type"] == "start"
+    assert first["type"] == "start"
     assert generator.started.wait(timeout=1.0)
 
     stream.close()
@@ -244,12 +243,11 @@ def test_request_backend_snapshot_does_not_mutate_global_backend(tmp_path) -> No
     service.generator = TextGenerator(model, tokenizer, device="cpu")
     service.current_backend = "local"
 
-    events = [
-        json.loads(item.removeprefix("data: ").strip())
-        for item in service.stream_generate(
+    events = list(
+        service.stream_generate(
             "A", GenerationConfig(max_new_tokens=1, temperature=0.0), backend="pytorch"
         )
-    ]
+    )
 
     assert service.current_backend == "local"
     assert next(event for event in events if event["type"] == "done")["type"] == "done"
@@ -312,7 +310,7 @@ def test_alternate_backend_factory_waits_for_execution_slot(tmp_path) -> None:
         session = service.begin_generation("A", GenerationConfig(max_new_tokens=1), backend=name)
         assert not factory_called.is_set()
 
-        consumer = threading.Thread(target=lambda: list(session.iter_sse()))
+        consumer = threading.Thread(target=lambda: list(session.iter_events()))
         consumer.start()
         time.sleep(0.08)
         assert not factory_called.is_set()
@@ -368,7 +366,7 @@ def test_stop_words_are_encoded_from_the_session_tokenizer_snapshot(tmp_path) ->
     session = service.begin_generation("A", GenerationConfig(max_new_tokens=1), stop_words=["ab"])
     service.tokenizer = TokenizerB()  # type: ignore[assignment]
 
-    list(session.iter_sse())
+    list(session.iter_events())
 
     assert captured["stop_sequences"] == [[1, 2]]
 
@@ -427,10 +425,7 @@ def test_done_payload_uses_authoritative_generation_output(tmp_path) -> None:
     service.tokenizer = DummyTokenizer()  # type: ignore[assignment]
     service.generator = DivergentGenerator()  # type: ignore[assignment]
 
-    events = [
-        json.loads(item.removeprefix("data: ").strip())
-        for item in service.stream_generate("A", GenerationConfig(max_new_tokens=1))
-    ]
+    events = list(service.stream_generate("A", GenerationConfig(max_new_tokens=1)))
     done = next(event for event in events if event["type"] == "done")
 
     assert done["full_text"] == "Acanonical"
@@ -519,12 +514,9 @@ def test_request_backend_uses_backend_inference_factory_hook(tmp_path) -> None:
         service.generator = FactoryGenerator("current")
         service.current_backend = "local"
 
-        events = [
-            json.loads(item.removeprefix("data: ").strip())
-            for item in service.stream_generate(
-                "A", GenerationConfig(max_new_tokens=1), backend=name
-            )
-        ]
+        events = list(
+            service.stream_generate("A", GenerationConfig(max_new_tokens=1), backend=name)
+        )
 
         done = next(event for event in events if event["type"] == "done")
         assert done["generated_text"] == "cpu:object"
@@ -570,8 +562,8 @@ def test_generation_streaming_response_closes_session_on_asgi_send_disconnect() 
         def __init__(self) -> None:
             self.close_count = 0
 
-        def iter_sse(self):
-            yield 'data: {"type":"start"}\n\n'
+        def iter_events(self):
+            yield {"type": "start"}
 
         def close(self) -> None:
             self.close_count += 1
@@ -967,3 +959,39 @@ def test_inference_generation_is_rejected_while_training_owns_accelerator(tmp_pa
             service.begin_generation("A", GenerationConfig(max_new_tokens=1))
     finally:
         coordinator.release_training("cuda")
+
+
+def test_application_generation_stream_is_transport_neutral(tmp_path) -> None:
+    service = _service_without_assets(tmp_path)
+
+    class DummyTokenizer:
+        def encode(self, text):
+            return [1]
+
+    class DummyGenerator:
+        def generate(self, prompt, config, streamer, return_output=False, cancellation=None):
+            streamer.on_token("x")
+            streamer.on_finish()
+            return GenerationOutput(
+                text=prompt + "x",
+                prompt=prompt,
+                generated_text="x",
+                token_ids=[1],
+                tokens_generated=1,
+                tokens_per_second=1.0,
+                elapsed_time_sec=1.0,
+                finish_reason="length",
+            )
+
+    service.tokenizer = DummyTokenizer()  # type: ignore[assignment]
+    service.generator = DummyGenerator()  # type: ignore[assignment]
+
+    events = list(service.stream_generate("A", GenerationConfig(max_new_tokens=1)))
+
+    assert events[0] == {"type": "start", "prompt": "A"}
+    assert all(isinstance(event, dict) for event in events)
+    session = service.begin_generation("B", GenerationConfig(max_new_tokens=1))
+    try:
+        assert not hasattr(session, "iter_sse")
+    finally:
+        session.close()

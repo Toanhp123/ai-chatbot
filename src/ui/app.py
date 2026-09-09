@@ -10,6 +10,7 @@ from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 
 from src.adapters.config import YamlConfigProvider
+from src.adapters.diagnostics import DiagnosticsRuntimeAdapter
 from src.application.config import ConfigurationService
 from src.application.diagnostics import DiagnosticsApplicationService
 from src.application.explorer import ExplorerApplicationService
@@ -66,8 +67,10 @@ def create_app() -> FastAPI:
         training_service=app.state.training_service,
         inference_service=app.state.inference_service,
         config_service=config_service,
+        training_application=app.state.training_application,
     )
     app.state.diagnostics_service = DiagnosticsApplicationService(config_service)
+    app.state.diagnostics_runtime_adapter = DiagnosticsRuntimeAdapter()
     app.state.explorer_service = ExplorerApplicationService(config_service)
 
     # Đăng ký các Route API

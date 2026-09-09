@@ -2,28 +2,44 @@
 Inference Service: Quản lý nạp mô hình, hoán đổi checkpoint và điều phối sinh văn bản theo luồng (Streaming).
 """
 
-import math
 import os
-import stat as stat_module
 import threading
-import time
-from dataclasses import replace
-from typing import Any, Callable, Dict, Generator, List, Optional
+from typing import Any, Dict, Generator, List, Optional
 
 import torch
 
 from src.application.config import ConfigurationService
-from src.application.inference.contracts import GenerationCommand, GenerationOverrides
+from src.application.inference.checkpoint_catalog import (
+    checkpoint_identity as catalog_checkpoint_identity,
+)
+from src.application.inference.checkpoint_catalog import (
+    delete_checkpoint as catalog_delete_checkpoint,
+)
+from src.application.inference.checkpoint_catalog import (
+    identity_from_stat as catalog_identity_from_stat,
+)
+from src.application.inference.checkpoint_catalog import (
+    list_checkpoints as catalog_list_checkpoints,
+)
+from src.application.inference.checkpoint_catalog import (
+    resolve_checkpoint_path as catalog_resolve_checkpoint_path,
+)
+from src.application.inference.checkpoint_loader import load_checkpoint_artifacts
+from src.application.inference.contracts import (
+    GenerationCommand,
+    GenerationOverrides,
+    InferenceTrainingHandoff,
+)
+from src.application.inference.generation_admission import GenerationAdmissionManager
+from src.application.inference.preferences import InferencePreferences
 from src.application.inference.session import GenerationSession
 from src.application.runtime.accelerator import (
     AcceleratorCoordinator,
     same_accelerator_family,
 )
-from src.core.config import EngineConfig, GenerationConfig, ModelConfig
-from src.core.exceptions import EmptyPromptError, GenerationBusyError, GenerationNotReadyError
+from src.core.config import EngineConfig, GenerationConfig
 from src.core.logging import get_logger
-from src.data.tokenizers import BaseTokenizer, load_tokenizer, load_tokenizer_state
-from src.data.tokenizers.base import get_tokenizer_identity
+from src.data.tokenizers import BaseTokenizer, load_tokenizer
 from src.generation import (
     BaseGenerator,
     GeneratorRegistry,
@@ -50,33 +66,38 @@ class InferenceService:
         generation_config: Optional[GenerationConfig] = None,
         accelerator_coordinator: Optional[AcceleratorCoordinator] = None,
         config_service: Optional[ConfigurationService] = None,
+        engine_config: Optional[EngineConfig] = None,
     ) -> None:
         if max_generation_sessions <= 0:
             raise ValueError("max_generation_sessions phải > 0")
-        base_config = EngineConfig()
-        canonical_generation = (
-            GenerationConfig.from_kwargs_safe(generation_config.to_dict())
-            if generation_config is not None
-            else GenerationConfig.from_kwargs_safe(base_config.generation.to_dict())
-        )
-        self._engine_config = ConfigurationService.snapshot(
-            base_config.copy(
-                data=base_config.data.copy(vocab_file=vocab_path),
-                training=base_config.training.copy(
-                    checkpoint_dir=checkpoint_dir,
-                    checkpoint_name=checkpoint_name,
-                ),
-                system=base_config.system.copy(device=device),
-                generation=canonical_generation,
+        if engine_config is not None:
+            engine_config.validate()
+            initial_config = ConfigurationService.snapshot(engine_config)
+        else:
+            base_config = EngineConfig()
+            canonical_generation = (
+                GenerationConfig.from_kwargs_safe(generation_config.to_dict())
+                if generation_config is not None
+                else GenerationConfig.from_kwargs_safe(base_config.generation.to_dict())
             )
+            initial_config = ConfigurationService.snapshot(
+                base_config.copy(
+                    data=base_config.data.copy(vocab_file=vocab_path),
+                    training=base_config.training.copy(
+                        checkpoint_dir=checkpoint_dir,
+                        checkpoint_name=checkpoint_name,
+                    ),
+                    system=base_config.system.copy(device=device),
+                    generation=canonical_generation,
+                )
+            )
+        self._preferences = InferencePreferences(
+            initial_config,
+            config_service=config_service,
         )
-        self._config_service = config_service
-        if self._config_service is not None:
-            self._config_service.activate(self._engine_config)
 
         self.current_checkpoint_path: Optional[str] = None
         self._current_checkpoint_identity: Optional[tuple[int, int, int, int]] = None
-        self._device_override: Optional[str] = None
         self.device_str = resolve_device(self.configured_device)
         self.current_backend: str = backend
         self._accelerator_coordinator = accelerator_coordinator
@@ -85,8 +106,10 @@ class InferenceService:
         self.model: Optional[BaseModel] = None
         self.generator: Optional[BaseGenerator] = None
         self._lock = threading.Lock()
-        self._max_generation_sessions = max_generation_sessions
-        self._generation_sessions = 0
+        self._generation_admission = GenerationAdmissionManager(
+            max_sessions=max_generation_sessions,
+            accelerator_coordinator=accelerator_coordinator,
+        )
         # Model instances own mutable KV-cache state, so workers execute one at a time.
         self._generation_lock = threading.Lock()
 
@@ -118,136 +141,76 @@ class InferenceService:
     ) -> "InferenceService":
         """Build inference preferences from the same canonical EngineConfig used by training."""
         return cls(
-            checkpoint_dir=config.training.checkpoint_dir,
-            checkpoint_name=config.training.checkpoint_name,
             default_checkpoint=os.path.join(
                 config.training.checkpoint_dir, config.training.checkpoint_name
             ),
-            vocab_path=config.data.vocab_file,
-            device=config.system.device,
             backend=backend,
             max_generation_sessions=max_generation_sessions,
-            generation_config=config.generation,
             accelerator_coordinator=accelerator_coordinator,
             config_service=config_service,
+            engine_config=config,
         )
-
-    def _preference_config(self) -> EngineConfig:
-        """Return the one authoritative preference snapshot for future inference work."""
-        if self._config_service is not None:
-            return self._config_service.current()
-        return ConfigurationService.snapshot(self._engine_config)
-
-    def _activate_preference_config(self, config: EngineConfig) -> EngineConfig:
-        snapshot = ConfigurationService.snapshot(config)
-        self._engine_config = snapshot
-        if self._config_service is not None:
-            self._config_service.activate(snapshot)
-        return snapshot
 
     @property
     def checkpoint_dir(self) -> str:
-        return self._preference_config().training.checkpoint_dir
+        return self._preferences.checkpoint_dir
 
     @checkpoint_dir.setter
     def checkpoint_dir(self, value: str) -> None:
-        if not value or not value.strip():
-            raise ValueError("checkpoint_dir không được để trống.")
-        config = self._preference_config()
-        self._activate_preference_config(
-            config.copy(training=config.training.copy(checkpoint_dir=value))
-        )
+        self._preferences.checkpoint_dir = value
 
     @property
     def checkpoint_name(self) -> str:
-        return self._preference_config().training.checkpoint_name
+        return self._preferences.checkpoint_name
 
     @checkpoint_name.setter
     def checkpoint_name(self, value: str) -> None:
-        if not value or not value.strip():
-            raise ValueError("checkpoint_name không được để trống.")
-        config = self._preference_config()
-        self._activate_preference_config(
-            config.copy(training=config.training.copy(checkpoint_name=value))
-        )
+        self._preferences.checkpoint_name = value
 
     @property
     def vocab_path(self) -> str:
-        return self._preference_config().data.vocab_file
+        return self._preferences.vocab_path
 
     @vocab_path.setter
     def vocab_path(self, value: str) -> None:
-        if not value or not value.strip():
-            raise ValueError("vocab_path không được để trống.")
-        config = self._preference_config()
-        self._activate_preference_config(config.copy(data=config.data.copy(vocab_file=value)))
+        self._preferences.vocab_path = value
 
     @property
     def configured_device(self) -> str:
-        # Explicit device ordinals (for example ``cuda:0``) are runtime placement
-        # overrides, not valid persisted SystemConfig values.
-        return self._device_override or self._preference_config().system.device
+        return self._preferences.configured_device
 
     @configured_device.setter
     def configured_device(self, value: str) -> None:
-        if not value or not value.strip():
-            raise ValueError("configured_device không được để trống.")
-        self._device_override = value
+        self._preferences.configured_device = value
 
     @property
     def default_generation_config(self) -> GenerationConfig:
-        return GenerationConfig.from_kwargs_safe(self._preference_config().generation.to_dict())
+        return self._preferences.default_generation_config
 
     @default_generation_config.setter
     def default_generation_config(self, value: GenerationConfig) -> None:
-        config = self._preference_config()
-        generation = GenerationConfig.from_kwargs_safe(value.to_dict())
-        self._activate_preference_config(config.copy(generation=generation))
+        self._preferences.default_generation_config = value
 
     def apply_engine_config(self, config: EngineConfig) -> None:
-        """Activate canonical preferences for future inference operations.
-
-        Loaded runtime artifacts remain untouched; only the shared configuration snapshot
-        changes. All compatibility properties derive from that one snapshot.
-        """
-        config.validate()
-        self._device_override = None
-        self._activate_preference_config(config)
+        """Activate canonical preferences without mutating loaded runtime artifacts."""
+        self._preferences.apply_engine_config(config)
 
     def get_engine_config(self) -> EngineConfig:
-        """Return a defensive copy of the shared canonical configuration snapshot."""
-        return self._preference_config()
+        return self._preferences.snapshot()
 
     @staticmethod
     def _identity_from_stat(stat_result: os.stat_result) -> tuple[int, int, int, int]:
-        return (
-            int(stat_result.st_dev),
-            int(stat_result.st_ino),
-            int(stat_result.st_size),
-            int(stat_result.st_mtime_ns),
-        )
+        return catalog_identity_from_stat(stat_result)
 
-    @classmethod
-    def _checkpoint_identity(cls, path: str) -> tuple[int, int, int, int]:
-        return cls._identity_from_stat(os.stat(path))
+    @staticmethod
+    def _checkpoint_identity(path: str) -> tuple[int, int, int, int]:
+        return catalog_checkpoint_identity(path)
 
     @staticmethod
     def _resolve_checkpoint_path_for_dir(
         checkpoint_dir: str, path: str, *, filename_only: bool = False
     ) -> str:
-        root = os.path.realpath(os.path.abspath(checkpoint_dir))
-        if filename_only:
-            candidate = os.path.realpath(os.path.join(root, os.path.basename(path)))
-        else:
-            candidate = os.path.realpath(os.path.abspath(path))
-            if os.path.dirname(path) in {"", "."}:
-                candidate = os.path.realpath(os.path.join(root, os.path.basename(path)))
-        try:
-            if os.path.commonpath([root, candidate]) != root or candidate == root:
-                raise ValueError
-        except ValueError as exc:
-            raise ValueError("Checkpoint phải nằm bên trong checkpoint_dir đã cấu hình.") from exc
-        return candidate
+        return catalog_resolve_checkpoint_path(checkpoint_dir, path, filename_only=filename_only)
 
     def get_runtime_state(self) -> Dict[str, Any]:
         """Return authoritative inference preferences and the loaded artifact revision."""
@@ -290,110 +253,14 @@ class InferenceService:
         )
 
     def list_checkpoints(self) -> List[Dict[str, Any]]:
-        """Scan one coherent checkpoint-directory snapshot and return stable file metadata."""
+        """Return checkpoint metadata from one coherent runtime/config snapshot."""
         with self._lock:
-            checkpoint_dir = self.checkpoint_dir
-            checkpoint_name = self.checkpoint_name
-            active_path = self.current_checkpoint_path
-            active_identity = self._current_checkpoint_identity
-
-        checkpoints: List[Dict[str, Any]] = []
-        if not os.path.exists(checkpoint_dir):
-            return checkpoints
-
-        try:
-            filenames = os.listdir(checkpoint_dir)
-        except OSError:
-            return checkpoints
-
-        for fname in filenames:
-            if not (fname.endswith(".pt") or fname.endswith(".pth")):
-                continue
-            try:
-                fpath = self._resolve_checkpoint_path_for_dir(
-                    checkpoint_dir, fname, filename_only=True
-                )
-                with open(fpath, "rb") as checkpoint_file:
-                    file_stat = os.fstat(checkpoint_file.fileno())
-                    if not stat_module.S_ISREG(file_stat.st_mode):
-                        continue
-                    current_identity = self._identity_from_stat(file_stat)
-                    size_mb = round(file_stat.st_size / (1024 * 1024), 2)
-                    modified_time = time.strftime(
-                        "%Y-%m-%d %H:%M:%S", time.localtime(file_stat.st_mtime)
-                    )
-                    step = None
-                    val_loss = None
-                    run_name = None
-                    try:
-                        meta = torch.load(checkpoint_file, map_location="cpu", weights_only=True)
-                        if isinstance(meta, dict):
-                            step = meta.get("step")
-                            raw_val = meta.get("val_loss")
-                            if raw_val is not None:
-                                try:
-                                    value = float(raw_val)
-                                    if math.isfinite(value):
-                                        val_loss = round(value, 4)
-                                except (ValueError, TypeError):
-                                    pass
-                            run_name = meta.get("run_name")
-                    except Exception:
-                        pass
-            except (OSError, ValueError):
-                continue
-
-            is_active = (
-                active_path is not None
-                and os.path.abspath(fpath) == os.path.abspath(active_path)
-                and active_identity == current_identity
+            return catalog_list_checkpoints(
+                checkpoint_dir=self.checkpoint_dir,
+                checkpoint_name=self.checkpoint_name,
+                active_path=self.current_checkpoint_path,
+                active_identity=self._current_checkpoint_identity,
             )
-            checkpoints.append(
-                {
-                    "filename": fname,
-                    "path": fpath.replace("\\", "/"),
-                    "size_mb": size_mb,
-                    "modified_time": modified_time,
-                    "is_active": is_active,
-                    "step": step,
-                    "val_loss": val_loss,
-                    "run_name": run_name,
-                    "is_configured_best": fname == checkpoint_name,
-                }
-            )
-
-        valid_losses = [c["val_loss"] for c in checkpoints if c.get("val_loss") is not None]
-        min_loss = min(valid_losses) if valid_losses else None
-        for checkpoint in checkpoints:
-            checkpoint["is_best_val"] = (
-                min_loss is not None
-                and checkpoint.get("val_loss") is not None
-                and abs(checkpoint["val_loss"] - min_loss) < 1e-5
-            )
-            fname = checkpoint["filename"]
-            if fname == checkpoint_name:
-                checkpoint["tag"] = "best"
-            elif fname == "last_model.pt":
-                checkpoint["tag"] = "canonical_last"
-            elif fname.endswith("_last.pt"):
-                checkpoint["tag"] = "run_last"
-            elif "_step" in fname:
-                checkpoint["tag"] = "top_k"
-            else:
-                checkpoint["tag"] = "custom"
-
-        def _checkpoint_sort_key(item: Dict[str, Any]):
-            is_best = 0 if item["filename"] == checkpoint_name else 1
-            mtime = 0.0
-            try:
-                mtime = time.mktime(time.strptime(item["modified_time"], "%Y-%m-%d %H:%M:%S"))
-            except Exception:
-                pass
-            step = item.get("step") or 0
-            return (is_best, -mtime, -step)
-
-        checkpoints.sort(key=_checkpoint_sort_key)
-        return checkpoints
 
     def list_generators(self) -> List[str]:
         """Danh sách tất cả các generator backend đã đăng ký trong GeneratorRegistry."""
@@ -411,30 +278,27 @@ class InferenceService:
             if callable(empty_cache):
                 empty_cache()
 
-    def prepare_for_training(self, target_device: str) -> bool:
-        """Offload idle inference weights when training needs the same accelerator.
+    def prepare_for_training(self, target_device: str) -> InferenceTrainingHandoff:
+        """Create a reversible inference-to-training runtime handoff.
 
-        The checkpoint identity remains active; only its execution residency changes.
-        A persistent coordinator residency lease prevents a checkpoint reload from
-        silently reoccupying the accelerator between this handoff and training admission.
+        When inference owns the same coordinated accelerator, residency is converted to
+        training ownership atomically while this service lock is held. The caller may
+        roll the handoff back until background training accepts ownership.
         """
         with self._lock:
             if not same_accelerator_family(self.device_str, target_device):
-                return False
-            if self._generation_sessions:
-                raise GenerationBusyError(
-                    active=self._generation_sessions,
-                    limit=self._max_generation_sessions,
-                    operation="prepare_training",
-                )
+                return InferenceTrainingHandoff()
+            self._generation_admission.ensure_idle(operation="prepare_training")
             if self.model is None or self.tokenizer is None:
-                return False
+                return InferenceTrainingHandoff()
 
             previous_device = self.device_str
             previous_generator = self.generator
             model = self.model
             tokenizer = self.tokenizer
             backend = self.current_backend
+            residency_device = self._residency_device
+            admission_transferred = False
 
             if isinstance(model, torch.nn.Module):
                 model.to("cpu")
@@ -443,6 +307,9 @@ class InferenceService:
                 cpu_generator = GeneratorRegistry.create_for_inference(
                     backend, model=model, tokenizer=tokenizer, device="cpu"
                 )
+                if residency_device is not None and self._accelerator_coordinator is not None:
+                    self._accelerator_coordinator.transfer_inference_to_training(residency_device)
+                    admission_transferred = True
             except Exception:
                 try:
                     if isinstance(model, torch.nn.Module):
@@ -453,21 +320,40 @@ class InferenceService:
 
             self.generator = cpu_generator
             self.device_str = "cpu"
-            residency_device = self._residency_device
             self._residency_device = None
-            if residency_device is not None and self._accelerator_coordinator is not None:
-                self._accelerator_coordinator.release_inference_residency(residency_device)
-            return True
+
+            def rollback() -> None:
+                with self._lock:
+                    if self.model is not model or self.device_str != "cpu":
+                        return
+                    restored_residency = False
+                    if admission_transferred and self._accelerator_coordinator is not None:
+                        self._accelerator_coordinator.transfer_training_to_inference(
+                            previous_device
+                        )
+                        restored_residency = True
+                    try:
+                        if isinstance(model, torch.nn.Module):
+                            model.to(previous_device)
+                    except Exception:
+                        if restored_residency and self._accelerator_coordinator is not None:
+                            self._accelerator_coordinator.release_inference_residency(
+                                previous_device
+                            )
+                        raise
+                    self.generator = previous_generator
+                    self.device_str = previous_device
+                    self._residency_device = residency_device if restored_residency else None
+
+            return InferenceTrainingHandoff(
+                training_admission_reserved=admission_transferred,
+                rollback=rollback,
+            )
 
     def set_backend(self, backend: str) -> None:
         """Chuyển đổi generator backend sang một backend khác trong GeneratorRegistry."""
         with self._lock:
-            if self._generation_sessions:
-                raise GenerationBusyError(
-                    active=self._generation_sessions,
-                    limit=self._max_generation_sessions,
-                    operation="set_backend",
-                )
+            self._generation_admission.ensure_idle(operation="set_backend")
             backend_clean = backend.lower().strip()
             # Luôn xác thực tên backend, kể cả khi model/tokenizer chưa được nạp.
             # Nếu không, UI có thể lưu một backend không tồn tại và chỉ lỗi muộn
@@ -534,12 +420,7 @@ class InferenceService:
                 checkpoint_path = self._resolve_checkpoint_path_for_dir(
                     self.checkpoint_dir, checkpoint_path
                 )
-            if self._generation_sessions:
-                raise GenerationBusyError(
-                    active=self._generation_sessions,
-                    limit=self._max_generation_sessions,
-                    operation="load_checkpoint",
-                )
+            self._generation_admission.ensure_idle(operation="load_checkpoint")
             target_backend = self.current_backend
             if backend:
                 target_backend = backend.lower().strip()
@@ -560,52 +441,15 @@ class InferenceService:
                 reserved_accelerator = True
 
             try:
-                # Stage checkpoint tensors on CPU first. Loading directly onto the active
-                # inference device would temporarily duplicate checkpoint + old model + new model
-                # in VRAM before the atomic service-state commit.
-                with open(checkpoint_path, "rb") as checkpoint_file:
-                    loaded_checkpoint_identity = self._identity_from_stat(
-                        os.fstat(checkpoint_file.fileno())
-                    )
-                    checkpoint = torch.load(checkpoint_file, map_location="cpu", weights_only=True)
-                checkpoint_identity = checkpoint.get("tokenizer_identity")
-                if not isinstance(checkpoint_identity, dict):
-                    raise ValueError(
-                        "Checkpoint legacy không có tokenizer identity; từ chối nạp để tránh ánh xạ token sai."
-                    )
-                checkpoint_version = int(checkpoint.get("checkpoint_version", 1))
-                embedded_state = checkpoint.get("tokenizer_state")
-                if checkpoint_version >= 3 and not isinstance(embedded_state, dict):
-                    raise ValueError("Checkpoint v3 thiếu tokenizer state bắt buộc.")
-                if isinstance(embedded_state, dict):
-                    tokenizer = load_tokenizer_state(embedded_state)
-                else:
-                    tokenizer = (
-                        load_tokenizer(self.vocab_path)
-                        if os.path.exists(self.vocab_path)
-                        else self.tokenizer
-                    )
-                if tokenizer is None:
-                    raise ValueError(
-                        "Không thể nạp checkpoint khi chưa có tokenizer/từ vựng tương ứng."
-                    )
-                current_identity = get_tokenizer_identity(tokenizer)
-                if checkpoint_identity.get("fingerprint") != current_identity.get("fingerprint"):
-                    raise ValueError(
-                        "Tokenizer/từ vựng hiện tại không khớp tokenizer identity của checkpoint."
-                    )
-
-                cfg_dict = checkpoint.get("config", {}).get("model", {})
-                model_config = ModelConfig.from_kwargs_safe(cfg_dict, ignore_unknown=True)
-                model = ModelRegistry.create(model_config.name, model_config)
-
-                if isinstance(model, torch.nn.Module):
-                    model.load_state_dict(checkpoint["model_state_dict"])
-
-                # The checkpoint payload is no longer needed after the CPU model has been
-                # populated. Drop it before an accelerator swap to avoid retaining another
-                # full copy of the weights in host memory during the handoff.
-                del checkpoint
+                # Materialize and validate CPU artifacts before touching the active runtime.
+                artifacts = load_checkpoint_artifacts(
+                    checkpoint_path,
+                    vocab_path=self.vocab_path,
+                    fallback_tokenizer=self.tokenizer,
+                )
+                loaded_checkpoint_identity = artifacts.identity
+                tokenizer = artifacts.tokenizer
+                model = artifacts.model
 
                 previous_model = self.model
                 previous_model_to_restore: Optional[BaseModel] = None
@@ -694,32 +538,16 @@ class InferenceService:
                     self._accelerator_coordinator.release_generation(target_device)
 
     def delete_checkpoint(self, filename: str) -> bool:
-        """Xóa một checkpoint khỏi thư mục lưu trữ an toàn."""
+        """Delete one managed checkpoint while protecting configured/active artifacts."""
         with self._lock:
-            safe_filename = os.path.basename(filename)
-            target_path = self._resolve_checkpoint_path_for_dir(
-                self.checkpoint_dir, safe_filename, filename_only=True
+            safe_filename = catalog_delete_checkpoint(
+                checkpoint_dir=self.checkpoint_dir,
+                checkpoint_name=self.checkpoint_name,
+                filename=filename,
+                active_path=self.current_checkpoint_path,
             )
-            if not os.path.exists(target_path):
-                raise FileNotFoundError(f"Không tìm thấy file checkpoint: {safe_filename}")
-
-            if safe_filename == self.checkpoint_name:
-                raise ValueError("Không thể xóa checkpoint tốt nhất đang được cấu hình!")
-
-            if self.current_checkpoint_path and os.path.abspath(target_path) == os.path.abspath(
-                self.current_checkpoint_path
-            ):
-                raise ValueError("Không thể xóa checkpoint đang được nạp phục vụ suy luận!")
-
-            os.remove(target_path)
             logger.info(f"🗑️ Đã xóa checkpoint: {safe_filename}")
             return True
-
-    def _release_generation_admission(self, device: str) -> None:
-        with self._lock:
-            self._generation_sessions = max(0, self._generation_sessions - 1)
-        if self._accelerator_coordinator is not None:
-            self._accelerator_coordinator.release_generation(device)
 
     def begin_generation(
         self,
@@ -728,88 +556,22 @@ class InferenceService:
         backend: Optional[str] = None,
         stop_words: Optional[List[str]] = None,
     ) -> GenerationSession:
-        """Reserve bounded admission and freeze all mutable inference inputs for one request."""
-        if not prompt.strip():
-            raise EmptyPromptError()
-        config.validate()
+        """Freeze one runtime snapshot and delegate bounded session admission."""
         with self._lock:
             current_backend = self.current_backend
             requested_backend = backend.lower().strip() if backend else current_backend
-            # Validate request input before admission/readiness so an invalid backend
-            # cannot be masked by a transient busy or not-ready service state.
-            requested_generator_cls = GeneratorRegistry.get(requested_backend)
-
-            if self._generation_sessions >= self._max_generation_sessions:
-                raise GenerationBusyError(
-                    active=self._generation_sessions,
-                    limit=self._max_generation_sessions,
-                )
-
-            generator = self.generator
-            tokenizer = self.tokenizer
-            model = self.model
-            if generator is None or tokenizer is None:
-                raise GenerationNotReadyError()
-            generator_provider: Callable[[], BaseGenerator]
-            if requested_backend == current_backend:
-                generator_snapshot = generator
-
-                def current_generator_provider() -> BaseGenerator:
-                    return generator_snapshot
-
-                generator_provider = current_generator_provider
-            else:
-                if model is None:
-                    raise GenerationNotReadyError()
-                generator_cls_snapshot = requested_generator_cls
-                model_snapshot = model
-                tokenizer_snapshot = tokenizer
-                device_snapshot = self.device_str
-
-                def requested_generator_provider() -> BaseGenerator:
-                    return generator_cls_snapshot.from_inference_context(
-                        model=model_snapshot,
-                        tokenizer=tokenizer_snapshot,
-                        device=device_snapshot,
-                    )
-
-                generator_provider = requested_generator_provider
-
-            stop_sequences = (
-                [list(sequence) for sequence in config.stop_sequences]
-                if config.stop_sequences
-                else []
+            return self._generation_admission.begin(
+                prompt=prompt,
+                config=config,
+                requested_backend=requested_backend,
+                current_backend=current_backend,
+                generator=self.generator,
+                tokenizer=self.tokenizer,
+                model=self.model,
+                device=self.device_str,
+                execution_lock=self._generation_lock,
+                stop_words=stop_words,
             )
-            if stop_words:
-                stop_sequences.extend(
-                    sequence for word in stop_words if word and (sequence := tokenizer.encode(word))
-                )
-            frozen_config = replace(
-                config,
-                stop_tokens=list(config.stop_tokens) if config.stop_tokens else None,
-                stop_sequences=stop_sequences or None,
-            )
-            device_snapshot = self.device_str
-            if self._accelerator_coordinator is not None:
-                self._accelerator_coordinator.reserve_generation(device_snapshot)
-
-            def release_admission() -> None:
-                self._release_generation_admission(device_snapshot)
-
-            try:
-                session = GenerationSession(
-                    generator_provider=generator_provider,
-                    prompt=prompt,
-                    config=frozen_config,
-                    execution_lock=self._generation_lock,
-                    release_admission=release_admission,
-                )
-            except Exception:
-                if self._accelerator_coordinator is not None:
-                    self._accelerator_coordinator.release_generation(device_snapshot)
-                raise
-            self._generation_sessions += 1
-            return session
 
     def stream_generate(
         self,
@@ -817,11 +579,11 @@ class InferenceService:
         config: GenerationConfig,
         backend: Optional[str] = None,
         stop_words: Optional[List[str]] = None,
-    ) -> Generator[str, None, None]:
-        """Compatibility generator around the explicit GenerationSession lifecycle."""
+    ) -> Generator[dict[str, object], None, None]:
+        """Compatibility event generator around the explicit GenerationSession lifecycle."""
         session = self.begin_generation(prompt, config, backend=backend, stop_words=stop_words)
         try:
-            yield from session.iter_sse()
+            yield from session.iter_events()
         finally:
             session.close()
 

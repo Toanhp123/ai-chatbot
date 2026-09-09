@@ -6,8 +6,9 @@ import os
 from typing import Any, Dict, Optional
 
 from src.application.config import ConfigRequest, ConfigurationService
-from src.data.cleaners import get_cleaner
+from src.application.data_policy import build_application_cleaner, prepare_application_dataset
 from src.data.cleaners.standard import DeduplicationFilter, LineLengthFilter, RepetitionFilter
+from src.data.constants import FALLBACK_CORPUS
 from src.data.pipeline import DataPipeline
 from src.data.tokenizers import ByteTokenizer, load_tokenizer
 from src.data.tokenizers.gemini import GeminiTokenizer
@@ -34,7 +35,10 @@ class ExplorerApplicationService:
         min_length: Optional[int],
         max_length: Optional[int],
     ) -> Dict[str, Any]:
-        cleaner = get_cleaner(cleaner_type, clean_line_numbers=clean_line_numbers)
+        cleaner = build_application_cleaner(
+            cleaner_type,
+            clean_line_numbers=clean_line_numbers,
+        )
         cleaned = cleaner.process(text)
         if repetition:
             cleaned = RepetitionFilter().process(cleaned)
@@ -137,7 +141,11 @@ class ExplorerApplicationService:
 
     def export_binary(self, source: Optional[str] = None) -> Dict[str, Any]:
         config = self._config(source)
-        train_data, val_data, _ = DataPipeline.setup_data(config.data)
+        train_data, val_data, _ = prepare_application_dataset(
+            config.data,
+            fallback_text=FALLBACK_CORPUS,
+            persist_fallback=True,
+        )
         data_dir = os.path.dirname(os.path.abspath(config.data.input_file))
         train_bin = os.path.join(data_dir, "train.bin")
         val_bin = os.path.join(data_dir, "val.bin")

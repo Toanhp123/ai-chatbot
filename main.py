@@ -11,7 +11,14 @@ import argparse
 import logging
 import sys
 
-from src.adapters.cli import ConsoleTrainingObserver
+from src.adapters.cli import (
+    ConsoleTrainingObserver,
+    configure_cli_logging,
+    print_inspect,
+    print_scenarios,
+    print_system_report,
+    run_quality_gates_cli,
+)
 from src.adapters.config import YamlConfigProvider
 from src.application.config import ConfigRequest, ConfigurationService
 from src.application.diagnostics import DiagnosticsApplicationService
@@ -24,7 +31,6 @@ from src.application.inference import (
 from src.application.inference import (
     load_generator_from_checkpoint as _load_generator_from_checkpoint,
 )
-from src.application.runtime import ApplicationRuntimeService
 from src.application.training import TrainingApplicationService, TrainingCommand
 
 logger = logging.getLogger("ai-train")
@@ -58,14 +64,14 @@ def _configure_from_request(
     args: argparse.Namespace,
 ):
     config = config_service.resolve(_config_request(args))
-    ApplicationRuntimeService.configure_logging(config, name="ai-train")
+    configure_cli_logging(config, name="ai-train")
     return config
 
 
 def cmd_check(args: argparse.Namespace) -> None:
     config_service = _config_service()
     _configure_from_request(config_service, args)
-    DiagnosticsApplicationService(config_service).print_system_report()
+    print_system_report()
 
 
 def cmd_estimate(args: argparse.Namespace) -> None:
@@ -75,17 +81,14 @@ def cmd_estimate(args: argparse.Namespace) -> None:
     logger.info(
         "Phân tích ngân sách VRAM cho cấu hình: %s", args.config or config_service.default_path
     )
-    DiagnosticsApplicationService(config_service).print_scenarios_from_config(
-        None,
-        (),
-    )
+    print_scenarios(DiagnosticsApplicationService(config_service), None, ())
 
 
 def cmd_inspect(args: argparse.Namespace) -> None:
     config_service = _config_service()
     config = _configure_from_request(config_service, args)
     config_service.activate(config)
-    DiagnosticsApplicationService(config_service).print_inspect(None, ())
+    print_inspect(DiagnosticsApplicationService(config_service), None, ())
 
 
 def cmd_train(args: argparse.Namespace) -> None:
@@ -98,7 +101,7 @@ def cmd_train(args: argparse.Namespace) -> None:
             quick_check=bool(getattr(args, "quick_check", False)),
         )
     )
-    ApplicationRuntimeService.configure_logging(plan.requested_config, name="ai-train")
+    configure_cli_logging(plan.requested_config, name="ai-train")
     logger.info("Nạp cấu hình từ: %s", args.config or config_service.default_path)
     if plan.feasibility.feasible:
         logger.info("✅ [Pre-flight Memory Check]: %s", plan.feasibility.message)
@@ -206,13 +209,13 @@ def cmd_generate(args: argparse.Namespace) -> None:
 
 def cmd_gate(args: argparse.Namespace) -> None:
     del args
-    raise SystemExit(DiagnosticsApplicationService.run_quality_gates_cli())
+    raise SystemExit(run_quality_gates_cli())
 
 
 def cmd_ui(args: argparse.Namespace) -> None:
     config_service = _config_service()
     config = config_service.resolve()
-    ApplicationRuntimeService.configure_logging(config, name="ai-train")
+    configure_cli_logging(config, name="ai-train")
     try:
         import uvicorn
     except ImportError:

@@ -2,13 +2,10 @@
 
 from __future__ import annotations
 
-import os
-import time
 from dataclasses import dataclass
 from typing import Any, Dict, Optional
 
 from src.application.config import ConfigRequest, ConfigurationService
-from src.core.diagnostics import print_diagnostic_report, print_vram_scenarios_table
 from src.core.diagnostics.estimator import (
     analyze_vram_scenarios,
     estimate_vram_budget,
@@ -24,7 +21,6 @@ from src.core.diagnostics.storage import get_disk_info, verify_directory_permiss
 from src.core.diagnostics.system import get_system_info
 from src.core.runtime import resolve_training_plan
 from src.models.registry import ModelRegistry
-from src.utils.tensor_inspector import print_model_summary
 
 
 @dataclass(frozen=True)
@@ -134,9 +130,6 @@ class DiagnosticsApplicationService:
             system_config=config.system,
         )
 
-    def print_scenarios_from_config(self, source: Optional[str], overrides=()) -> None:
-        print_vram_scenarios_table(self.scenarios_from_config(source, overrides))
-
     def advisor(self) -> Dict[str, Any]:
         runner = DiagnosticsRunner()
         report = runner.run(test_tensor_allocation=True)
@@ -206,77 +199,9 @@ class DiagnosticsApplicationService:
             "layers": layers_info[:35],
         }
 
-    def print_inspect(self, source: Optional[str], overrides=()) -> None:
+    def model_for_inspection(self, source: Optional[str], overrides=()):
+        """Return the configured model object for an outer renderer without printing here."""
         config = self.config_service.resolve(
             ConfigRequest(source=source, overrides=tuple(overrides))
         )
-        model = ModelRegistry.create(config.model.name, config.model)
-        print_model_summary(model)
-
-    @staticmethod
-    def print_system_report() -> None:
-        print_diagnostic_report()
-
-    @staticmethod
-    def run_quality_gates() -> Dict[str, Any]:
-        from scripts.check_all import (
-            run_architecture_gate,
-            run_diagnostics_gate,
-            run_format_gate,
-            run_lint_gate,
-            run_test_suite_gate,
-            run_type_gate,
-        )
-
-        gates = [
-            run_format_gate,
-            run_lint_gate,
-            run_type_gate,
-            run_architecture_gate,
-            run_diagnostics_gate,
-            run_test_suite_gate,
-        ]
-        started = time.time()
-        results = [gate() for gate in gates]
-        return {
-            "all_passed": all(result.get("passed", False) for result in results),
-            "total_elapsed": round(time.time() - started, 2),
-            "results": results,
-        }
-
-    @staticmethod
-    def run_quality_gates_cli() -> int:
-        from scripts.check_all import main as run_quality_gates
-
-        return int(run_quality_gates())
-
-    @staticmethod
-    def logs(lines: int = 80) -> Dict[str, Any]:
-        candidate_files = ["logs/train.log", "logs/engine.log"]
-        log_file = next((path for path in candidate_files if os.path.exists(path)), None)
-        if not log_file and os.path.exists("logs"):
-            candidates = [
-                os.path.join("logs", filename)
-                for filename in os.listdir("logs")
-                if filename.endswith(".log")
-            ]
-            if candidates:
-                candidates.sort(key=os.path.getmtime, reverse=True)
-                log_file = candidates[0]
-        if not log_file or not os.path.exists(log_file):
-            return {"logs": [], "total_lines": 0, "file": "logs/train.log"}
-        try:
-            with open(log_file, "r", encoding="utf-8", errors="replace") as handle:
-                all_lines = handle.readlines()
-            tail = [line.rstrip() for line in all_lines[-lines:] if line.strip()]
-            return {
-                "logs": tail,
-                "total_lines": len(all_lines),
-                "file": log_file.replace("\\", "/"),
-            }
-        except Exception as exc:
-            return {
-                "logs": [f"Lỗi khi đọc file log: {exc}"],
-                "total_lines": 0,
-                "file": log_file.replace("\\", "/"),
-            }
+        return ModelRegistry.create(config.model.name, config.model)

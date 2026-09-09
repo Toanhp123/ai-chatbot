@@ -1,3 +1,5 @@
-"""Application-visible error contract re-exported from inner domain exceptions."""
+"""Stable error contract exposed to outer adapters."""
 
-from src.core.exceptions import *  # noqa: F403
+from src.core.exceptions import AIEngineError, ConfigurationError, ErrorCode
+
+__all__ = ["AIEngineError", "ConfigurationError", "ErrorCode"]

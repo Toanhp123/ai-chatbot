@@ -5,6 +5,7 @@ và factory get_batch_provider.
 """
 
 import os
+from typing import Any, cast
 
 import pytest
 import torch
@@ -18,13 +19,14 @@ from src.data.batch_provider import (
     TensorBatchProvider,
     get_batch_provider,
 )
-from src.data.cleaners import TextCleaner
+from src.data.cleaners import PassthroughCleaner, TextCleaner
+from src.data.constants import FALLBACK_CORPUS
 from src.data.dataset import (
     MemmapDataset,
     TextDataset,
 )
 from src.data.pipeline import DataPipeline
-from src.data.tokenizers import BaseTokenizer
+from src.data.tokenizers import BaseTokenizer, CharTokenizer
 
 
 def test_text_dataset_indexing():
@@ -141,7 +143,13 @@ def test_data_pipeline_setup_data(tmp_path):
     )
 
     cleaner = TextCleaner(clean_line_numbers=True)
-    train_data, val_data, tokenizer = DataPipeline.setup_data(config, cleaner=cleaner)
+    train_data, val_data, tokenizer = DataPipeline.setup_data(
+        config,
+        cleaner=cleaner,
+        tokenizer_factory=lambda text: CharTokenizer(text=text),
+        fallback_text=FALLBACK_CORPUS,
+        persist_fallback=True,
+    )
 
     assert len(train_data) > 0
     assert len(val_data) > 0
@@ -161,7 +169,12 @@ def test_data_pipeline_creates_input_file_parent_directory(tmp_path):
         vocab_file=str(tmp_path / "data" / "vocab.json"),
     )
 
-    text = DataPipeline.fetch_or_load_text(config, cleaner=TextCleaner())
+    text = DataPipeline.fetch_or_load_text(
+        config,
+        cleaner=TextCleaner(),
+        fallback_text=FALLBACK_CORPUS,
+        persist_fallback=True,
+    )
 
     assert text
     assert input_file.exists()
@@ -224,7 +237,12 @@ def test_setup_data_rejects_split_too_short_for_block_size(tmp_path) -> None:
     )
 
     with pytest.raises(DatasetEmptyError, match="block_size|validation|đánh giá"):
-        DataPipeline.setup_data(config, block_size=16)
+        DataPipeline.setup_data(
+            config,
+            cleaner=PassthroughCleaner(),
+            tokenizer_factory=lambda text: CharTokenizer(text=text),
+            block_size=16,
+        )
 
 
 def test_dataloader_provider_restores_cursor_and_shuffle_order_for_exact_resume() -> None:
@@ -278,7 +296,84 @@ def test_existing_small_local_input_is_never_overwritten(tmp_path) -> None:
         cleaner_type="none",
     )
 
-    text = DataPipeline.fetch_or_load_text(config)
+    text = DataPipeline.fetch_or_load_text(config, cleaner=PassthroughCleaner())
 
     assert text == original
     assert input_file.read_text(encoding="utf-8") == original
+
+
+def test_data_pipeline_remote_failure_is_strict_without_application_fallback(tmp_path, monkeypatch):
+    config = DataConfig(
+        data_dir=str(tmp_path / "data"),
+        input_file=str(tmp_path / "data" / "input.txt"),
+        vocab_file=str(tmp_path / "data" / "vocab.json"),
+        source_url="https://example.invalid/corpus.txt",
+        cleaner_type="none",
+    )
+
+    def fail_urlopen(*args, **kwargs):
+        raise OSError("offline")
+
+    monkeypatch.setattr("src.data.pipeline.urllib.request.urlopen", fail_urlopen)
+
+    with pytest.raises(DataPipelineError, match="tải|nguồn|corpus|offline"):
+        DataPipeline.fetch_or_load_text(config, cleaner=TextCleaner(), fallback_text=None)
+
+    assert not os.path.exists(config.input_file)
+
+
+def test_remote_cleaner_failure_is_not_misclassified_as_source_failure(tmp_path, monkeypatch):
+    config = DataConfig(
+        data_dir=str(tmp_path / "data"),
+        input_file=str(tmp_path / "data" / "input.txt"),
+        vocab_file=str(tmp_path / "data" / "vocab.json"),
+        source_url="https://example.test/corpus.txt",
+        cleaner_type="none",
+    )
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def read(self):
+            return b"REMOTE-CORPUS"
+
+    class Cleaner:
+        def __call__(self, text: str) -> str:
+            if text == "REMOTE-CORPUS":
+                raise DataPipelineError("cleaner failed")
+            return text
+
+    monkeypatch.setattr("src.data.pipeline.urllib.request.urlopen", lambda *a, **k: Response())
+
+    with pytest.raises(DataPipelineError, match="cleaner failed"):
+        DataPipeline.fetch_or_load_text(
+            config,
+            cleaner=Cleaner(),
+            fallback_text="FALLBACK-CORPUS",
+        )
+
+
+def test_data_pipeline_requires_caller_owned_cleaner_and_tokenizer_policy(tmp_path):
+    input_file = tmp_path / "input.txt"
+    input_file.write_text("abcdefghijklmnopqrstuvwxyz" * 8, encoding="utf-8")
+    config = DataConfig(
+        data_dir=str(tmp_path),
+        input_file=str(input_file),
+        vocab_file=str(tmp_path / "vocab.json"),
+    )
+
+    fetch_without_static_contract = cast(Any, DataPipeline.fetch_or_load_text)
+    with pytest.raises(TypeError):
+        fetch_without_static_contract(config)
+
+    with pytest.raises(DataPipelineError, match="tokenizer|Tokenizer"):
+        DataPipeline.setup_data(
+            config,
+            cleaner=TextCleaner(),
+            tokenizer=None,
+            tokenizer_factory=None,
+        )

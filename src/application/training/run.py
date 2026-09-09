@@ -10,11 +10,11 @@ from __future__ import annotations
 import time
 from typing import Callable, Optional
 
+from src.application.data_policy import prepare_application_dataset
 from src.core.config import EngineConfig
-from src.core.runtime import ResolvedTrainingPlan, resolve_training_plan, validate_training_plan
+from src.core.runtime import ResolvedTrainingPlan, validate_training_plan
 from src.data.batch_provider import get_batch_provider
-from src.data.cleaners import get_cleaner
-from src.data.pipeline import DataPipeline
+from src.data.constants import FALLBACK_CORPUS
 from src.generation import get_generator
 from src.models.registry import ModelRegistry
 from src.training.callbacks import (
@@ -75,7 +75,7 @@ class TrainingRunFactory:
         self,
         *,
         config: EngineConfig,
-        runtime_plan: Optional[ResolvedTrainingPlan] = None,
+        runtime_plan: ResolvedTrainingPlan,
         observer: Optional[TrainingObserver] = None,
         abort_check: Optional[Callable[[], bool]] = None,
         log_interval: int = 10,
@@ -84,15 +84,13 @@ class TrainingRunFactory:
         set_seed(effective.system.seed)
         self._check_abort(abort_check)
 
-        cleaner_kwargs = dict(effective.data.cleaner_kwargs)
-        cleaner_kwargs.setdefault("clean_line_numbers", effective.data.clean_line_numbers)
-        cleaner = get_cleaner(cleaner_type=effective.data.cleaner_type, **cleaner_kwargs)
         self._check_abort(abort_check)
 
-        train_data, val_data, tokenizer = DataPipeline.setup_data(
-            config=effective.data,
-            cleaner=cleaner,
+        train_data, val_data, tokenizer = prepare_application_dataset(
+            effective.data,
             block_size=effective.model.block_size,
+            fallback_text=FALLBACK_CORPUS,
+            persist_fallback=True,
         )
         self._check_abort(abort_check)
 
@@ -110,10 +108,7 @@ class TrainingRunFactory:
         model = ModelRegistry.create(effective.model.name, effective.model)
         self._check_abort(abort_check)
 
-        if runtime_plan is None:
-            runtime_plan = resolve_training_plan(effective)
-        else:
-            validate_training_plan(effective, runtime_plan)
+        validate_training_plan(effective, runtime_plan)
 
         sample_generator = get_generator(
             "local",

@@ -1,19 +1,16 @@
 """HTTP/SSE adapter for training application use cases."""
 
 import asyncio
-import os
-import stat
-from dataclasses import replace
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, HTTPException, Request
-from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from src.application.config import ConfigRequest
 from src.application.errors import AIEngineError
 from src.application.training import TrainingCommand
 from src.ui.path_policy import resolve_path_within_root
+from src.ui.responses import TrainingStreamingResponse
 
 router = APIRouter(prefix="/api/training", tags=["Training"])
 
@@ -38,19 +35,6 @@ def _resolve_resume_checkpoint(path: str, checkpoint_dir: str) -> str:
             status_code=400,
             detail="Checkpoint resume phải nằm bên trong checkpoint_dir đã cấu hình.",
         ) from exc
-
-
-def _capture_resume_checkpoint_identity(path: str) -> tuple[int, int, int, int]:
-    with open(path, "rb") as checkpoint_file:
-        file_stat = os.fstat(checkpoint_file.fileno())
-        if not stat.S_ISREG(file_stat.st_mode):
-            raise OSError(f"Checkpoint resume không phải file thường: {path}")
-        return (
-            int(file_stat.st_dev),
-            int(file_stat.st_ino),
-            int(file_stat.st_size),
-            int(file_stat.st_mtime_ns),
-        )
 
 
 class TrainingConfigRequest(BaseModel):
@@ -173,43 +157,35 @@ async def check_feasibility_endpoint(req: CheckFeasibilityRequest, request: Requ
 
 @router.post("/start")
 async def start_training_endpoint(req: StartTrainingRequest, request: Request):
-    training_application = request.app.state.training_application
     training_service = request.app.state.training_service
     command = TrainingCommand(
         config_path=_safe_config_path(req.config_path),
         overrides=_request_overrides(req, request),
         quick_check=req.quick_check,
     )
-    plan = await asyncio.to_thread(training_application.plan, command)
-
-    if req.resume_checkpoint:
-        resume_checkpoint = _resolve_resume_checkpoint(
-            req.resume_checkpoint,
-            plan.requested_config.training.checkpoint_dir,
-        )
-        try:
-            identity = _capture_resume_checkpoint_identity(resume_checkpoint)
-        except FileNotFoundError as exc:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Không tìm thấy file checkpoint để resume: '{req.resume_checkpoint}'",
-            ) from exc
-        except (IsADirectoryError, OSError) as exc:
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    "Không thể chốt revision checkpoint để resume; file có thể đã bị "
-                    f"thay thế hoặc không còn hợp lệ: '{req.resume_checkpoint}'"
-                ),
-            ) from exc
-        plan = replace(
-            plan,
-            resume_checkpoint=resume_checkpoint,
-            resume_checkpoint_identity=identity,
-        )
 
     try:
-        await asyncio.to_thread(request.app.state.training_launch_service.start, plan)
+        plan = await asyncio.to_thread(
+            request.app.state.training_launch_service.start_command,
+            command,
+            resume_checkpoint=req.resume_checkpoint,
+            resume_path_resolver=_resolve_resume_checkpoint,
+        )
+    except FileNotFoundError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Không tìm thấy file checkpoint để resume: '{req.resume_checkpoint}'",
+        ) from exc
+    except (IsADirectoryError, OSError) as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Không thể chốt revision checkpoint để resume; file có thể đã bị "
+                f"thay thế hoặc không còn hợp lệ: '{req.resume_checkpoint}'"
+            ),
+        ) from exc
+    except HTTPException:
+        raise
     except AIEngineError:
         raise
     except Exception as exc:
@@ -260,8 +236,8 @@ async def get_training_status_endpoint(request: Request):
 
 @router.get("/stream")
 async def stream_training_metrics_endpoint(request: Request):
-    return StreamingResponse(
-        request.app.state.training_service.stream_events(),
+    return TrainingStreamingResponse(
+        events=request.app.state.training_service.iter_events(),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",

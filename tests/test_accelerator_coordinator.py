@@ -108,6 +108,8 @@ def test_generation_session_holds_shared_reservation_until_close(tmp_path):
 
 
 def test_training_start_reserves_shared_accelerator_before_entering_starting_state():
+    from src.application.training.contracts import TrainingFeasibility, TrainingPlan
+    from src.core.config import EngineConfig
     from src.core.exceptions import AcceleratorBusyError
     from src.core.runtime import ResolvedTrainingPlan
     from src.ui.services.accelerator_coordinator import AcceleratorCoordinator
@@ -115,7 +117,7 @@ def test_training_start_reserves_shared_accelerator_before_entering_starting_sta
 
     coordinator = AcceleratorCoordinator()
     coordinator.reserve_generation("cuda")
-    plan = ResolvedTrainingPlan(
+    runtime_plan = ResolvedTrainingPlan(
         requested_device="cuda",
         device="cuda",
         device_type="cuda",
@@ -129,10 +131,17 @@ def test_training_start_reserves_shared_accelerator_before_entering_starting_sta
         effective_batch_size=1,
         gradient_checkpointing=False,
     )
+    config = EngineConfig().copy(system=EngineConfig().system.copy(device="cuda"))
+    plan = TrainingPlan(
+        requested_config=config,
+        config=config,
+        runtime_plan=runtime_plan,
+        feasibility=TrainingFeasibility(True, "ok", 0.0, 0.0),
+    )
     service = TrainingService(accelerator_coordinator=coordinator)
     try:
         with pytest.raises(AcceleratorBusyError):
-            service.start_training(runtime_plan=plan)
+            service.start_training(plan=plan)
         assert service.status == "IDLE"
     finally:
         coordinator.release_generation("cuda")
@@ -165,3 +174,69 @@ def test_training_blocks_new_inference_residency():
             coordinator.reserve_inference_residency("mps")
     finally:
         coordinator.release_training("mps")
+
+
+def test_accelerator_coordinator_atomically_transfers_inference_residency_to_training():
+    from src.application.runtime.accelerator import AcceleratorCoordinator
+
+    coordinator = AcceleratorCoordinator()
+    coordinator.reserve_inference_residency("cuda:0")
+
+    coordinator.transfer_inference_to_training("cuda")
+
+    assert coordinator.snapshot()["cuda"] == {
+        "training": True,
+        "generation": 0,
+        "inference_residency": 0,
+    }
+
+    coordinator.transfer_training_to_inference("cuda:1")
+    assert coordinator.snapshot()["cuda"] == {
+        "training": False,
+        "generation": 0,
+        "inference_residency": 1,
+    }
+
+
+def test_training_start_does_not_leak_admission_when_state_changes_before_commit(monkeypatch):
+    from src.application.runtime.accelerator import AcceleratorCoordinator
+    from src.application.training.contracts import TrainingFeasibility, TrainingPlan
+    from src.core.config import EngineConfig
+    from src.core.runtime import RuntimeCapabilities, resolve_training_plan
+    from src.ui.services.training_service import TrainingService
+
+    coordinator = AcceleratorCoordinator()
+    config = EngineConfig().copy(system=EngineConfig().system.copy(device="cuda"))
+    runtime_plan = resolve_training_plan(
+        config,
+        capabilities=RuntimeCapabilities(
+            cuda_available=True,
+            mps_available=False,
+            bf16_supported=False,
+            bitsandbytes_available=False,
+        ),
+    )
+    plan = TrainingPlan(
+        requested_config=config,
+        config=config,
+        runtime_plan=runtime_plan,
+        feasibility=TrainingFeasibility(True, "ok", 0.0, 0.0),
+    )
+    service = TrainingService(accelerator_coordinator=coordinator)
+
+    original_from_dict = EngineConfig.from_dict
+    calls = {"count": 0}
+
+    def race_during_freeze(value):
+        calls["count"] += 1
+        result = original_from_dict(value)
+        if calls["count"] == 2:
+            service.status = "STARTING"
+        return result
+
+    monkeypatch.setattr(EngineConfig, "from_dict", staticmethod(race_during_freeze))
+
+    with pytest.raises(RuntimeError, match="STARTING"):
+        service.start_training(plan=plan)
+
+    assert coordinator.snapshot() == {}
