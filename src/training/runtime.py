@@ -6,6 +6,7 @@ import time
 from typing import Any, Callable, Optional
 
 from src.core.config import EngineConfig
+from src.core.exceptions import TrainingPreparationCancelled
 from src.core.runtime import ResolvedTrainingPlan, validate_training_plan
 from src.data.api import create_batch_provider
 from src.generation.api import create_generator
@@ -21,7 +22,6 @@ from src.training.contracts import (
     NullTrainingObserver,
     PreparedTrainingRun,
     TrainingObserver,
-    TrainingPreparationAborted,
 )
 from src.training.trainer import Trainer, TrainOutput
 from src.utils.seed import set_seed
@@ -63,7 +63,7 @@ class TrainingRunFactory:
     @staticmethod
     def _check_abort(abort_check: Optional[Callable[[], bool]]) -> None:
         if abort_check is not None and abort_check():
-            raise TrainingPreparationAborted()
+            raise TrainingPreparationCancelled()
 
     def prepare(
         self,

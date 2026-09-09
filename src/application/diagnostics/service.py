@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Protocol
 
-from src.application.config import ConfigRequest, ConfigurationService
+from src.application.config import ConfigRequest
+from src.application.config.service import ConfigurationService
 from src.core.diagnostics import (
     DiagnosticsRunner,
     analyze_vram_scenarios,
@@ -42,9 +43,29 @@ class VramEstimateInput:
     bias: Optional[bool] = None
 
 
+class DiagnosticsRuntimePort(Protocol):
+    def run_quality_gates(self) -> Dict[str, Any]: ...
+    def logs(self, lines: int = 80) -> Dict[str, Any]: ...
+
+
 class DiagnosticsApplicationService:
-    def __init__(self, config_service: ConfigurationService) -> None:
+    def __init__(
+        self,
+        config_service: ConfigurationService,
+        runtime_adapter: Optional[DiagnosticsRuntimePort] = None,
+    ) -> None:
         self.config_service = config_service
+        self._runtime_adapter = runtime_adapter
+
+    def run_quality_gates(self) -> Dict[str, Any]:
+        if self._runtime_adapter is None:
+            raise RuntimeError("Diagnostics runtime port chưa được cấu hình.")
+        return self._runtime_adapter.run_quality_gates()
+
+    def logs(self, lines: int = 80) -> Dict[str, Any]:
+        if self._runtime_adapter is None:
+            raise RuntimeError("Diagnostics runtime port chưa được cấu hình.")
+        return self._runtime_adapter.logs(lines)
 
     def system(self) -> Dict[str, Any]:
         return {

@@ -4,11 +4,11 @@ from unittest.mock import Mock, patch
 import pytest
 import torch
 
-from src.application.training import TrainingService
 from src.application.training.contracts import TrainingFeasibility, TrainingPlan
 from src.core.config import EngineConfig
 from src.core.runtime import RuntimeCapabilities, resolve_training_plan
 from src.training.trainer import TrainOutput
+from tests.application_support import make_training_service
 
 
 def _training_plan(
@@ -35,7 +35,7 @@ def _training_plan(
 
 
 def test_abort_before_trainer_creation_does_not_deadlock():
-    service = TrainingService()
+    service = make_training_service()
     config = EngineConfig()
     tokenizer = Mock(vocab_size=32)
     batch_provider = Mock()
@@ -77,12 +77,12 @@ def test_clear_state_waits_for_stopping_worker_before_committing_idle():
     import threading
     import time
 
-    service = TrainingService()
+    service = make_training_service()
     service.status = "STOPPING"
 
     def finish_old_worker():
         time.sleep(0.03)
-        with service._lock:
+        with service._synchronization.section():
             service.status = "STOPPED"
 
     worker = threading.Thread(target=finish_old_worker)
@@ -96,7 +96,7 @@ def test_clear_state_waits_for_stopping_worker_before_committing_idle():
 
 
 def test_training_worker_shares_one_runtime_plan_with_generator_and_trainer():
-    service = TrainingService()
+    service = make_training_service()
     config = EngineConfig()
     config = config.copy(system=config.system.copy(device="cpu"))
     runtime_plan = resolve_training_plan(
@@ -225,7 +225,7 @@ def _run_fake_training_service(service, termination_reason, before_return=None):
 
 def test_training_state_is_versioned_and_event_init_is_authoritative():
 
-    service = TrainingService()
+    service = make_training_service()
     service.history_steps.extend(
         {"type": "step", "step": i, "loss": 1.0, "lr": 0.001, "elapsed": 0.0} for i in range(350)
     )
@@ -260,7 +260,7 @@ def test_training_state_is_versioned_and_event_init_is_authoritative():
 def test_user_stop_preserves_metrics_and_exposes_termination_reason():
     from src.training.trainer import TrainingTerminationReason
 
-    service = TrainingService()
+    service = make_training_service()
     events = []
     original_broadcast = service.broadcast
 
@@ -287,7 +287,7 @@ def test_user_stop_preserves_metrics_and_exposes_termination_reason():
 def test_early_stop_maps_to_completed_without_erasing_metrics():
     from src.training.trainer import TrainingTerminationReason
 
-    service = TrainingService()
+    service = make_training_service()
     _run_fake_training_service(service, TrainingTerminationReason.EARLY_STOPPED)
 
     state = service.get_state()
@@ -298,7 +298,7 @@ def test_early_stop_maps_to_completed_without_erasing_metrics():
 
 
 def test_clear_state_is_the_only_terminal_operation_that_erases_metrics():
-    service = TrainingService()
+    service = make_training_service()
     service.status = "STOPPED"
     service.current_step = 12
     service.current_loss = 0.4
@@ -315,7 +315,7 @@ def test_clear_state_is_the_only_terminal_operation_that_erases_metrics():
 
 
 def test_training_histories_are_bounded_without_breaking_authoritative_snapshot(monkeypatch):
-    service = TrainingService()
+    service = make_training_service()
     monkeypatch.setattr(service, "MAX_STEP_HISTORY", 2, raising=False)
     monkeypatch.setattr(service, "MAX_EVAL_HISTORY", 2, raising=False)
     monkeypatch.setattr(service, "MAX_SAMPLE_HISTORY", 2, raising=False)
@@ -334,7 +334,7 @@ def test_training_histories_are_bounded_without_breaking_authoritative_snapshot(
 def test_late_stop_request_does_not_overwrite_already_completed_trainer_result():
     from src.training.trainer import TrainingTerminationReason
 
-    service = TrainingService()
+    service = make_training_service()
     _run_fake_training_service(
         service,
         TrainingTerminationReason.COMPLETED,
@@ -347,7 +347,7 @@ def test_late_stop_request_does_not_overwrite_already_completed_trainer_result()
 
 
 def test_training_worker_uses_resolved_config_snapshot_without_rereading_yaml():
-    service = TrainingService()
+    service = make_training_service()
     config = EngineConfig().copy(system=EngineConfig().system.copy(device="cpu"))
     runtime_plan = resolve_training_plan(
         config,
@@ -388,7 +388,7 @@ def test_training_worker_uses_resolved_config_snapshot_without_rereading_yaml():
 
 
 def test_training_service_defensively_copies_config_snapshot_before_worker_runs():
-    service = TrainingService()
+    service = make_training_service()
     config = EngineConfig().copy(
         system=EngineConfig().system.copy(device="cpu"),
         training=EngineConfig().training.copy(max_iters=123, run_name="stable"),
@@ -441,12 +441,12 @@ def test_training_service_defensively_copies_config_snapshot_before_worker_runs(
 
 
 def test_training_start_rejected_while_generation_owns_same_accelerator():
-    from src.application.runtime import AcceleratorCoordinator
+    from src.core.accelerator import AcceleratorCoordinator
     from src.core.exceptions import AcceleratorBusyError
 
     coordinator = AcceleratorCoordinator()
     coordinator.reserve_generation("cuda")
-    service = TrainingService(accelerator_coordinator=coordinator)
+    service = make_training_service(accelerator_coordinator=coordinator)
     config = EngineConfig().copy(system=EngineConfig().system.copy(device="cuda"))
     runtime_plan = resolve_training_plan(
         config,
@@ -485,12 +485,12 @@ def _cuda_plan_for_test():
 
 
 def test_training_start_rejected_before_state_commit_when_generation_owns_accelerator():
-    from src.application.runtime import AcceleratorCoordinator
+    from src.core.accelerator import AcceleratorCoordinator
     from src.core.exceptions import AcceleratorBusyError
 
     coordinator = AcceleratorCoordinator()
     coordinator.reserve_generation("cuda")
-    service = TrainingService(accelerator_coordinator=coordinator)
+    service = make_training_service(accelerator_coordinator=coordinator)
     config = EngineConfig().copy(system=EngineConfig().system.copy(device="cuda"))
     try:
         with pytest.raises(AcceleratorBusyError):
@@ -502,10 +502,10 @@ def test_training_start_rejected_before_state_commit_when_generation_owns_accele
 
 
 def test_training_releases_accelerator_after_worker_failure():
-    from src.application.runtime import AcceleratorCoordinator
+    from src.core.accelerator import AcceleratorCoordinator
 
     coordinator = AcceleratorCoordinator()
-    service = TrainingService(accelerator_coordinator=coordinator)
+    service = make_training_service(accelerator_coordinator=coordinator)
     config = EngineConfig().copy(system=EngineConfig().system.copy(device="cuda"))
 
     with patch(
@@ -522,10 +522,10 @@ def test_training_releases_accelerator_after_worker_failure():
 
 
 def test_training_thread_start_failure_rolls_back_state_and_accelerator_reservation():
-    from src.application.runtime import AcceleratorCoordinator
+    from src.core.accelerator import AcceleratorCoordinator
 
     coordinator = AcceleratorCoordinator()
-    service = TrainingService(accelerator_coordinator=coordinator)
+    service = make_training_service(accelerator_coordinator=coordinator)
     config = EngineConfig().copy(system=EngineConfig().system.copy(device="cuda"))
 
     with patch(
@@ -545,7 +545,7 @@ def test_training_sample_generation_uses_canonical_generation_config():
     from src.generation import GenerationOutput
     from src.training.callbacks import SampleGenerationCallback, TrainerProtocol
 
-    service = TrainingService()
+    service = make_training_service()
     base = EngineConfig()
     config = base.copy(
         system=base.system.copy(device="cpu"),
@@ -632,7 +632,7 @@ def test_training_sample_generation_uses_canonical_generation_config():
 
 
 def test_training_service_forwards_pinned_resume_identity_to_trainer():
-    service = TrainingService()
+    service = make_training_service()
     config = EngineConfig().copy(system=EngineConfig().system.copy(device="cpu"))
     runtime_plan = resolve_training_plan(
         config,
@@ -682,7 +682,7 @@ def test_training_service_forwards_pinned_resume_identity_to_trainer():
 
 
 def test_training_application_event_stream_is_transport_neutral():
-    service = TrainingService()
+    service = make_training_service()
     stream = service.iter_events()
     first = next(stream)
     stream.close()

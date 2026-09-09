@@ -19,19 +19,10 @@ from src.adapters.cli import (
     print_system_report,
     run_quality_gates_cli,
 )
-from src.adapters.config import YamlConfigProvider
-from src.application.config import ConfigRequest, ConfigurationService
-from src.application.diagnostics import DiagnosticsApplicationService
 from src.application.errors import AIEngineError
-from src.application.inference import (
-    GenerationCommand,
-    GenerationOverrides,
-    InferenceService,
-)
-from src.application.inference import (
-    load_generator_from_checkpoint as _load_generator_from_checkpoint,
-)
-from src.application.training import TrainingApplicationService, TrainingCommand
+from src.application.inference import GenerationCommand, GenerationOverrides, InferenceGateway
+from src.application.training import TrainingCommand
+from src.composition import build_application_services
 
 logger = logging.getLogger("ai-train")
 
@@ -48,88 +39,47 @@ if sys.platform == "win32":
         pass
 
 
-def _config_service() -> ConfigurationService:
-    return ConfigurationService(YamlConfigProvider())
-
-
-def _config_request(args: argparse.Namespace) -> ConfigRequest:
-    return ConfigRequest.from_values(
-        getattr(args, "config", None),
-        getattr(args, "override", None),
+def _compose(args: argparse.Namespace):
+    services = build_application_services(
+        config_path=getattr(args, "config", None),
+        overrides=getattr(args, "override", None),
     )
-
-
-def _configure_from_request(
-    config_service: ConfigurationService,
-    args: argparse.Namespace,
-):
-    config = config_service.resolve(_config_request(args))
-    configure_cli_logging(config, name="ai-train")
-    return config
+    configure_cli_logging(services.config.logging_settings(), name="ai-train")
+    return services
 
 
 def cmd_check(args: argparse.Namespace) -> None:
-    config_service = _config_service()
-    _configure_from_request(config_service, args)
-    print_system_report(DiagnosticsApplicationService(config_service))
+    services = _compose(args)
+    print_system_report(services.diagnostics)
 
 
 def cmd_estimate(args: argparse.Namespace) -> None:
-    config_service = _config_service()
-    config = _configure_from_request(config_service, args)
-    config_service.activate(config)
+    services = _compose(args)
     logger.info(
-        "Phân tích ngân sách VRAM cho cấu hình: %s", args.config or config_service.default_path
+        "Phân tích ngân sách VRAM cho cấu hình: %s",
+        args.config or services.config.default_path,
     )
-    print_scenarios(DiagnosticsApplicationService(config_service), None, ())
+    print_scenarios(services.diagnostics, None, ())
 
 
 def cmd_inspect(args: argparse.Namespace) -> None:
-    config_service = _config_service()
-    config = _configure_from_request(config_service, args)
-    config_service.activate(config)
-    print_inspect(DiagnosticsApplicationService(config_service), None, ())
+    services = _compose(args)
+    print_inspect(services.diagnostics, None, ())
 
 
 def cmd_train(args: argparse.Namespace) -> None:
-    config_service = _config_service()
-    application = TrainingApplicationService(config_service)
-    plan = application.plan(
-        TrainingCommand(
-            config_path=getattr(args, "config", None),
-            overrides=tuple(getattr(args, "override", None) or ()),
-            quick_check=bool(getattr(args, "quick_check", False)),
-        )
+    services = _compose(args)
+    command = TrainingCommand(
+        config_path=getattr(args, "config", None),
+        overrides=tuple(getattr(args, "override", None) or ()),
+        quick_check=bool(getattr(args, "quick_check", False)),
     )
-    configure_cli_logging(plan.requested_config, name="ai-train")
-    logger.info("Nạp cấu hình từ: %s", args.config or config_service.default_path)
-    if plan.feasibility.feasible:
-        logger.info("✅ [Pre-flight Memory Check]: %s", plan.feasibility.message)
-    else:
-        logger.warning("⚠️ %s", plan.feasibility.message)
     if getattr(args, "quick_check", False):
         logger.info("⚡ Chế độ Quick Check: Huấn luyện nhanh 50 bước kiểm tra hệ thống.")
-
-    prepared = application.prepare(
-        plan,
+    services.training.run(
+        command,
         observer=ConsoleTrainingObserver(),
         log_interval=10 if getattr(args, "quick_check", False) else 100,
-    )
-    application.execute(prepared, plan)
-
-
-def load_generator_from_checkpoint(
-    checkpoint_path: str,
-    vocab_path: str,
-    device: str = "auto",
-    backend: str = "local",
-):
-    """Compatibility facade over the canonical application checkpoint loader."""
-    return _load_generator_from_checkpoint(
-        checkpoint_path,
-        vocab_path,
-        device=device,
-        backend=backend,
     )
 
 
@@ -148,7 +98,7 @@ def _generation_overrides(args: argparse.Namespace) -> GenerationOverrides:
 
 
 def _render_generation(
-    inference: InferenceService,
+    inference: InferenceGateway,
     *,
     prompt: str,
     overrides: GenerationOverrides,
@@ -168,10 +118,8 @@ def _render_generation(
 
 
 def cmd_generate(args: argparse.Namespace) -> None:
-    config_service = _config_service()
-    config = _configure_from_request(config_service, args)
-    config_service.activate(config)
-    inference = InferenceService.from_engine_config(config, config_service=config_service)
+    services = _compose(args)
+    inference = services.inference
     backend = getattr(args, "backend", None) or inference.current_backend
     if getattr(args, "vocab", None):
         inference.set_vocab_path(args.vocab)
@@ -213,9 +161,8 @@ def cmd_gate(args: argparse.Namespace) -> None:
 
 
 def cmd_ui(args: argparse.Namespace) -> None:
-    config_service = _config_service()
-    config = config_service.resolve()
-    configure_cli_logging(config, name="ai-train")
+    services = build_application_services()
+    configure_cli_logging(services.config.logging_settings(), name="ai-train")
     try:
         import uvicorn
     except ImportError:

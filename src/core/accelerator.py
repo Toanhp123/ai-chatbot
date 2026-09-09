@@ -1,4 +1,4 @@
-"""Cross-service admission for accelerator ownership.
+"""Inner runtime mechanics for accelerator ownership.
 
 Training may coexist with CPU inference, but CUDA/MPS training is exclusive against
 both active generation work and an inference model that is still resident on that

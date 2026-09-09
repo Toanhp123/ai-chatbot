@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Optional, Protocol
 
 from src.core.config import EngineConfig
+from src.core.exceptions import TrainingPreparationCancelled
 from src.core.runtime import ResolvedTrainingPlan
 
 
@@ -47,10 +48,6 @@ class NullTrainingObserver:
         del kwargs
 
 
-class TrainingPreparationAborted(RuntimeError):
-    """Control signal used when preparation is cancelled safely."""
-
-
 class CancellationSignal(Protocol):
     def set(self) -> None: ...
     def clear(self) -> None: ...
@@ -74,5 +71,5 @@ __all__ = [
     "PreparedTrainingRun",
     "TrainingControl",
     "TrainingObserver",
-    "TrainingPreparationAborted",
+    "TrainingPreparationCancelled",
 ]

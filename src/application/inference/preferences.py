@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from typing import Optional
 
-from src.application.config import ConfigurationService
+from src.application.config.service import ConfigurationService
 from src.core.config import EngineConfig, GenerationConfig
 
 

@@ -308,6 +308,10 @@ class ContextLengthExceededError(ModelArchitectureError):
 
 
 # --- Training Exceptions ---
+class TrainingPreparationCancelled(RuntimeError):
+    """Internal control signal for a safely cancelled training preparation."""
+
+
 class TrainingError(AIEngineError):
     """Ngoại lệ chung cho quy trình huấn luyện."""
 

@@ -1,4 +1,17 @@
-from .contracts import DEFAULT_CONFIG_PATH, ConfigProvider, ConfigRequest
-from .service import ConfigurationService
+from .contracts import (
+    DEFAULT_CONFIG_PATH,
+    ConfigDocumentError,
+    ConfigDocumentProvider,
+    ConfigRequest,
+    LoggingSettings,
+)
+from .gateway import ConfigGateway
 
-__all__ = ["DEFAULT_CONFIG_PATH", "ConfigProvider", "ConfigRequest", "ConfigurationService"]
+__all__ = [
+    "DEFAULT_CONFIG_PATH",
+    "ConfigDocumentError",
+    "ConfigDocumentProvider",
+    "ConfigGateway",
+    "ConfigRequest",
+    "LoggingSettings",
+]

@@ -2,17 +2,18 @@
 
 from __future__ import annotations
 
-from typing import Optional, Sequence
+from typing import Mapping, Optional, Sequence
 
-from src.core.config import EngineConfig
+from src.core.config import EngineConfig, apply_overrides
+from src.core.exceptions import ConfigurationError
 
-from .contracts import ConfigProvider, ConfigRequest
+from .contracts import ConfigDocumentError, ConfigDocumentProvider, ConfigRequest
 
 
 class ConfigurationService:
-    """Resolve and snapshot configuration through one provider contract."""
+    """Own defaults, overrides, canonical validation, snapshots and activation."""
 
-    def __init__(self, provider: ConfigProvider) -> None:
+    def __init__(self, provider: ConfigDocumentProvider) -> None:
         self._provider = provider
         self._active: Optional[EngineConfig] = None
 
@@ -20,9 +21,26 @@ class ConfigurationService:
     def default_path(self) -> str:
         return self._provider.default_path
 
+    @staticmethod
+    def _canonical_from_mapping(
+        mapping: Mapping[str, object],
+        *,
+        overrides: Sequence[str] = (),
+    ) -> EngineConfig:
+        raw = dict(mapping)
+        if overrides:
+            raw = apply_overrides(raw, overrides)
+        return EngineConfig.from_dict(raw)
+
     def resolve(self, request: Optional[ConfigRequest] = None) -> EngineConfig:
-        resolved = self._provider.load(request or ConfigRequest())
-        return self.snapshot(resolved)
+        effective = request or ConfigRequest()
+        try:
+            mapping = self._provider.load_mapping(effective.source)
+        except FileNotFoundError as exc:
+            raise ConfigurationError(str(exc)) from exc
+        except ConfigDocumentError as exc:
+            raise ConfigurationError(str(exc)) from exc
+        return self.snapshot(self._canonical_from_mapping(mapping, overrides=effective.overrides))
 
     def resolve_values(
         self,
@@ -61,7 +79,12 @@ class ConfigurationService:
         return self._provider.read_raw(source)
 
     def save_raw(self, content: str, source: Optional[str] = None) -> tuple[str, EngineConfig]:
-        path, config = self._provider.save_raw(content, source)
+        try:
+            mapping = self._provider.parse_mapping(content)
+        except ConfigDocumentError as exc:
+            raise ConfigurationError(str(exc)) from exc
+        config = self._canonical_from_mapping(mapping)
+        path = self._provider.write_raw(content, source)
         if self._provider.is_default_path(path):
             self._active = self.snapshot(config)
         return path, self.snapshot(config)

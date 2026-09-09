@@ -45,7 +45,10 @@ class RuntimeTrainingHandoff:
     """Reversible runtime-only offload performed before cross-use-case ownership transfer."""
 
     previous_device: str
-    rollback: Callable[[], None]
+    rollback_action: Callable[[], None]
+
+    def rollback(self) -> None:
+        self.rollback_action()
 
 
 class InferenceRuntime:
@@ -162,9 +165,7 @@ class InferenceRuntime:
     @property
     def ready(self) -> bool:
         with self._lock:
-            return (
-                self.model is not None and self.tokenizer is not None and self.generator is not None
-            )
+            return self.tokenizer is not None and self.generator is not None
 
     def set_backend(self, backend: str) -> str:
         cleaned = self.validate_backend(backend)
@@ -291,7 +292,7 @@ class InferenceRuntime:
                 self.generator = previous_generator
                 self.device = previous_device
 
-        return RuntimeTrainingHandoff(previous_device=previous_device, rollback=rollback)
+        return RuntimeTrainingHandoff(previous_device=previous_device, rollback_action=rollback)
 
     def begin_generation(
         self,

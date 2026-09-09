@@ -1,22 +1,20 @@
 """Configuration application contracts.
 
-Only this layer owns the canonical default source. Inner modules receive resolved
-EngineConfig snapshots and never know whether the source was YAML, HTTP or tests.
+Application owns canonical configuration policy. Adapters only decode/encode and
+perform source I/O through this port; they never construct ``EngineConfig``.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional, Protocol, Sequence
-
-from src.core.config import EngineConfig
+from typing import Mapping, Optional, Protocol, Sequence
 
 DEFAULT_CONFIG_PATH = "configs/truyen_kieu.yaml"
 
 
 @dataclass(frozen=True)
 class ConfigRequest:
-    """One request to resolve a canonical EngineConfig."""
+    """One request to resolve canonical application configuration."""
 
     source: Optional[str] = None
     overrides: tuple[str, ...] = ()
@@ -30,16 +28,37 @@ class ConfigRequest:
         return cls(source=source, overrides=tuple(overrides or ()))
 
 
-class ConfigProvider(Protocol):
-    """Port for obtaining and persisting canonical configuration."""
+@dataclass(frozen=True)
+class LoggingSettings:
+    level: str
+    file: str
+
+
+class ConfigDocumentError(ValueError):
+    """Raised when an adapter cannot decode a configuration document."""
+
+
+class ConfigDocumentProvider(Protocol):
+    """Port for config document conversion and I/O only."""
 
     @property
     def default_path(self) -> str: ...
 
-    def load(self, request: ConfigRequest) -> EngineConfig: ...
+    def load_mapping(self, source: Optional[str] = None) -> Mapping[str, object]: ...
+
+    def parse_mapping(self, content: str) -> Mapping[str, object]: ...
 
     def read_raw(self, source: Optional[str] = None) -> tuple[str, str]: ...
 
-    def save_raw(self, content: str, source: Optional[str] = None) -> tuple[str, EngineConfig]: ...
+    def write_raw(self, content: str, source: Optional[str] = None) -> str: ...
 
     def is_default_path(self, path: str) -> bool: ...
+
+
+__all__ = [
+    "DEFAULT_CONFIG_PATH",
+    "ConfigDocumentError",
+    "ConfigDocumentProvider",
+    "ConfigRequest",
+    "LoggingSettings",
+]

@@ -95,8 +95,17 @@ FORBIDDEN_DEPENDENCIES: Dict[str, List[str]] = {
         "src.application",
         "src.adapters",
     ],
-    # Application orchestrates inner capabilities but never knows transport/UI adapters.
-    "src.application": ["src.ui", "src.adapters"],
+    # Application owns use-case orchestration and ports. Runtime mechanics stay behind
+    # those ports and are wired only by composition.
+    "src.application": [
+        "src.ui",
+        "src.adapters",
+        "src.training",
+        "src.inference",
+        "src.generation",
+        "src.core.accelerator",
+        "src.core.concurrency",
+    ],
     # UI is an outer adapter: it may depend on application/adapters, never inner capabilities.
     "src.ui": [
         "src.core",
@@ -106,15 +115,32 @@ FORBIDDEN_DEPENDENCIES: Dict[str, List[str]] = {
         "src.generation",
         "src.utils",
         "src.inference",
+        "src.application.config.service",
+        "src.application.config.gateway",
+        "src.application.inference.service",
+        "src.application.inference.gateway",
+        "src.application.training.service",
+        "src.application.training.background",
+        "src.application.training.launch",
+        "src.application.training.gateway",
     ],
-    # Adapters are outer I/O implementations. Capability bypasses are forbidden below.
+    # Adapters are outer I/O implementations and may depend only on Application contracts.
     "src.adapters": [
+        "src.core",
         "src.data",
         "src.models",
         "src.training",
         "src.generation",
         "src.inference",
         "src.utils",
+        "src.application.config.service",
+        "src.application.config.gateway",
+        "src.application.inference.service",
+        "src.application.inference.gateway",
+        "src.application.training.service",
+        "src.application.training.background",
+        "src.application.training.launch",
+        "src.application.training.gateway",
     ],
 }
 
@@ -133,15 +159,11 @@ FACADE_ONLY_DEPENDENCIES: Dict[str, Dict[str, Tuple[str, ...]]] = {
     "src.application": {
         "src.data": ("src.data.api",),
         "src.models": ("src.models.api",),
-        "src.training": ("src.training.api",),
-        "src.generation": ("src.generation.api",),
-        "src.inference": ("src.inference.api",),
-    },
-    # Adapters may use stable domain/config error contracts, but no core mechanics.
-    "src.adapters": {
-        "src.core": ("src.core.config", "src.core.exceptions"),
     },
 }
+
+# Symbol-level rules remain available for future narrow exceptions.
+FORBIDDEN_IMPORTED_SYMBOLS: Dict[str, Dict[str, Tuple[str, ...]]] = {}
 
 
 def get_module_path(filepath: str, root_dir: Optional[str] = None) -> str:
@@ -267,6 +289,31 @@ def check_architecture_boundaries(
                                 "target_module": target_module,
                                 "forbidden_rule": forbidden,
                                 "reason": f"Module '{matched_rule_source}' không được phép phụ thuộc vào '{forbidden}' (Vi phạm Dependency Inversion / Clean Architecture).",
+                            }
+                        )
+
+                symbol_rules = FORBIDDEN_IMPORTED_SYMBOLS.get(matched_rule_source, {})
+                for module_prefix, forbidden_symbols in symbol_rules.items():
+                    for forbidden_symbol in forbidden_symbols:
+                        forbidden_target = f"{module_prefix}.{forbidden_symbol}"
+                        if target_module != forbidden_target:
+                            continue
+                        violation_key = (lineno, forbidden_target)
+                        if violation_key in seen_violations:
+                            continue
+                        seen_violations.add(violation_key)
+                        violations.append(
+                            {
+                                "filepath": filepath,
+                                "lineno": lineno,
+                                "source_module": source_module,
+                                "rule_scope": matched_rule_source,
+                                "target_module": target_module,
+                                "forbidden_rule": forbidden_target,
+                                "reason": (
+                                    f"Module '{matched_rule_source}' không được import concrete runtime "
+                                    f"'{forbidden_target}'; hãy phụ thuộc Application-owned port."
+                                ),
                             }
                         )
 

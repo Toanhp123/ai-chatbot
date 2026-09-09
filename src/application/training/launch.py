@@ -1,16 +1,15 @@
-"""Application coordinator for starting one Web/interactive training run."""
+"""Application coordinator for starting one interactive/background training run."""
 
 from __future__ import annotations
 
 import logging
 from dataclasses import replace
-from typing import Callable, Optional, Protocol
+from typing import Optional, Protocol
 
-from src.application.inference import InferenceTrainingHandoff
+from src.application.inference.contracts import InferenceTrainingHandoff
 from src.core.config import EngineConfig
-from src.training.api import capture_checkpoint_identity
 
-from .contracts import TrainingCommand, TrainingPlan
+from .contracts import ResumeCheckpointPort, TrainingCommand, TrainingPlan, TrainingStartResult
 
 
 class TrainingStarter(Protocol):
@@ -29,11 +28,8 @@ class TrainingPlanner(Protocol):
     def plan(self, command: TrainingCommand) -> TrainingPlan: ...
 
 
-ResumePathResolver = Callable[[str, str], str]
-
-
 class TrainingLaunchApplicationService:
-    """Coordinate planning, runtime handoff, background start and config commit."""
+    """Coordinate planning, checkpoint pinning, runtime handoff, start and config commit."""
 
     def __init__(
         self,
@@ -42,48 +38,39 @@ class TrainingLaunchApplicationService:
         inference_service: InferenceTrainingCoordinator,
         config_service: ConfigActivator,
         training_application: Optional[TrainingPlanner] = None,
+        checkpoint_port: Optional[ResumeCheckpointPort] = None,
     ) -> None:
         self._training_service = training_service
         self._inference_service = inference_service
         self._config_service = config_service
         self._training_application = training_application
+        self._checkpoint_port = checkpoint_port
 
-    @staticmethod
-    def _capture_checkpoint_identity(path: str) -> tuple[int, int, int, int]:
-        """Delegate revision pinning to the training capability filesystem boundary."""
-        return capture_checkpoint_identity(path)
-
-    def start_command(
-        self,
-        command: TrainingCommand,
-        *,
-        resume_checkpoint: Optional[str] = None,
-        resume_path_resolver: Optional[ResumePathResolver] = None,
-    ) -> TrainingPlan:
-        """Plan and start one run so adapters do not mutate the planned use case."""
+    def start_command(self, command: TrainingCommand) -> TrainingStartResult:
+        """Plan and start one run so adapters cannot mutate the planned use case."""
         if self._training_application is None:
-            raise RuntimeError(
-                "TrainingLaunchApplicationService cần TrainingApplicationService để start command."
-            )
+            raise RuntimeError("Training command planning port chưa được cấu hình.")
         plan = self._training_application.plan(command)
-        if resume_checkpoint:
-            checkpoint_path = (
-                resume_path_resolver(
-                    resume_checkpoint,
-                    plan.requested_config.training.checkpoint_dir,
-                )
-                if resume_path_resolver is not None
-                else resume_checkpoint
+        if command.resume_checkpoint:
+            if self._checkpoint_port is None:
+                raise RuntimeError("Resume checkpoint cần checkpoint port trong composition root.")
+            checkpoint_path = self._checkpoint_port.resolve(
+                command.resume_checkpoint,
+                plan.requested_config.training.checkpoint_dir,
             )
             plan = replace(
                 plan,
                 resume_checkpoint=checkpoint_path,
-                resume_checkpoint_identity=self._capture_checkpoint_identity(checkpoint_path),
+                resume_checkpoint_identity=self._checkpoint_port.capture_identity(checkpoint_path),
             )
-        self.start(plan)
-        return plan
+        self._start_plan(plan)
+        return TrainingStartResult(feasibility=plan.feasibility)
 
     def start(self, plan: TrainingPlan) -> None:
+        """Commit an already-planned run as one reversible Application transaction."""
+        self._start_plan(plan)
+
+    def _start_plan(self, plan: TrainingPlan) -> None:
         """Commit a preplanned run only after reversible runtime handoff succeeds."""
         handoff = self._inference_service.prepare_for_training(plan.runtime_plan.device)
         try:

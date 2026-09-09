@@ -323,7 +323,7 @@ def test_training_start_reuses_preflight_runtime_plan_for_worker() -> None:
     )
     app = create_app()
     start_training_mock = Mock()
-    app.state.training_service.start_training = start_training_mock
+    app.state.services.training._background.start_training = start_training_mock
 
     with (
         patch(
@@ -612,7 +612,7 @@ def test_ui_checkpoint_load_invalid_backend_is_400(client: TestClient):
 
 
 def test_ui_stop_words_preserve_multi_token_sequences(client: TestClient, monkeypatch):
-    service = _app_state(client).inference_service
+    service = _app_state(client).services.inference._service
     captured = {}
 
     class FakeSession:
@@ -648,7 +648,7 @@ def test_ui_stop_words_preserve_multi_token_sequences(client: TestClient, monkey
 def test_ui_checkpoint_download_uses_inference_service_directory(client: TestClient, tmp_path):
     import torch
 
-    service = _app_state(client).inference_service
+    service = _app_state(client).services.inference._service
     old_dir = service.checkpoint_dir
     custom_dir = tmp_path / "custom-checkpoints"
     custom_dir.mkdir()
@@ -671,14 +671,14 @@ def test_ui_training_feasibility_does_not_silently_ignore_zero_override(client: 
 def test_ui_training_start_commits_inference_checkpoint_dir_only_after_start_succeeds(
     client: TestClient, monkeypatch
 ):
-    training_service = _app_state(client).training_service
-    inference_service = _app_state(client).inference_service
+    training_service = _app_state(client).services.training
+    inference_service = _app_state(client).services.inference._service
     committed_dirs = []
 
     def reject_start(*args, **kwargs):
         raise RuntimeError("already running")
 
-    monkeypatch.setattr(training_service, "start_training", reject_start)
+    monkeypatch.setattr(training_service._background, "start_training", reject_start)
     monkeypatch.setattr(
         inference_service, "set_checkpoint_dir", lambda path: committed_dirs.append(path)
     )
@@ -697,7 +697,7 @@ def test_ui_checkpoint_download_rejects_symlink_escape(client: TestClient, tmp_p
     if not hasattr(os, "symlink"):
         pytest.skip("symlink unavailable")
 
-    service = _app_state(client).inference_service
+    service = _app_state(client).services.inference._service
     old_dir = service.checkpoint_dir
     checkpoint_dir = tmp_path / "checkpoints"
     checkpoint_dir.mkdir()
@@ -849,7 +849,7 @@ def test_training_start_accepts_canonical_dotted_overrides_without_schema_copy()
     )
     app = create_app()
     start_mock = Mock()
-    app.state.training_service.start_training = start_mock
+    app.state.services.training._background.start_training = start_mock
 
     with (
         patch("src.application.training.service.resolve_training_plan", return_value=runtime_plan),
@@ -883,7 +883,7 @@ def test_training_start_rejects_unknown_canonical_override_key_before_worker_sta
 
     app = create_app()
     start_mock = Mock()
-    app.state.training_service.start_training = start_mock
+    app.state.services.training._background.start_training = start_mock
 
     with TestClient(app) as local_client:
         response = local_client.post(
@@ -940,10 +940,10 @@ def test_ui_training_resume_rejects_checkpoint_outside_configured_dir(
 ):
     outside = tmp_path / "outside.pt"
     outside.write_bytes(b"checkpoint")
-    training_service = _app_state(client).training_service
+    training_service = _app_state(client).services.training
     start_calls = []
     monkeypatch.setattr(
-        training_service,
+        training_service._background,
         "start_training",
         lambda *args, **kwargs: start_calls.append((args, kwargs)),
     )
@@ -959,7 +959,7 @@ def test_ui_training_resume_rejects_checkpoint_outside_configured_dir(
 
 
 def test_ui_generate_accepts_zero_top_k_as_disabled_filter(client: TestClient, monkeypatch):
-    service = _app_state(client).inference_service
+    service = _app_state(client).services.inference._service
 
     class FakeSession:
         def iter_events(self):
@@ -995,7 +995,7 @@ def test_ui_generate_accepts_zero_top_k_as_disabled_filter(client: TestClient, m
 def test_ui_generation_busy_is_rejected_before_sse_response(client: TestClient, monkeypatch):
     from src.core.exceptions import GenerationBusyError
 
-    service = _app_state(client).inference_service
+    service = _app_state(client).services.inference._service
 
     def busy(*args, **kwargs):
         raise GenerationBusyError(active=2, limit=2)
@@ -1011,7 +1011,7 @@ def test_ui_generation_busy_is_rejected_before_sse_response(client: TestClient, 
 
 
 def test_ui_generate_rejects_too_many_stop_words_before_service(client: TestClient, monkeypatch):
-    service = _app_state(client).inference_service
+    service = _app_state(client).services.inference._service
     calls = []
     monkeypatch.setattr(
         service,
@@ -1030,7 +1030,7 @@ def test_ui_generate_rejects_too_many_stop_words_before_service(client: TestClie
 
 
 def test_ui_generate_rejects_oversized_stop_word_before_service(client: TestClient, monkeypatch):
-    service = _app_state(client).inference_service
+    service = _app_state(client).services.inference._service
     calls = []
     monkeypatch.setattr(
         service,
@@ -1063,7 +1063,7 @@ def test_training_start_preserves_run_name_from_resolved_yaml(tmp_path, monkeypa
 
     app = create_app()
     start_mock = Mock()
-    app.state.training_service.start_training = start_mock
+    app.state.services.training._background.start_training = start_mock
 
     with TestClient(app) as local_client:
         response = local_client.post(
@@ -1091,7 +1091,7 @@ def test_create_app_bootstraps_inference_from_canonical_engine_config(tmp_path, 
     )
 
     app = create_app()
-    service = app.state.inference_service
+    service = app.state.services.inference._service
 
     assert service.checkpoint_dir == "custom/checkpoints"
     assert service.checkpoint_name == "champion.pt"
@@ -1137,7 +1137,7 @@ def test_ui_generate_omitted_sampling_fields_inherit_canonical_generation_config
 ):
     from src.core.config import GenerationConfig
 
-    service = _app_state(client).inference_service
+    service = _app_state(client).services.inference._service
     service.default_generation_config = GenerationConfig(
         max_new_tokens=77,
         temperature=0.23,
@@ -1266,7 +1266,7 @@ def test_explorer_dataset_sample_serializes_paths_with_stable_forward_slashes(
     client: TestClient, monkeypatch
 ):
     """Explorer wire paths stay platform-neutral even when runtime paths use Windows separators."""
-    service = _app_state(client).inference_service
+    service = _app_state(client).services.inference._service
     original = service.get_engine_config()
     cfg = original.copy(
         data=original.data.copy(
@@ -1291,7 +1291,7 @@ def test_explorer_dataset_sample_uses_active_engine_config(client: TestClient, t
     from src.data.tokenizers import CharTokenizer
 
     state = _app_state(client)
-    service = state.inference_service
+    service = state.services.inference._service
     original = service.get_engine_config()
     input_file = tmp_path / "active-corpus.txt"
     vocab_file = tmp_path / "active-vocab.json"
@@ -1319,9 +1319,9 @@ def test_explorer_char_tokenizer_does_not_reuse_incompatible_loaded_byte_tokeniz
     from src.data.tokenizers import ByteTokenizer, CharTokenizer
 
     state = _app_state(client)
-    service = state.inference_service
+    service = state.services.inference._service
     original_config = service.get_engine_config()
-    original_tokenizer = service.tokenizer
+    original_tokenizer = service._runtime.tokenizer
     vocab_file = tmp_path / "char-vocab.json"
     CharTokenizer(text="Trăm năm").save_vocab(str(vocab_file))
     cfg = original_config.copy(
@@ -1329,14 +1329,14 @@ def test_explorer_char_tokenizer_does_not_reuse_incompatible_loaded_byte_tokeniz
     )
     try:
         service.apply_engine_config(cfg)
-        service.tokenizer = ByteTokenizer()
+        service._runtime.tokenizer = ByteTokenizer()
         res = client.post("/api/explorer/tokenize", json={"text": "Trăm", "tokenizer_type": "char"})
         assert res.status_code == 200
         data = res.json()
         assert data["tokenizer_type"] == "char"
         assert len(data["token_ids"]) <= len("Trăm")
     finally:
-        service.tokenizer = original_tokenizer
+        service._runtime.tokenizer = original_tokenizer
         service.apply_engine_config(original_config)
 
 
@@ -1355,7 +1355,7 @@ def test_slow_checkpoint_listing_does_not_block_control_plane(client: TestClient
 
     import httpx
 
-    service = _app_state(client).inference_service
+    service = _app_state(client).services.inference._service
 
     def slow_list_checkpoints():
         time.sleep(0.20)
@@ -1385,7 +1385,7 @@ def test_slow_checkpoint_load_does_not_block_control_plane(client: TestClient, m
 
     import httpx
 
-    service = _app_state(client).inference_service
+    service = _app_state(client).services.inference._service
 
     def slow_load_checkpoint(path, backend=None, **kwargs):
         time.sleep(0.20)
@@ -1425,7 +1425,7 @@ def test_slow_training_start_handoff_does_not_block_control_plane(client: TestCl
     def slow_start_training(*args, **kwargs):
         time.sleep(0.20)
 
-    monkeypatch.setattr(state.training_service, "start_training", slow_start_training)
+    monkeypatch.setattr(state.services.training._background, "start_training", slow_start_training)
 
     async def exercise():
         transport = httpx.ASGITransport(app=client.app)
@@ -1455,7 +1455,7 @@ def test_slow_inference_state_read_does_not_block_control_plane(client: TestClie
 
     import httpx
 
-    service = _app_state(client).inference_service
+    service = _app_state(client).services.inference._service
     original = service.get_runtime_state
 
     def slow_state():
@@ -1489,7 +1489,7 @@ def test_slow_generation_admission_does_not_block_control_plane(client: TestClie
 
     from src.core.exceptions import GenerationNotReadyError
 
-    service = _app_state(client).inference_service
+    service = _app_state(client).services.inference._service
 
     def slow_begin(*args, **kwargs):
         time.sleep(0.20)
@@ -1519,14 +1519,14 @@ def test_slow_generation_admission_does_not_block_control_plane(client: TestClie
 def test_checkpoint_load_response_uses_authoritative_service_path(client: TestClient, monkeypatch):
     import os
 
-    service = _app_state(client).inference_service
+    service = _app_state(client).services.inference._service
     canonical_path = os.path.abspath(os.path.join(service.checkpoint_dir, "best.pt")).replace(
         "\\", "/"
     )
 
     def fake_load_checkpoint(path, backend=None, **kwargs):
-        service.current_checkpoint_path = canonical_path
-        service._current_checkpoint_identity = (1, 2, 3, 4)
+        service._runtime.current_checkpoint_path = canonical_path
+        service._runtime.current_checkpoint_identity = (1, 2, 3, 4)
 
     monkeypatch.setattr(service, "load_checkpoint", fake_load_checkpoint)
 
@@ -1575,8 +1575,8 @@ def test_auto_training_run_names_are_collision_resistant():
 def test_ui_training_start_prepares_inference_residency_before_gpu_training(
     client: TestClient, monkeypatch
 ):
-    training_service = _app_state(client).training_service
-    inference_service = _app_state(client).inference_service
+    training_service = _app_state(client).services.training
+    inference_service = _app_state(client).services.inference._service
     calls = []
 
     from src.core.runtime import ResolvedTrainingPlan
@@ -1602,7 +1602,7 @@ def test_ui_training_start_prepares_inference_residency_before_gpu_training(
         "src.application.training.service.check_memory_feasibility",
         lambda **kwargs: (True, "ok", {"total_estimated_gb": 0.1, "total_estimated_mb": 100}),
     )
-    from src.application.inference import InferenceTrainingHandoff
+    from src.application.inference.contracts import InferenceTrainingHandoff
 
     def fake_prepare_for_training(device):
         calls.append(("prepare", device))
@@ -1615,7 +1615,7 @@ def test_ui_training_start_prepares_inference_residency_before_gpu_training(
         raising=False,
     )
     monkeypatch.setattr(
-        training_service,
+        training_service._background,
         "start_training",
         lambda *args, **kwargs: calls.append(("start", kwargs["plan"].runtime_plan.device)),
     )
@@ -1634,8 +1634,8 @@ def test_ui_training_start_pins_resume_checkpoint_revision(
 
     from src.core.runtime import ResolvedTrainingPlan
 
-    training_service = _app_state(client).training_service
-    inference_service = _app_state(client).inference_service
+    training_service = _app_state(client).services.training
+    inference_service = _app_state(client).services.inference._service
     checkpoint_dir = tmp_path / "checkpoints"
     checkpoint_dir.mkdir()
     checkpoint = checkpoint_dir / "resume.pt"
@@ -1665,7 +1665,7 @@ def test_ui_training_start_pins_resume_checkpoint_revision(
         "src.application.training.service.check_memory_feasibility",
         lambda **kwargs: (True, "ok", {"total_estimated_gb": 0.1, "total_estimated_mb": 100}),
     )
-    from src.application.inference import InferenceTrainingHandoff
+    from src.application.inference.contracts import InferenceTrainingHandoff
 
     monkeypatch.setattr(
         inference_service,
@@ -1677,7 +1677,7 @@ def test_ui_training_start_pins_resume_checkpoint_revision(
     def fake_start(*args, **kwargs):
         captured.update(kwargs)
 
-    monkeypatch.setattr(training_service, "start_training", fake_start)
+    monkeypatch.setattr(training_service._background, "start_training", fake_start)
 
     response = client.post(
         "/api/training/start",
@@ -1694,21 +1694,21 @@ def test_ui_training_start_pins_resume_checkpoint_revision(
 def test_ui_training_start_reports_resume_disappeared_during_revision_pin(
     client: TestClient, monkeypatch, tmp_path
 ):
-    training_service = _app_state(client).training_service
-    inference_service = _app_state(client).inference_service
+    training_service = _app_state(client).services.training
+    inference_service = _app_state(client).services.inference._service
     checkpoint_dir = tmp_path / "checkpoints"
     checkpoint_dir.mkdir()
     checkpoint = checkpoint_dir / "resume.pt"
     checkpoint.write_bytes(b"exists-at-validation")
 
-    launch_service = _app_state(client).training_launch_service
+    launch_service = _app_state(client).services.training._launcher
     monkeypatch.setattr(
-        launch_service,
-        "_capture_checkpoint_identity",
+        launch_service._checkpoint_port,
+        "capture_identity",
         lambda path: (_ for _ in ()).throw(FileNotFoundError(path)),
     )
 
-    from src.application.inference import InferenceTrainingHandoff
+    from src.application.inference.contracts import InferenceTrainingHandoff
 
     monkeypatch.setattr(
         inference_service,
@@ -1716,7 +1716,9 @@ def test_ui_training_start_reports_resume_disappeared_during_revision_pin(
         lambda device: InferenceTrainingHandoff(),
     )
     monkeypatch.setattr(inference_service, "apply_engine_config", lambda config: None)
-    monkeypatch.setattr(training_service, "start_training", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        training_service._background, "start_training", lambda *args, **kwargs: None
+    )
 
     response = client.post(
         "/api/training/start",

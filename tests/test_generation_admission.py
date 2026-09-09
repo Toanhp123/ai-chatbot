@@ -79,9 +79,9 @@ class _Generator(BaseGenerator):
 
 
 def test_generation_admission_manager_owns_session_limit_and_release():
-    from src.application.inference.generation_admission import GenerationAdmissionManager
+    from src.inference.admission import GenerationAdmission
 
-    manager = GenerationAdmissionManager(max_sessions=1)
+    manager = GenerationAdmission(max_sessions=1)
     release = manager.acquire(
         prompt="hello",
         config=GenerationConfig(max_new_tokens=1),

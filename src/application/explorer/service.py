@@ -4,7 +4,8 @@ from __future__ import annotations
 
 from typing import Any, Dict, Optional
 
-from src.application.config import ConfigRequest, ConfigurationService
+from src.application.config import ConfigRequest
+from src.application.config.service import ConfigurationService
 from src.application.data_policy import build_application_cleaner, prepare_application_dataset
 from src.data.api import (
     FALLBACK_CORPUS,

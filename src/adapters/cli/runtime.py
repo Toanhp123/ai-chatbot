@@ -7,7 +7,7 @@ import os
 from logging.handlers import RotatingFileHandler
 from typing import List
 
-from src.core.config import EngineConfig
+from src.application.config import LoggingSettings
 
 _MANAGED_HANDLERS: List[logging.Handler] = []
 
@@ -45,9 +45,8 @@ def _build_console_handler(level: int) -> logging.Handler:
     return handler
 
 
-def _configure_process_logging(config: EngineConfig, *, name: str) -> logging.Logger:
-    system = config.system
-    level = getattr(logging, str(system.log_level).upper(), logging.INFO)
+def _configure_process_logging(settings: LoggingSettings, *, name: str) -> logging.Logger:
+    level = getattr(logging, settings.level.upper(), logging.INFO)
     root = logging.getLogger()
 
     for handler in list(_MANAGED_HANDLERS):
@@ -63,8 +62,8 @@ def _configure_process_logging(config: EngineConfig, *, name: str) -> logging.Lo
     root.addHandler(console)
     _MANAGED_HANDLERS.append(console)
 
-    if system.log_file:
-        path = os.path.abspath(system.log_file)
+    if settings.file:
+        path = os.path.abspath(settings.file)
         os.makedirs(os.path.dirname(path), exist_ok=True)
         file_handler = RotatingFileHandler(
             path,
@@ -81,9 +80,9 @@ def _configure_process_logging(config: EngineConfig, *, name: str) -> logging.Lo
     return logging.getLogger(name)
 
 
-def configure_cli_logging(config: EngineConfig, *, name: str = "ai-train") -> logging.Logger:
-    """Apply canonical config to process logging at the outer CLI boundary."""
-    return _configure_process_logging(config, name=name)
+def configure_cli_logging(settings: LoggingSettings, *, name: str = "ai-train") -> logging.Logger:
+    """Apply Application-owned logging settings at the outer CLI boundary."""
+    return _configure_process_logging(settings, name=name)
 
 
 __all__ = ["configure_cli_logging"]

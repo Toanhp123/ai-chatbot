@@ -1,16 +1,17 @@
-"""YAML implementation of the application ConfigProvider port."""
+"""YAML config-document adapter: decode/encode and atomic file I/O only."""
 
 from __future__ import annotations
 
 import os
 import tempfile
-from typing import Optional
+from typing import Mapping, Optional
 
 import yaml
 
-from src.application.config.contracts import DEFAULT_CONFIG_PATH, ConfigRequest
-from src.core.config import EngineConfig, apply_overrides
-from src.core.exceptions import ConfigurationError
+from src.application.config.contracts import (
+    DEFAULT_CONFIG_PATH,
+    ConfigDocumentError,
+)
 
 
 class YamlConfigProvider:
@@ -29,16 +30,31 @@ class YamlConfigProvider:
             os.path.abspath(self._default_path)
         )
 
-    def load(self, request: ConfigRequest) -> EngineConfig:
-        path = self._path(request.source)
-        if request.source is None and not os.path.isfile(path):
-            config = EngineConfig()
-            if request.overrides:
-                config = EngineConfig.from_dict(
-                    apply_overrides(config.to_dict(), request.overrides)
-                )
-            return config
-        return EngineConfig.from_yaml(path, overrides=request.overrides or None)
+    @staticmethod
+    def _decode(content: str) -> Mapping[str, object]:
+        try:
+            parsed = yaml.safe_load(content)
+        except yaml.YAMLError as exc:
+            raise ConfigDocumentError(f"Lỗi phân tích cú pháp YAML: {exc}") from exc
+        if parsed is None:
+            return {}
+        if not isinstance(parsed, dict):
+            raise ConfigDocumentError(
+                "Nội dung YAML phải là một dictionary/mapping ở cấp cao nhất."
+            )
+        return parsed
+
+    def load_mapping(self, source: Optional[str] = None) -> Mapping[str, object]:
+        path = self._path(source)
+        if source is None and not os.path.isfile(path):
+            return {}
+        if not os.path.isfile(path):
+            raise FileNotFoundError(f"Không tìm thấy file cấu hình: {path}")
+        with open(path, "r", encoding="utf-8") as handle:
+            return self._decode(handle.read())
+
+    def parse_mapping(self, content: str) -> Mapping[str, object]:
+        return self._decode(content)
 
     def read_raw(self, source: Optional[str] = None) -> tuple[str, str]:
         path = self._path(source)
@@ -47,18 +63,8 @@ class YamlConfigProvider:
         with open(path, "r", encoding="utf-8") as handle:
             return path, handle.read()
 
-    def save_raw(self, content: str, source: Optional[str] = None) -> tuple[str, EngineConfig]:
+    def write_raw(self, content: str, source: Optional[str] = None) -> str:
         path = self._path(source)
-        try:
-            parsed = yaml.safe_load(content)
-        except yaml.YAMLError as exc:
-            raise ConfigurationError(f"Lỗi phân tích cú pháp YAML: {exc}") from exc
-        if parsed is None:
-            parsed = {}
-        if not isinstance(parsed, dict):
-            raise ConfigurationError("Nội dung YAML phải là một dictionary/mapping ở cấp cao nhất.")
-        validated = EngineConfig.from_dict(parsed)
-
         target_dir = os.path.dirname(os.path.abspath(path))
         os.makedirs(target_dir, exist_ok=True)
         fd, temp_path = tempfile.mkstemp(prefix=".config-", suffix=".yaml", dir=target_dir)
@@ -74,4 +80,4 @@ class YamlConfigProvider:
             except FileNotFoundError:
                 pass
             raise
-        return path, validated
+        return path

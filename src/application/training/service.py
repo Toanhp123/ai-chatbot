@@ -1,4 +1,4 @@
-"""Training application use cases: resolve, preflight, prepare and execute."""
+"""Training application use cases: policy, planning and runtime delegation."""
 
 from __future__ import annotations
 
@@ -6,38 +6,46 @@ import time
 import uuid
 from typing import Callable, Optional
 
-from src.application.config import ConfigRequest, ConfigurationService
+from src.application.config import ConfigRequest
+from src.application.config.service import ConfigurationService
 from src.application.data_policy import prepare_application_dataset
 from src.core.config import EngineConfig
 from src.core.diagnostics import check_memory_feasibility
+from src.core.exceptions import TrainingPreparationCancelled
 from src.core.runtime import ResolvedTrainingPlan, resolve_training_plan
 from src.data.api import FALLBACK_CORPUS
-from src.training.api import (
-    PreparedTrainingRun,
-    TrainingObserver,
-    TrainingRunFactory,
-    TrainOutput,
-)
 
-from .contracts import TrainingCommand, TrainingFeasibility, TrainingPlan
+from .contracts import (
+    PreparedTraining,
+    TrainingCommand,
+    TrainingExecutionResult,
+    TrainingFeasibility,
+    TrainingObserver,
+    TrainingPlan,
+    TrainingRuntimePort,
+)
 
 
 def generate_run_name() -> str:
     return f"kieu_{time.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
 
 
+def _termination_value(value: object) -> str:
+    raw = getattr(value, "value", value)
+    return str(raw)
+
+
 class TrainingApplicationService:
-    """Own training use-case policy while delegating runtime mechanics."""
+    """Own training use-case policy while delegating trainer mechanics through a port."""
 
     def __init__(
         self,
+        *,
+        runtime: TrainingRuntimePort,
         config_service: Optional[ConfigurationService] = None,
-        run_factory: Optional[TrainingRunFactory] = None,
     ) -> None:
         self.config_service = config_service
-        # ``run_factory`` remains as a compatibility injection point, but its
-        # implementation is capability-owned rather than Application-owned.
-        self.run_factory = run_factory or TrainingRunFactory()
+        self._runtime = runtime
 
     def plan(
         self,
@@ -81,8 +89,10 @@ class TrainingApplicationService:
                 estimated_mb=float(budget.get("total_estimated_mb", 0.0)),
             ),
             resume_checkpoint=command.resume_checkpoint,
-            resume_checkpoint_identity=command.resume_checkpoint_identity,
         )
+
+    def check_feasibility(self, command: TrainingCommand) -> TrainingFeasibility:
+        return self.plan(command, assign_run_name=False).feasibility
 
     def prepare(
         self,
@@ -91,12 +101,10 @@ class TrainingApplicationService:
         observer: Optional[TrainingObserver] = None,
         abort_check: Optional[Callable[[], bool]] = None,
         log_interval: int = 10,
-    ) -> PreparedTrainingRun:
-        """Apply data-selection policy, then delegate trainer mechanics."""
+    ) -> PreparedTraining:
+        """Apply Application data-selection policy, then delegate trainer mechanics."""
         if abort_check is not None and abort_check():
-            from src.training.api import TrainingPreparationAborted
-
-            raise TrainingPreparationAborted()
+            raise TrainingPreparationCancelled()
 
         effective = ConfigurationService.snapshot(plan.config)
         train_data, val_data, tokenizer = prepare_application_dataset(
@@ -106,11 +114,9 @@ class TrainingApplicationService:
             persist_fallback=True,
         )
         if abort_check is not None and abort_check():
-            from src.training.api import TrainingPreparationAborted
+            raise TrainingPreparationCancelled()
 
-            raise TrainingPreparationAborted()
-
-        return self.run_factory.prepare(
+        runtime_run = self._runtime.prepare(
             config=effective,
             runtime_plan=plan.runtime_plan,
             train_data=train_data,
@@ -120,11 +126,28 @@ class TrainingApplicationService:
             abort_check=abort_check,
             log_interval=log_interval,
         )
+        return PreparedTraining(runtime_run=runtime_run, control=runtime_run.trainer)
 
-    def execute(self, prepared: PreparedTrainingRun, plan: TrainingPlan) -> TrainOutput:
+    def execute(self, prepared: PreparedTraining, plan: TrainingPlan) -> TrainingExecutionResult:
         """Execute a prepared capability run with Application-owned resume policy."""
-        return self.run_factory.execute(
-            prepared,
+        output = self._runtime.execute(
+            prepared.runtime_run,
             resume_checkpoint=plan.resume_checkpoint,
             resume_checkpoint_identity=plan.resume_checkpoint_identity,
         )
+        return TrainingExecutionResult(
+            interrupted=bool(output.interrupted),
+            termination_reason=_termination_value(output.termination_reason),
+        )
+
+    def run(
+        self,
+        command: TrainingCommand,
+        *,
+        observer: Optional[TrainingObserver] = None,
+        log_interval: int = 10,
+    ) -> TrainingExecutionResult:
+        """Synchronous training use case used by CLI adapters."""
+        plan = self.plan(command)
+        prepared = self.prepare(plan, observer=observer, log_interval=log_interval)
+        return self.execute(prepared, plan)

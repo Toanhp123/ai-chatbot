@@ -1,3 +1,3 @@
-from .accelerator import AcceleratorCoordinator, same_accelerator_family
+from .contracts import AcceleratorPort, SynchronizationPort, same_accelerator_family
 
-__all__ = ["AcceleratorCoordinator", "same_accelerator_family"]
+__all__ = ["AcceleratorPort", "SynchronizationPort", "same_accelerator_family"]

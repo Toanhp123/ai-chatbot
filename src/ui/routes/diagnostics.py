@@ -50,13 +50,13 @@ def _safe_config_path(path: Optional[str]) -> Optional[str]:
 
 @router.get("/system")
 async def get_system_diagnostics(request: Request):
-    return await asyncio.to_thread(request.app.state.diagnostics_service.system)
+    return await asyncio.to_thread(request.app.state.services.diagnostics.system)
 
 
 @router.post("/estimate")
 async def estimate_vram_endpoint(req: VRAMEstimateRequest, request: Request):
     return await asyncio.to_thread(
-        request.app.state.diagnostics_service.estimate,
+        request.app.state.services.diagnostics.estimate,
         req.to_application(),
     )
 
@@ -64,19 +64,19 @@ async def estimate_vram_endpoint(req: VRAMEstimateRequest, request: Request):
 @router.post("/scenarios")
 async def scenarios_endpoint(req: VRAMEstimateRequest, request: Request):
     return await asyncio.to_thread(
-        request.app.state.diagnostics_service.scenarios,
+        request.app.state.services.diagnostics.scenarios,
         req.to_application(),
     )
 
 
 @router.get("/advisor")
 async def get_hardware_advisor_endpoint(request: Request):
-    return await asyncio.to_thread(request.app.state.diagnostics_service.advisor)
+    return await asyncio.to_thread(request.app.state.services.diagnostics.advisor)
 
 
 @router.post("/gates/run")
 async def run_quality_gates_endpoint(request: Request):
-    return await asyncio.to_thread(request.app.state.diagnostics_runtime_adapter.run_quality_gates)
+    return await asyncio.to_thread(request.app.state.services.diagnostics.run_quality_gates)
 
 
 @router.get("/inspect")
@@ -90,7 +90,7 @@ async def inspect_model_endpoint(
     block_size: Optional[int] = None,
 ):
     return await asyncio.to_thread(
-        request.app.state.diagnostics_service.inspect,
+        request.app.state.services.diagnostics.inspect,
         source=_safe_config_path(config_path),
         model_name=model_name,
         n_embd=n_embd,
@@ -102,4 +102,4 @@ async def inspect_model_endpoint(
 
 @router.get("/logs")
 async def get_system_logs_endpoint(request: Request, lines: int = 80):
-    return await asyncio.to_thread(request.app.state.diagnostics_runtime_adapter.logs, lines)
+    return await asyncio.to_thread(request.app.state.services.diagnostics.logs, lines)

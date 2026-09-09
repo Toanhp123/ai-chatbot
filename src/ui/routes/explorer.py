@@ -82,13 +82,13 @@ def _present_tokenize_result(result: dict) -> dict:
 
 @router.post("/clean")
 async def clean_endpoint(req: CleanRequest, request: Request):
-    return request.app.state.explorer_service.clean(**req.model_dump())
+    return request.app.state.services.explorer.clean(**req.model_dump())
 
 
 @router.post("/tokenize")
 async def tokenize_endpoint(req: TokenizeRequest, request: Request):
     try:
-        result = request.app.state.explorer_service.tokenize(
+        result = request.app.state.services.explorer.tokenize(
             text=req.text,
             tokenizer_type=req.tokenizer_type,
             source=_safe_config_path(req.config_path),
@@ -103,7 +103,7 @@ async def tokenize_endpoint(req: TokenizeRequest, request: Request):
 @router.get("/dataset-sample")
 async def get_dataset_sample(request: Request, config_path: Optional[str] = None):
     return await asyncio.to_thread(
-        request.app.state.explorer_service.dataset_sample,
+        request.app.state.services.explorer.dataset_sample,
         _safe_config_path(config_path),
     )
 
@@ -111,7 +111,7 @@ async def get_dataset_sample(request: Request, config_path: Optional[str] = None
 @router.post("/export-binary")
 async def export_binary_endpoint(request: Request, config_path: Optional[str] = None):
     return await asyncio.to_thread(
-        request.app.state.explorer_service.export_binary,
+        request.app.state.services.explorer.export_binary,
         _safe_config_path(config_path),
     )
 
@@ -122,7 +122,7 @@ async def compare_tokenizers_endpoint(
     request: Request,
     config_path: Optional[str] = None,
 ):
-    return request.app.state.explorer_service.compare_tokenizers(
+    return request.app.state.services.explorer.compare_tokenizers(
         text=req.text,
         source=_safe_config_path(config_path),
     )

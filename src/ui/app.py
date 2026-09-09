@@ -9,18 +9,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 
-from src.adapters.config import YamlConfigProvider
-from src.adapters.diagnostics import DiagnosticsRuntimeAdapter
-from src.application.config import ConfigurationService
-from src.application.diagnostics import DiagnosticsApplicationService
-from src.application.explorer import ExplorerApplicationService
-from src.application.inference import InferenceService
-from src.application.runtime import AcceleratorCoordinator
-from src.application.training import (
-    TrainingApplicationService,
-    TrainingLaunchApplicationService,
-    TrainingService,
-)
+from src.composition import build_application_services
 from src.ui.errors import register_ai_engine_error_handlers
 from src.ui.routes.diagnostics import router as diagnostics_router
 from src.ui.routes.explorer import router as explorer_router
@@ -46,32 +35,8 @@ def create_app() -> FastAPI:
         allow_headers=["*"],
     )
 
-    # One composition root: adapters provide config I/O, application services own use cases.
-    config_provider = YamlConfigProvider()
-    config_service = ConfigurationService(config_provider)
-    boot_config = config_service.activate(config_service.resolve())
-    app.state.configuration_service = config_service
-    app.state.config_path = os.path.realpath(os.path.abspath(config_service.default_path))
-    app.state.accelerator_coordinator = AcceleratorCoordinator()
-    app.state.inference_service = InferenceService.from_engine_config(
-        boot_config,
-        accelerator_coordinator=app.state.accelerator_coordinator,
-        config_service=config_service,
-    )
-    app.state.training_application = TrainingApplicationService(config_service)
-    app.state.training_service = TrainingService(
-        accelerator_coordinator=app.state.accelerator_coordinator,
-        training_application=app.state.training_application,
-    )
-    app.state.training_launch_service = TrainingLaunchApplicationService(
-        training_service=app.state.training_service,
-        inference_service=app.state.inference_service,
-        config_service=config_service,
-        training_application=app.state.training_application,
-    )
-    app.state.diagnostics_service = DiagnosticsApplicationService(config_service)
-    app.state.diagnostics_runtime_adapter = DiagnosticsRuntimeAdapter()
-    app.state.explorer_service = ExplorerApplicationService(config_service)
+    # The UI adapter sees one typed gateway; concrete assembly lives in src.composition.
+    app.state.services = build_application_services()
 
     # Đăng ký các Route API
     app.include_router(inference_router)

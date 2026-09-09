@@ -77,18 +77,18 @@ class SaveConfigRequest(BaseModel):
 
 @router.get("/generators")
 async def list_generators_endpoint(request: Request):
-    service = request.app.state.inference_service
+    service = request.app.state.services.inference
     return {"generators": service.list_generators(), "current_backend": service.current_backend}
 
 
 @router.get("/inference/state")
 async def get_inference_state_endpoint(request: Request):
-    return await asyncio.to_thread(request.app.state.inference_service.get_runtime_state)
+    return await asyncio.to_thread(request.app.state.services.inference.get_runtime_state)
 
 
 @router.post("/generators/select")
 async def select_generator_endpoint(req: SelectGeneratorRequest, request: Request):
-    service = request.app.state.inference_service
+    service = request.app.state.services.inference
     try:
         service.set_backend(req.backend)
         return {
@@ -105,7 +105,7 @@ async def select_generator_endpoint(req: SelectGeneratorRequest, request: Reques
 @router.post("/generate/stream")
 async def generate_stream_endpoint(req: GenerateRequest, request: Request):
     session = await asyncio.to_thread(
-        request.app.state.inference_service.begin_generation_command,
+        request.app.state.services.inference.begin_generation_command,
         req.to_application(),
     )
     return GenerationStreamingResponse(
@@ -122,13 +122,15 @@ async def generate_stream_endpoint(req: GenerateRequest, request: Request):
 @router.get("/checkpoints")
 async def list_checkpoints_endpoint(request: Request):
     return {
-        "checkpoints": await asyncio.to_thread(request.app.state.inference_service.list_checkpoints)
+        "checkpoints": await asyncio.to_thread(
+            request.app.state.services.inference.list_checkpoints
+        )
     }
 
 
 @router.post("/checkpoints/load")
 async def load_checkpoint_endpoint(req: LoadCheckpointRequest, request: Request):
-    service = request.app.state.inference_service
+    service = request.app.state.services.inference
     try:
         await asyncio.to_thread(
             service.load_checkpoint,
@@ -157,7 +159,7 @@ async def load_checkpoint_endpoint(req: LoadCheckpointRequest, request: Request)
 @router.delete("/checkpoints/{filename}")
 async def delete_checkpoint_endpoint(filename: str, request: Request):
     try:
-        request.app.state.inference_service.delete_checkpoint(filename)
+        request.app.state.services.inference.delete_checkpoint(filename)
         return {"status": "success", "message": f"Đã xóa checkpoint: {filename}"}
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
@@ -171,7 +173,7 @@ async def delete_checkpoint_endpoint(filename: str, request: Request):
 async def download_checkpoint_endpoint(filename: str, request: Request):
     safe_filename = os.path.basename(filename)
     try:
-        path = request.app.state.inference_service.resolve_checkpoint_path(
+        path = request.app.state.services.inference.resolve_checkpoint_path(
             safe_filename, filename_only=True
         )
     except ValueError as exc:
@@ -185,15 +187,13 @@ async def download_checkpoint_endpoint(filename: str, request: Request):
 
 @router.get("/models")
 async def list_models_endpoint(request: Request):
-    return {"models": request.app.state.inference_service.list_models()}
+    return {"models": request.app.state.services.inference.list_models()}
 
 
 @router.get("/configs/raw")
 async def get_raw_config_endpoint(request: Request, path: Optional[str] = None):
     try:
-        resolved_path, content = request.app.state.configuration_service.read_raw(
-            _safe_config_path(path)
-        )
+        resolved_path, content = request.app.state.services.config.read_raw(_safe_config_path(path))
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     return {"path": resolved_path, "content": content}
@@ -203,7 +203,7 @@ async def get_raw_config_endpoint(request: Request, path: Optional[str] = None):
 async def save_raw_config_endpoint(req: SaveConfigRequest, request: Request):
     source = _safe_config_path(req.path)
     try:
-        path, _config = request.app.state.configuration_service.save_raw(req.content, source)
+        path = request.app.state.services.config.save_raw(req.content, source)
     except ConfigurationError:
         raise
     return {"status": "success", "message": f"Đã lưu cấu hình thành công: {path}", "path": path}

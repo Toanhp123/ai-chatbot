@@ -1,13 +1,9 @@
-from src.inference.api import GenerationSession
-
-from .contracts import GenerationCommand, GenerationOverrides, InferenceTrainingHandoff
-from .service import InferenceService, load_generator_from_checkpoint
+from .contracts import GenerationCommand, GenerationOverrides, GenerationStream
+from .gateway import InferenceGateway
 
 __all__ = [
     "GenerationCommand",
     "GenerationOverrides",
-    "GenerationSession",
-    "InferenceService",
-    "InferenceTrainingHandoff",
-    "load_generator_from_checkpoint",
+    "GenerationStream",
+    "InferenceGateway",
 ]

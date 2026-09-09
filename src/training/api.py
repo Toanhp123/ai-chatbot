@@ -8,7 +8,6 @@ from src.training.contracts import (
     PreparedTrainingRun,
     TrainingControl,
     TrainingObserver,
-    TrainingPreparationAborted,
 )
 from src.training.events import TrainingEventHub
 from src.training.execution import BackgroundExecution
@@ -26,7 +25,6 @@ __all__ = [
     "TrainingControl",
     "TrainingEventHub",
     "TrainingObserver",
-    "TrainingPreparationAborted",
     "TrainingRunFactory",
     "TrainingTerminationReason",
 ]

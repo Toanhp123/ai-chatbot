@@ -1,17 +1,17 @@
-"""Bounded generation-session admission policy for inference application flows."""
+"""Inference-owned synchronization mechanics for bounded generation admission."""
 
 from __future__ import annotations
 
 import threading
 from typing import Callable, Optional
 
-from src.application.runtime.accelerator import AcceleratorCoordinator
+from src.core.accelerator import AcceleratorCoordinator
 from src.core.config import GenerationConfig
 from src.core.exceptions import EmptyPromptError, GenerationBusyError
 
 
-class GenerationAdmissionManager:
-    """Own use-case session limits and accelerator leases, not runtime artifacts."""
+class GenerationAdmission:
+    """Thread-safe generation slot and accelerator lease implementation."""
 
     def __init__(
         self,
@@ -52,7 +52,6 @@ class GenerationAdmissionManager:
         config: GenerationConfig,
         device: str,
     ) -> Callable[[], None]:
-        """Reserve one generation slot and return an idempotent release callback."""
         if not prompt.strip():
             raise EmptyPromptError()
         config.validate()
@@ -84,4 +83,4 @@ class GenerationAdmissionManager:
         return release
 
 
-__all__ = ["GenerationAdmissionManager"]
+__all__ = ["GenerationAdmission"]

@@ -1,11 +1,12 @@
 import pytest
 
-from src.application.inference import InferenceService
+from src.application.inference.service import InferenceService
 from src.core.exceptions import AIEngineError
+from tests.application_support import concrete_inference_runtime, make_inference_service
 
 
 def _service_without_assets(tmp_path) -> InferenceService:
-    return InferenceService(
+    return make_inference_service(
         checkpoint_dir=str(tmp_path / "checkpoints"),
         default_checkpoint=str(tmp_path / "missing_default.pt"),
         vocab_path=str(tmp_path / "missing_vocab.json"),
@@ -19,14 +20,14 @@ def test_inference_service_loads_existing_configured_vocab_on_startup(tmp_path):
     vocab_path = tmp_path / "vocab.json"
     CharTokenizer(vocab=list("abcd")).save_vocab(str(vocab_path))
 
-    service = InferenceService(
+    service = make_inference_service(
         checkpoint_dir=str(tmp_path / "checkpoints"),
         default_checkpoint=str(tmp_path / "missing_default.pt"),
         vocab_path=str(vocab_path),
     )
 
-    assert service.tokenizer is not None
-    assert service.tokenizer.vocab_size == 4
+    assert concrete_inference_runtime(service).tokenizer is not None
+    assert concrete_inference_runtime(service).tokenizer.vocab_size == 4
 
 
 def test_failed_checkpoint_load_does_not_mutate_backend(tmp_path):
@@ -37,8 +38,8 @@ def test_failed_checkpoint_load_does_not_mutate_backend(tmp_path):
 
     assert service.current_backend == "local"
     assert service.current_checkpoint_path is None
-    assert service.model is None
-    assert service.generator is None
+    assert concrete_inference_runtime(service).model is None
+    assert concrete_inference_runtime(service).generator is None
 
 
 def test_invalid_checkpoint_backend_is_rejected_without_mutating_state(tmp_path):
@@ -58,7 +59,7 @@ def test_checkpoint_listing_uses_safe_weights_only_loading(tmp_path, monkeypatch
     checkpoint_dir = tmp_path / "checkpoints"
     checkpoint_dir.mkdir()
     torch.save({"step": 3, "val_loss": 1.2}, checkpoint_dir / "safe.pt")
-    service = InferenceService(
+    service = make_inference_service(
         checkpoint_dir=str(checkpoint_dir),
         default_checkpoint=str(tmp_path / "missing_default.pt"),
         vocab_path=str(tmp_path / "missing_vocab.json"),
@@ -107,8 +108,8 @@ def test_checkpoint_load_requires_tokenizer_before_committing_state(tmp_path):
     with pytest.raises(ValueError, match="tokenizer|từ vựng"):
         service.load_checkpoint(str(checkpoint))
 
-    assert service.model is None
-    assert service.generator is None
+    assert concrete_inference_runtime(service).model is None
+    assert concrete_inference_runtime(service).generator is None
     assert service.current_checkpoint_path is None
 
 
@@ -143,8 +144,8 @@ def test_stream_generate_serializes_shared_generator_state(tmp_path):
 
     service = _service_without_assets(tmp_path)
     generator = SharedStateGenerator()
-    service.tokenizer = DummyTokenizer()  # type: ignore[assignment]
-    service.generator = generator  # type: ignore[assignment]
+    concrete_inference_runtime(service).tokenizer = DummyTokenizer()  # type: ignore[assignment]
+    concrete_inference_runtime(service).generator = generator  # type: ignore[assignment]
 
     start = threading.Barrier(3)
     outputs = []
@@ -200,13 +201,13 @@ def test_checkpoint_load_rejects_tokenizer_identity_mismatch(tmp_path):
     )
 
     service = _service_without_assets(tmp_path)
-    service.tokenizer = tokenizer_b
+    concrete_inference_runtime(service).tokenizer = tokenizer_b
 
     with pytest.raises(ValueError, match="tokenizer|vocab|từ vựng"):
         service.load_checkpoint(str(checkpoint))
 
-    assert service.model is None
-    assert service.generator is None
+    assert concrete_inference_runtime(service).model is None
+    assert concrete_inference_runtime(service).generator is None
     assert service.current_checkpoint_path is None
 
 
@@ -243,17 +244,17 @@ def test_checkpoint_load_prefers_configured_vocab_file_over_stale_in_memory_toke
         checkpoint,
     )
 
-    service = InferenceService(
+    service = make_inference_service(
         checkpoint_dir=str(tmp_path),
         default_checkpoint=str(tmp_path / "missing.pt"),
         vocab_path=str(vocab_path),
         device="cpu",
     )
-    service.tokenizer = old_tokenizer
+    concrete_inference_runtime(service).tokenizer = old_tokenizer
 
     service.load_checkpoint(str(checkpoint))
 
-    loaded_tokenizer = service.tokenizer
+    loaded_tokenizer = concrete_inference_runtime(service).tokenizer
     assert loaded_tokenizer is not None
     assert (
         get_tokenizer_identity(loaded_tokenizer)["fingerprint"]
@@ -267,7 +268,7 @@ def test_checkpoint_listing_preserves_zero_validation_loss(tmp_path):
     checkpoint_dir = tmp_path / "checkpoints"
     checkpoint_dir.mkdir()
     torch.save({"step": 7, "val_loss": 0.0}, checkpoint_dir / "zero.pt")
-    service = InferenceService(
+    service = make_inference_service(
         checkpoint_dir=str(checkpoint_dir),
         default_checkpoint=str(tmp_path / "missing.pt"),
         vocab_path=str(tmp_path / "missing_vocab.json"),
@@ -304,8 +305,8 @@ def test_stream_done_counts_generated_token_ids_not_text_chunks(tmp_path):
             )
 
     service = _service_without_assets(tmp_path)
-    service.tokenizer = DummyTokenizer()  # type: ignore[assignment]
-    service.generator = ChunkingGenerator()  # type: ignore[assignment]
+    concrete_inference_runtime(service).tokenizer = DummyTokenizer()  # type: ignore[assignment]
+    concrete_inference_runtime(service).generator = ChunkingGenerator()  # type: ignore[assignment]
 
     events = list(service.stream_generate("A", GenerationConfig(max_new_tokens=2)))
     done = next(event for event in events if event.get("type") == "done")
@@ -343,7 +344,7 @@ def test_checkpoint_v3_missing_embedded_tokenizer_state_is_rejected_atomically(t
         checkpoint,
     )
 
-    service = InferenceService(
+    service = make_inference_service(
         checkpoint_dir=str(tmp_path),
         default_checkpoint=str(tmp_path / "missing.pt"),
         vocab_path=str(vocab_path),
@@ -353,8 +354,8 @@ def test_checkpoint_v3_missing_embedded_tokenizer_state_is_rejected_atomically(t
     with pytest.raises(ValueError, match="v3|tokenizer state|Tokenizer state"):
         service.load_checkpoint(str(checkpoint))
 
-    assert service.model is None
-    assert service.generator is None
+    assert concrete_inference_runtime(service).model is None
+    assert concrete_inference_runtime(service).generator is None
     assert service.current_checkpoint_path is None
 
 
@@ -401,7 +402,7 @@ def test_inference_service_from_engine_config_uses_custom_artifact_paths(tmp_pat
         ),
     )
 
-    service = InferenceService.from_engine_config(config)
+    service = make_inference_service(engine_config=config)
 
     assert service.checkpoint_dir == str(tmp_path / "artifacts")
     assert service.checkpoint_name == "champion.pt"
@@ -415,7 +416,7 @@ def test_checkpoint_listing_uses_configured_checkpoint_name_for_best_tag(tmp_pat
     checkpoint_dir.mkdir()
     torch.save({"step": 1, "val_loss": 1.0}, checkpoint_dir / "champion.pt")
     torch.save({"step": 2, "val_loss": 2.0}, checkpoint_dir / "other.pt")
-    service = InferenceService(
+    service = make_inference_service(
         checkpoint_dir=str(checkpoint_dir),
         checkpoint_name="champion.pt",
         default_checkpoint=str(tmp_path / "missing.pt"),
@@ -436,7 +437,7 @@ def test_same_checkpoint_path_replacement_is_not_reported_active_until_reloaded(
     checkpoint_dir.mkdir()
     checkpoint_path = checkpoint_dir / "best.pt"
     _write_portable_checkpoint(checkpoint_path, step=10)
-    service = InferenceService(
+    service = make_inference_service(
         checkpoint_dir=str(checkpoint_dir),
         checkpoint_name="best.pt",
         default_checkpoint=str(tmp_path / "missing.pt"),
@@ -462,7 +463,7 @@ def test_configured_best_checkpoint_is_marked_and_protected_from_delete(tmp_path
     checkpoint_dir.mkdir()
     configured = checkpoint_dir / "custom-best.pt"
     _write_portable_checkpoint(configured, step=42)
-    service = InferenceService(
+    service = make_inference_service(
         checkpoint_dir=str(checkpoint_dir),
         checkpoint_name="custom-best.pt",
         default_checkpoint=str(checkpoint_dir / "missing.pt"),
@@ -480,36 +481,36 @@ def test_configured_best_checkpoint_is_marked_and_protected_from_delete(tmp_path
 def test_generation_rejected_while_training_owns_same_accelerator(tmp_path):
     from unittest.mock import Mock
 
-    from src.application.runtime import AcceleratorCoordinator
+    from src.core.accelerator import AcceleratorCoordinator
     from src.core.config import GenerationConfig
     from src.core.exceptions import AcceleratorBusyError
 
     coordinator = AcceleratorCoordinator()
     coordinator.reserve_training("cuda")
-    service = InferenceService(
+    service = make_inference_service(
         checkpoint_dir=str(tmp_path / "checkpoints"),
         default_checkpoint=str(tmp_path / "missing.pt"),
         vocab_path=str(tmp_path / "missing_vocab.json"),
         device="cpu",
         accelerator_coordinator=coordinator,
     )
-    service.device_str = "cuda"
-    service.generator = Mock()
-    service.tokenizer = Mock()
-    service.model = Mock()
+    concrete_inference_runtime(service).device = "cuda"
+    concrete_inference_runtime(service).generator = Mock()
+    concrete_inference_runtime(service).tokenizer = Mock()
+    concrete_inference_runtime(service).model = Mock()
 
     with pytest.raises(AcceleratorBusyError):
         service.begin_generation("hello", GenerationConfig(max_new_tokens=1))
 
-    assert service._generation_admission.active_sessions == 0
+    assert service._admission.active_sessions == 0
     coordinator.release_training("cuda")
 
 
 def test_set_backend_rebuilds_generator_on_current_active_device(tmp_path, monkeypatch):
     service = _service_without_assets(tmp_path)
-    service.device_str = "mps"
-    service.model = object()  # type: ignore[assignment]
-    service.tokenizer = object()  # type: ignore[assignment]
+    concrete_inference_runtime(service).device = "mps"
+    concrete_inference_runtime(service).model = object()  # type: ignore[assignment]
+    concrete_inference_runtime(service).tokenizer = object()  # type: ignore[assignment]
     observed = {}
 
     monkeypatch.setattr(
@@ -577,14 +578,14 @@ def test_checkpoint_load_builds_generator_for_resolved_target_device(tmp_path, m
 
 
 def test_checkpoint_load_reserves_accelerator_before_deserializing(tmp_path, monkeypatch):
-    from src.application.runtime import AcceleratorCoordinator
+    from src.core.accelerator import AcceleratorCoordinator
     from src.core.exceptions import AcceleratorBusyError
 
     checkpoint_path = tmp_path / "model.pt"
     checkpoint_path.write_bytes(b"not-read")
     coordinator = AcceleratorCoordinator()
     coordinator.reserve_training("cuda")
-    service = InferenceService(
+    service = make_inference_service(
         checkpoint_dir=str(tmp_path),
         default_checkpoint=str(tmp_path / "missing.pt"),
         vocab_path=str(tmp_path / "missing.json"),
@@ -617,14 +618,14 @@ def test_checkpoint_load_binds_active_revision_to_exact_loaded_inode(tmp_path, m
     _write_portable_checkpoint(checkpoint_path, step=10)
     _write_portable_checkpoint(replacement_path, step=20)
 
-    service = InferenceService(
+    service = make_inference_service(
         checkpoint_dir=str(tmp_path),
         checkpoint_name="best.pt",
         default_checkpoint=str(tmp_path / "missing.pt"),
         vocab_path=str(tmp_path / "missing_vocab.json"),
         device="cpu",
     )
-    loaded_identity = service._checkpoint_identity(str(checkpoint_path))
+    loaded_identity = concrete_inference_runtime(service).checkpoint_identity(str(checkpoint_path))
 
     def replace_after_payload_was_loaded(state):
         tokenizer = real_load_tokenizer_state(state)
@@ -638,7 +639,7 @@ def test_checkpoint_load_binds_active_revision_to_exact_loaded_inode(tmp_path, m
 
     service.load_checkpoint(str(checkpoint_path))
 
-    assert service._current_checkpoint_identity == loaded_identity
+    assert concrete_inference_runtime(service).current_checkpoint_identity == loaded_identity
     [listed] = service.list_checkpoints()
     assert listed["step"] == 20
     assert listed["is_active"] is False
@@ -654,7 +655,7 @@ def test_checkpoint_listing_uses_one_checkpoint_directory_snapshot(tmp_path, mon
     _write_portable_checkpoint(first / "first.pt", step=1)
     _write_portable_checkpoint(second / "second.pt", step=2)
 
-    service = InferenceService(
+    service = make_inference_service(
         checkpoint_dir=str(first),
         checkpoint_name="first.pt",
         default_checkpoint=str(tmp_path / "missing.pt"),
@@ -684,28 +685,26 @@ def test_prepare_for_training_offloads_idle_inference_model_from_shared_accelera
 ):
     import torch
 
-    from src.application.inference import InferenceService
-
     class DummyTokenizer:
         pass
 
     class DummyGenerator:
         pass
 
-    service = InferenceService(
+    service = make_inference_service(
         checkpoint_dir=str(tmp_path / "checkpoints"),
         default_checkpoint=str(tmp_path / "missing.pt"),
         vocab_path=str(tmp_path / "missing.json"),
         device="cpu",
     )
     model = torch.nn.Linear(2, 2)
-    service.model = model  # type: ignore[assignment]
-    service.tokenizer = DummyTokenizer()  # type: ignore[assignment]
-    service.generator = DummyGenerator()  # type: ignore[assignment]
-    service.device_str = "cuda"
-    service.current_backend = "local"
-    service.current_checkpoint_path = "checkpoints/model.pt"
-    service._current_checkpoint_identity = (1, 2, 3, 4)
+    concrete_inference_runtime(service).model = model  # type: ignore[assignment]
+    concrete_inference_runtime(service).tokenizer = DummyTokenizer()  # type: ignore[assignment]
+    concrete_inference_runtime(service).generator = DummyGenerator()  # type: ignore[assignment]
+    concrete_inference_runtime(service).device = "cuda"
+    concrete_inference_runtime(service).backend = "local"
+    concrete_inference_runtime(service).current_checkpoint_path = "checkpoints/model.pt"
+    concrete_inference_runtime(service).current_checkpoint_identity = (1, 2, 3, 4)
     created = []
 
     def create_for_inference(name, *, model, tokenizer, device):
@@ -722,16 +721,15 @@ def test_prepare_for_training_offloads_idle_inference_model_from_shared_accelera
     assert service.device_str == "cpu"
     assert created and created[-1][3] == "cpu"
     assert service.current_checkpoint_path == "checkpoints/model.pt"
-    assert service._current_checkpoint_identity == (1, 2, 3, 4)
+    assert concrete_inference_runtime(service).current_checkpoint_identity == (1, 2, 3, 4)
 
 
 def test_prepare_for_training_refuses_to_move_model_during_active_generation(tmp_path):
     from unittest.mock import Mock
 
-    from src.application.inference import InferenceService
     from src.core.exceptions import GenerationBusyError
 
-    service = InferenceService(
+    service = make_inference_service(
         checkpoint_dir=str(tmp_path / "checkpoints"),
         default_checkpoint=str(tmp_path / "missing.pt"),
         vocab_path=str(tmp_path / "missing.json"),
@@ -739,10 +737,10 @@ def test_prepare_for_training_refuses_to_move_model_during_active_generation(tmp
     )
     from src.core.config import GenerationConfig
 
-    service.device_str = "cuda"
-    service.model = object()  # type: ignore[assignment]
-    service.tokenizer = Mock()  # type: ignore[assignment]
-    service.generator = Mock()  # type: ignore[assignment]
+    concrete_inference_runtime(service).device = "cuda"
+    concrete_inference_runtime(service).model = object()  # type: ignore[assignment]
+    concrete_inference_runtime(service).tokenizer = Mock()  # type: ignore[assignment]
+    concrete_inference_runtime(service).generator = Mock()  # type: ignore[assignment]
     session = service.begin_generation("hello", GenerationConfig(max_new_tokens=1))
     try:
         with pytest.raises(GenerationBusyError):
@@ -755,13 +753,13 @@ def test_prepare_for_training_refuses_to_move_model_during_active_generation(tmp
 def test_checkpoint_loaded_on_accelerator_holds_residency_until_offloaded(tmp_path, monkeypatch):
     import torch
 
-    from src.application.runtime import AcceleratorCoordinator
+    from src.core.accelerator import AcceleratorCoordinator
     from src.core.exceptions import AcceleratorBusyError
 
     checkpoint_path = tmp_path / "model.pt"
     _write_portable_checkpoint(checkpoint_path)
     coordinator = AcceleratorCoordinator()
-    service = InferenceService(
+    service = make_inference_service(
         checkpoint_dir=str(tmp_path),
         default_checkpoint=str(tmp_path / "missing.pt"),
         vocab_path=str(tmp_path / "missing.json"),
@@ -807,7 +805,7 @@ def test_legacy_path_setters_keep_canonical_engine_config_in_sync(tmp_path):
     from src.core.config import EngineConfig
 
     config = EngineConfig()
-    service = InferenceService.from_engine_config(config)
+    service = make_inference_service(engine_config=config)
     new_checkpoint_dir = str(tmp_path / "other-checkpoints")
     new_vocab_path = str(tmp_path / "other-vocab.json")
 
@@ -824,12 +822,12 @@ def test_checkpoint_swap_to_cpu_offloads_previous_accelerator_model_before_relea
 ):
     import torch
 
-    from src.application.runtime import AcceleratorCoordinator
+    from src.core.accelerator import AcceleratorCoordinator
 
     checkpoint_path = tmp_path / "cpu.pt"
     _write_portable_checkpoint(checkpoint_path)
     coordinator = AcceleratorCoordinator()
-    service = InferenceService(
+    service = make_inference_service(
         checkpoint_dir=str(tmp_path),
         default_checkpoint=str(tmp_path / "missing.pt"),
         vocab_path=str(tmp_path / "missing.json"),
@@ -855,10 +853,10 @@ def test_checkpoint_swap_to_cpu_offloads_previous_accelerator_model_before_relea
         def eval(self):
             return self
 
-    service.model = PreviousModel()  # type: ignore[assignment]
-    service.tokenizer = object()  # type: ignore[assignment]
-    service.generator = object()  # type: ignore[assignment]
-    service.device_str = "cuda"
+    concrete_inference_runtime(service).model = PreviousModel()  # type: ignore[assignment]
+    concrete_inference_runtime(service).tokenizer = object()  # type: ignore[assignment]
+    concrete_inference_runtime(service).generator = object()  # type: ignore[assignment]
+    concrete_inference_runtime(service).device = "cuda"
     service._residency_device = "cuda"
     coordinator.reserve_inference_residency("cuda")
 
@@ -887,10 +885,10 @@ def test_checkpoint_swap_to_cpu_offloads_previous_accelerator_model_before_relea
 def test_training_handoff_rollback_restores_inference_residency_and_runtime(tmp_path, monkeypatch):
     import torch
 
-    from src.application.runtime import AcceleratorCoordinator
+    from src.core.accelerator import AcceleratorCoordinator
 
     coordinator = AcceleratorCoordinator()
-    service = InferenceService(
+    service = make_inference_service(
         checkpoint_dir=str(tmp_path),
         default_checkpoint=str(tmp_path / "missing.pt"),
         vocab_path=str(tmp_path / "missing.json"),
@@ -908,11 +906,11 @@ def test_training_handoff_rollback_restores_inference_residency_and_runtime(tmp_
             return self
 
     model = FakeModel()
-    service.model = model  # type: ignore[assignment]
-    service.tokenizer = DummyTokenizer()  # type: ignore[assignment]
-    service.generator = previous_generator  # type: ignore[assignment]
-    service.current_backend = "local"
-    service.device_str = "cuda"
+    concrete_inference_runtime(service).model = model  # type: ignore[assignment]
+    concrete_inference_runtime(service).tokenizer = DummyTokenizer()  # type: ignore[assignment]
+    concrete_inference_runtime(service).generator = previous_generator  # type: ignore[assignment]
+    concrete_inference_runtime(service).backend = "local"
+    concrete_inference_runtime(service).device = "cuda"
     service._residency_device = "cuda"
     coordinator.reserve_inference_residency("cuda")
     monkeypatch.setattr(
@@ -927,7 +925,7 @@ def test_training_handoff_rollback_restores_inference_residency_and_runtime(tmp_
     handoff.rollback()
 
     assert service.device_str == "cuda"
-    assert service.generator is previous_generator
+    assert concrete_inference_runtime(service).generator is previous_generator
     assert service._residency_device == "cuda"
     assert coordinator.snapshot()["cuda"] == {
         "training": False,

@@ -28,7 +28,7 @@ def _tiny_config() -> EngineConfig:
 
 
 def test_cli_checkpoint_loader_rejects_tokenizer_identity_mismatch(tmp_path) -> None:
-    from main import load_generator_from_checkpoint
+    from src.inference.api import load_generator_from_checkpoint
 
     tokenizer_a = CharTokenizer(vocab=list("abcdef"))
     tokenizer_b = CharTokenizer(vocab=list("uvwxyz"))
@@ -111,7 +111,7 @@ def test_trainer_without_tokenizer_does_not_emit_invalid_checkpoint_v2() -> None
 
 
 def test_v3_checkpoint_embeds_reconstructable_tokenizer_state(tmp_path) -> None:
-    from main import load_generator_from_checkpoint
+    from src.inference.api import load_generator_from_checkpoint
 
     tokenizer = CharTokenizer(vocab=list("abcdef"))
     cfg = _tiny_config()
@@ -242,7 +242,7 @@ def test_v3_resume_rejects_corrupted_embedded_tokenizer_state(tmp_path) -> None:
 
 
 def test_cli_v3_checkpoint_requires_embedded_tokenizer_state(tmp_path) -> None:
-    from main import load_generator_from_checkpoint
+    from src.inference.api import load_generator_from_checkpoint
 
     tokenizer = CharTokenizer(vocab=list("abcdef"))
     vocab_path = tmp_path / "vocab.json"

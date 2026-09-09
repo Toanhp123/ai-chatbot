@@ -5,7 +5,7 @@ from typing import Any, Iterable, Iterator, Mapping
 
 from fastapi.responses import StreamingResponse
 
-from src.application.inference import GenerationSession
+from src.application.inference import GenerationStream
 
 
 def iter_sse_events(events: Iterable[Mapping[str, object]]) -> Iterator[str]:
@@ -20,7 +20,7 @@ def iter_sse_events(events: Iterable[Mapping[str, object]]) -> Iterator[str]:
 class GenerationStreamingResponse(StreamingResponse):
     """Close the generation session on every ASGI transport exit, including disconnects."""
 
-    def __init__(self, *, session: GenerationSession, **kwargs: Any) -> None:
+    def __init__(self, *, session: GenerationStream, **kwargs: Any) -> None:
         self.generation_session = session
         super().__init__(iter_sse_events(session.iter_events()), **kwargs)
 

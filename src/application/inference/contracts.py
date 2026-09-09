@@ -1,10 +1,16 @@
-"""Transport-neutral inference request contracts."""
+"""Application-owned contracts for inference use cases.
+
+The Application layer talks to inference mechanics only through these structural
+ports. Concrete model/tokenizer/generator/session implementations stay inside the
+inference capability.
+"""
 
 from __future__ import annotations
 
-import threading
 from dataclasses import dataclass
-from typing import Callable, Optional, Sequence
+from typing import Callable, Iterator, Mapping, Optional, Protocol, Sequence
+
+from src.core.config import GenerationConfig
 
 
 @dataclass(frozen=True)
@@ -43,27 +49,116 @@ class GenerationCommand:
         )
 
 
-class InferenceTrainingHandoff:
-    """Reversible runtime handoff used while a training start is still uncommitted."""
+class GenerationStream(Protocol):
+    def iter_events(self) -> Iterator[dict[str, object]]: ...
+    def close(self) -> None: ...
 
-    def __init__(
+
+class RuntimeHandoff(Protocol):
+    @property
+    def previous_device(self) -> str: ...
+
+    def rollback(self) -> None: ...
+
+
+class InferenceRuntimePort(Protocol):
+    @property
+    def current_checkpoint_path(self) -> Optional[str]: ...
+
+    @property
+    def current_checkpoint_identity(self) -> Optional[tuple[int, int, int, int]]: ...
+
+    @property
+    def device(self) -> str: ...
+
+    @property
+    def backend(self) -> str: ...
+
+    @property
+    def ready(self) -> bool: ...
+
+    def path_exists(self, path: str) -> bool: ...
+    def join_path(self, *parts: str) -> str: ...
+    def load_tokenizer_if_present(self, vocab_path: str) -> bool: ...
+    def resolve_checkpoint_path_for_dir(
+        self,
+        checkpoint_dir: str,
+        path: str,
+        *,
+        filename_only: bool = False,
+    ) -> str: ...
+    def list_checkpoints(
         self,
         *,
-        training_admission_reserved: bool = False,
-        rollback: Optional[Callable[[], None]] = None,
-    ) -> None:
-        self.training_admission_reserved = training_admission_reserved
-        self._rollback = rollback
-        self._lock = threading.Lock()
-        self._rolled_back = False
+        checkpoint_dir: str,
+        checkpoint_name: str,
+    ) -> list[dict[str, object]]: ...
+    def delete_checkpoint(
+        self,
+        *,
+        checkpoint_dir: str,
+        checkpoint_name: str,
+        filename: str,
+    ) -> str: ...
+    def list_generators(self) -> list[str]: ...
+    def list_models(self) -> list[str]: ...
+    def validate_backend(self, backend: str) -> str: ...
+    def resolve_device_name(self, device: str) -> str: ...
+    def set_backend(self, backend: str) -> str: ...
+    def load_checkpoint(
+        self,
+        checkpoint_path: str,
+        *,
+        vocab_path: str,
+        configured_device: str,
+        backend: str,
+    ) -> tuple[int, int, int, int]: ...
+    def prepare_training_handoff(self) -> Optional[RuntimeHandoff]: ...
+    def begin_generation(
+        self,
+        *,
+        prompt: str,
+        config: GenerationConfig,
+        requested_backend: str,
+        stop_words: Optional[Sequence[str]],
+        release_admission: Callable[[], None],
+    ) -> GenerationStream: ...
+
+
+class GenerationAdmissionPort(Protocol):
+    @property
+    def active_sessions(self) -> int: ...
+    def ensure_idle(self, *, operation: str) -> None: ...
+    def acquire(
+        self,
+        *,
+        prompt: str,
+        config: GenerationConfig,
+        device: str,
+    ) -> Callable[[], None]: ...
+
+
+@dataclass(frozen=True)
+class InferenceTrainingHandoff:
+    """Application transaction token for a reversible cross-use-case handoff."""
+
+    training_admission_reserved: bool = False
+    rollback_action: Optional[Callable[[], None]] = None
 
     def rollback(self) -> None:
-        with self._lock:
-            if self._rolled_back:
-                return
-            self._rolled_back = True
-        if self._rollback is not None:
-            self._rollback()
+        if self.rollback_action is not None:
+            self.rollback_action()
 
 
-__all__ = ["GenerationCommand", "GenerationOverrides", "InferenceTrainingHandoff"]
+InferenceState = Mapping[str, object]
+
+__all__ = [
+    "GenerationAdmissionPort",
+    "GenerationCommand",
+    "GenerationOverrides",
+    "GenerationStream",
+    "InferenceRuntimePort",
+    "InferenceState",
+    "InferenceTrainingHandoff",
+    "RuntimeHandoff",
+]

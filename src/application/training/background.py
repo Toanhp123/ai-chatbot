@@ -7,21 +7,18 @@ TrainingApplicationService so Web and CLI share one canonical run graph.
 import time
 from typing import Any, Dict, Generator, List, Optional
 
-from src.application.runtime.accelerator import AcceleratorCoordinator
+from src.application.config.service import ConfigurationService
+from src.application.runtime import AcceleratorPort, SynchronizationPort
 from src.application.training.contracts import (
+    BackgroundExecutionPort,
+    BackgroundTaskPort,
+    TrainingControl,
+    TrainingEventPort,
     TrainingPlan,
-    TrainingPreparationAborted,
 )
 from src.application.training.service import TrainingApplicationService
-from src.core.config import EngineConfig
+from src.core.exceptions import TrainingPreparationCancelled
 from src.core.logging import get_logger
-from src.training.api import (
-    BackgroundExecution,
-    BackgroundTask,
-    TrainingControl,
-    TrainingEventHub,
-    TrainingTerminationReason,
-)
 
 logger = get_logger("TrainingService")
 
@@ -49,9 +46,11 @@ class TrainingService:
 
     def __init__(
         self,
-        accelerator_coordinator: Optional[AcceleratorCoordinator] = None,
-        training_application: Optional[TrainingApplicationService] = None,
-        execution: Optional[BackgroundExecution] = None,
+        training_application: TrainingApplicationService,
+        execution: BackgroundExecutionPort,
+        events: TrainingEventPort,
+        synchronization: SynchronizationPort,
+        accelerator: Optional[AcceleratorPort] = None,
     ) -> None:
         self.status: str = "IDLE"  # IDLE, STARTING, RUNNING, STOPPING, STOPPED, COMPLETED, ERROR
         self.current_step: int = 0
@@ -65,14 +64,13 @@ class TrainingService:
         self.run_id: int = 0
         self.sequence: int = 0
         self.trainer: Optional[TrainingControl] = None
-        self._execution = execution or BackgroundExecution()
-        self._thread: Optional[BackgroundTask] = None
-        self._lock = self._execution.create_lock()
+        self._execution = execution
+        self._thread: Optional[BackgroundTaskPort] = None
+        self._synchronization = synchronization
         self._abort_requested = self._execution.create_cancellation_signal()
-        self._accelerator_coordinator = accelerator_coordinator
-        self._training_application = training_application or TrainingApplicationService()
-
-        self._events = TrainingEventHub(queue_size=500)
+        self._accelerator = accelerator
+        self._training_application = training_application
+        self._events = events
 
         self.history_steps: List[Dict[str, Any]] = []
         self.history_evals: List[Dict[str, Any]] = []
@@ -83,7 +81,7 @@ class TrainingService:
         self._events.publish(evt)
 
     def _snapshot_locked(self) -> Dict[str, Any]:
-        """Return one coherent UI snapshot. Caller must hold ``_lock``."""
+        """Return one coherent UI snapshot. Caller must hold the injected synchronization section."""
         return {
             "run_id": self.run_id,
             "sequence": self.sequence,
@@ -113,7 +111,7 @@ class TrainingService:
 
     def get_state(self) -> Dict[str, Any]:
         """Return an atomic, authoritative snapshot for REST polling/reconnect."""
-        with self._lock:
+        with self._synchronization.section():
             return self._snapshot_locked()
 
     def record_step(
@@ -126,7 +124,7 @@ class TrainingService:
         emit: bool,
     ) -> None:
         event: Optional[Dict[str, Any]] = None
-        with self._lock:
+        with self._synchronization.section():
             self.current_step = step
             self.current_loss = round(float(loss), 4)
             self.current_lr = round(float(lr), 7)
@@ -148,7 +146,7 @@ class TrainingService:
             self.broadcast(event)
 
     def record_eval(self, *, step: int, train_loss: float, val_loss: float, lr: float) -> None:
-        with self._lock:
+        with self._synchronization.section():
             self.current_val_loss = round(float(val_loss), 4)
             sequence = self._next_sequence_locked()
             event = {
@@ -166,7 +164,7 @@ class TrainingService:
         self.broadcast(event)
 
     def record_sample(self, *, step: int, text: str) -> None:
-        with self._lock:
+        with self._synchronization.section():
             self.last_sample_text = text
             sequence = self._next_sequence_locked()
             event = {
@@ -184,8 +182,8 @@ class TrainingService:
 
     def clear_state(self) -> None:
         """Erase the terminal run only after the worker has fully cleaned up."""
-        cleanup_thread: Optional[BackgroundTask] = None
-        with self._lock:
+        cleanup_thread: Optional[BackgroundTaskPort] = None
+        with self._synchronization.section():
             if self.status in ("RUNNING", "STARTING"):
                 raise RuntimeError("Không thể làm mới khi tiến trình huấn luyện đang chạy.")
             if self._thread and self._thread.is_alive():
@@ -198,7 +196,7 @@ class TrainingService:
             if cleanup_thread.is_alive():
                 raise RuntimeError("Worker huấn luyện cũ chưa hoàn tất dọn dẹp; vui lòng thử lại.")
 
-        with self._lock:
+        with self._synchronization.section():
             if self.status in ("RUNNING", "STARTING", "STOPPING"):
                 raise RuntimeError("Không thể làm mới khi tiến trình huấn luyện đang chạy.")
             self.status = "IDLE"
@@ -220,9 +218,9 @@ class TrainingService:
 
     def _finish_abort(self) -> None:
         """Finish a user-requested abort during STARTING without inventing metrics."""
-        with self._lock:
+        with self._synchronization.section():
             self.status = "STOPPED"
-            self.termination_reason = TrainingTerminationReason.ABORTED_STARTUP.value
+            self.termination_reason = "ABORTED_STARTUP"
             self.trainer = None
             event = self._status_event_locked(
                 "Đã hủy bỏ khởi tạo huấn luyện an toàn theo yêu cầu người dùng."
@@ -237,8 +235,8 @@ class TrainingService:
         admission_reserved: bool = False,
     ) -> None:
         """Start one exclusive background run from an already-resolved application plan."""
-        old_thread: Optional[BackgroundTask] = None
-        with self._lock:
+        old_thread: Optional[BackgroundTaskPort] = None
+        with self._synchronization.section():
             if self.status in ("RUNNING", "STARTING"):
                 raise RuntimeError(
                     f"Không thể khởi chạy: Tiến trình đang ở trạng thái '{self.status}'. "
@@ -257,8 +255,8 @@ class TrainingService:
                 )
 
         frozen_plan = TrainingPlan(
-            requested_config=EngineConfig.from_dict(plan.requested_config.to_dict()),
-            config=EngineConfig.from_dict(plan.config.to_dict()),
+            requested_config=ConfigurationService.snapshot(plan.requested_config),
+            config=ConfigurationService.snapshot(plan.config),
             runtime_plan=plan.runtime_plan,
             feasibility=plan.feasibility,
             resume_checkpoint=plan.resume_checkpoint,
@@ -268,7 +266,7 @@ class TrainingService:
         reserved_accelerator = admission_reserved
         externally_reserved_admission = admission_reserved
         try:
-            with self._lock:
+            with self._synchronization.section():
                 if self.status in ("RUNNING", "STARTING", "STOPPING"):
                     raise RuntimeError(
                         f"Không thể khởi chạy: Tiến trình đang ở trạng thái '{self.status}'. "
@@ -279,8 +277,8 @@ class TrainingService:
                         "Tiến trình huấn luyện trước đó vẫn đang trong quá trình giải phóng tài nguyên. "
                         "Vui lòng đợi 1-2 giây."
                     )
-                if self._accelerator_coordinator is not None and not reserved_accelerator:
-                    self._accelerator_coordinator.reserve_training(admission_device)
+                if self._accelerator is not None and not reserved_accelerator:
+                    self._accelerator.reserve_training(admission_device)
                     reserved_accelerator = True
 
                 self._abort_requested.clear()
@@ -306,9 +304,9 @@ class TrainingService:
             if (
                 reserved_accelerator
                 and not externally_reserved_admission
-                and self._accelerator_coordinator is not None
+                and self._accelerator is not None
             ):
-                self._accelerator_coordinator.release_training(admission_device)
+                self._accelerator.release_training(admission_device)
             raise
 
         self.broadcast(starting_event)
@@ -321,13 +319,13 @@ class TrainingService:
                     abort_check=self._abort_requested.is_set,
                     log_interval=10,
                 )
-                with self._lock:
+                with self._synchronization.section():
                     if self._abort_requested.is_set() or self.status == "STOPPING":
                         abort_before_trainer = True
                         running_event = None
                     else:
                         abort_before_trainer = False
-                        self.trainer = prepared.trainer
+                        self.trainer = prepared.control
                         self.status = "RUNNING"
                         running_event = self._status_event_locked("Bắt đầu huấn luyện mô hình.")
                 if abort_before_trainer:
@@ -337,42 +335,38 @@ class TrainingService:
                     self.broadcast(running_event)
 
                 train_out = self._training_application.execute(prepared, frozen_plan)
-                with self._lock:
+                with self._synchronization.section():
                     reason = train_out.termination_reason
-                    user_stopped = (
-                        train_out.interrupted or reason is TrainingTerminationReason.USER_STOPPED
-                    )
+                    user_stopped = train_out.interrupted or reason == "USER_STOPPED"
                     if user_stopped:
                         self.status = "STOPPED"
-                        self.termination_reason = TrainingTerminationReason.USER_STOPPED.value
+                        self.termination_reason = "USER_STOPPED"
                     else:
                         self.status = "COMPLETED"
-                        self.termination_reason = reason.value
+                        self.termination_reason = reason
                     terminal_event = self._status_event_locked(
                         f"Huấn luyện kết thúc với trạng thái: {self.status}"
                     )
                 self.broadcast(terminal_event)
-            except TrainingPreparationAborted:
+            except TrainingPreparationCancelled:
                 self._finish_abort()
             except Exception as exc:
                 logger.exception("Lỗi trong quá trình huấn luyện nền: %s", exc)
-                with self._lock:
+                with self._synchronization.section():
                     self.status = "ERROR"
-                    self.termination_reason = TrainingTerminationReason.FAILED.value
+                    self.termination_reason = "FAILED"
                     self.error_message = str(exc)
                     error_event = self._status_event_locked(str(exc))
                 self.broadcast(error_event)
             finally:
                 cleanup_event: Optional[Dict[str, Any]] = None
-                with self._lock:
+                with self._synchronization.section():
                     self.trainer = None
                     if self.status in ("STARTING", "STOPPING"):
                         self.status = "STOPPED"
                         if self.termination_reason is None:
                             self.termination_reason = (
-                                TrainingTerminationReason.ABORTED_STARTUP.value
-                                if self.current_step == 0
-                                else TrainingTerminationReason.USER_STOPPED.value
+                                "ABORTED_STARTUP" if self.current_step == 0 else "USER_STOPPED"
                             )
                         cleanup_event = self._status_event_locked(
                             "Tiến trình huấn luyện đã dừng và hoàn tất dọn dẹp."
@@ -380,25 +374,25 @@ class TrainingService:
                     final_status = self.status
                 if cleanup_event is not None:
                     self.broadcast(cleanup_event)
-                if reserved_accelerator and self._accelerator_coordinator is not None:
-                    self._accelerator_coordinator.release_training(admission_device)
+                if reserved_accelerator and self._accelerator is not None:
+                    self._accelerator.release_training(admission_device)
                 self._execution.cleanup_accelerator_cache()
                 logger.info(
                     "Luồng huấn luyện nền đã hoàn tất dọn dẹp. Trạng thái cuối: %s",
                     final_status,
                 )
 
-        with self._lock:
+        with self._synchronization.section():
             self._thread = self._execution.create_task(train_worker)
             thread = self._thread
         try:
             thread.start()
         except Exception as exc:
-            with self._lock:
+            with self._synchronization.section():
                 if self._thread is thread:
                     self._thread = None
                 self.status = "IDLE"
-                self.termination_reason = TrainingTerminationReason.FAILED.value
+                self.termination_reason = "FAILED"
                 self.error_message = str(exc)
                 rollback_event = self._status_event_locked(
                     "Không thể khởi chạy luồng huấn luyện; trạng thái đã được hoàn nguyên."
@@ -406,9 +400,9 @@ class TrainingService:
             if (
                 reserved_accelerator
                 and not externally_reserved_admission
-                and self._accelerator_coordinator is not None
+                and self._accelerator is not None
             ):
-                self._accelerator_coordinator.release_training(admission_device)
+                self._accelerator.release_training(admission_device)
             self.broadcast(rollback_event)
             raise
 
@@ -416,7 +410,7 @@ class TrainingService:
         """Request a safe stop without erasing terminal run metrics."""
         event: Optional[Dict[str, Any]] = None
         trainer: Optional[TrainingControl] = None
-        with self._lock:
+        with self._synchronization.section():
             if self.status == "STOPPING":
                 logger.info("Yêu cầu dừng khi đang ở trạng thái STOPPING (đã nhận lệnh trước đó).")
                 return

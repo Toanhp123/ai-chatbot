@@ -27,16 +27,6 @@ def _safe_config_path(path: Optional[str]) -> Optional[str]:
         ) from exc
 
 
-def _resolve_resume_checkpoint(path: str, checkpoint_dir: str) -> str:
-    try:
-        return resolve_path_within_root(path, checkpoint_dir, bare_name_in_root=True)
-    except ValueError as exc:
-        raise HTTPException(
-            status_code=400,
-            detail="Checkpoint resume phải nằm bên trong checkpoint_dir đã cấu hình.",
-        ) from exc
-
-
 class TrainingConfigRequest(BaseModel):
     model_config = ConfigDict(extra="allow")
     config_path: Optional[str] = Field(default=None)
@@ -126,7 +116,7 @@ def _build_overrides(req: TrainingConfigRequest, allowed_paths: set[str]) -> Lis
 
 
 def _request_overrides(req: TrainingConfigRequest, request: Request) -> tuple[str, ...]:
-    allowed = request.app.state.configuration_service.canonical_override_paths(
+    allowed = request.app.state.services.config.canonical_override_paths(
         ("system", "data", "model", "training")
     )
     try:
@@ -137,15 +127,13 @@ def _request_overrides(req: TrainingConfigRequest, request: Request) -> tuple[st
 
 @router.post("/check-feasibility")
 async def check_feasibility_endpoint(req: CheckFeasibilityRequest, request: Request):
-    plan = await asyncio.to_thread(
-        request.app.state.training_application.plan,
+    feasibility = await asyncio.to_thread(
+        request.app.state.services.training.check_feasibility,
         TrainingCommand(
             config_path=_safe_config_path(req.config_path),
             overrides=_request_overrides(req, request),
         ),
-        assign_run_name=False,
     )
-    feasibility = plan.feasibility
     return {
         "feasible": feasibility.feasible,
         "advisory": True,
@@ -157,19 +145,18 @@ async def check_feasibility_endpoint(req: CheckFeasibilityRequest, request: Requ
 
 @router.post("/start")
 async def start_training_endpoint(req: StartTrainingRequest, request: Request):
-    training_service = request.app.state.training_service
+    training_service = request.app.state.services.training
     command = TrainingCommand(
         config_path=_safe_config_path(req.config_path),
         overrides=_request_overrides(req, request),
         quick_check=req.quick_check,
+        resume_checkpoint=req.resume_checkpoint,
     )
 
     try:
-        plan = await asyncio.to_thread(
-            request.app.state.training_launch_service.start_command,
+        start_result = await asyncio.to_thread(
+            request.app.state.services.training.start,
             command,
-            resume_checkpoint=req.resume_checkpoint,
-            resume_path_resolver=_resolve_resume_checkpoint,
         )
     except FileNotFoundError as exc:
         raise HTTPException(
@@ -191,7 +178,7 @@ async def start_training_endpoint(req: StartTrainingRequest, request: Request):
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    feasibility = plan.feasibility
+    feasibility = start_result.feasibility
     return {
         "status": "success",
         "message": "Đã khởi chạy huấn luyện trên luồng nền.",
@@ -208,14 +195,14 @@ async def start_training_endpoint(req: StartTrainingRequest, request: Request):
 
 @router.post("/stop")
 async def stop_training_endpoint(request: Request):
-    request.app.state.training_service.stop_training()
+    request.app.state.services.training.stop()
     return {"status": "success", "message": "Đã gửi tín hiệu dừng huấn luyện an toàn."}
 
 
 @router.post("/clear")
 async def clear_training_endpoint(request: Request):
     try:
-        request.app.state.training_service.clear_state()
+        request.app.state.services.training.clear()
         return {"status": "success", "message": "Đã làm mới thông tin huấn luyện."}
     except RuntimeError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -223,21 +210,20 @@ async def clear_training_endpoint(request: Request):
 
 @router.get("/config")
 async def get_training_config_endpoint(request: Request, path: Optional[str] = None):
-    config = request.app.state.configuration_service.resolve(
+    return request.app.state.services.config.resolve_mapping(
         ConfigRequest(source=_safe_config_path(path))
     )
-    return config.to_dict()
 
 
 @router.get("/status")
 async def get_training_status_endpoint(request: Request):
-    return request.app.state.training_service.get_state()
+    return request.app.state.services.training.get_state()
 
 
 @router.get("/stream")
 async def stream_training_metrics_endpoint(request: Request):
     return TrainingStreamingResponse(
-        events=request.app.state.training_service.iter_events(),
+        events=request.app.state.services.training.iter_events(),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",

@@ -6,7 +6,7 @@ import pytest
 import torch
 import torch.nn as nn
 
-from src.application.inference import InferenceService
+from src.application.inference.service import InferenceService
 from src.core.config import GenerationConfig
 from src.core.exceptions import GenerationBusyError, SamplingError
 from src.generation import (
@@ -16,6 +16,7 @@ from src.generation import (
     TextIteratorStreamer,
     sample_next_token,
 )
+from tests.application_support import concrete_inference_runtime, make_inference_service
 
 
 class RecordingTokenizer:
@@ -44,7 +45,7 @@ class RecordingModel(nn.Module):
 
 
 def _service_without_assets(tmp_path, *, max_generation_sessions: int = 2) -> InferenceService:
-    return InferenceService(
+    return make_inference_service(
         checkpoint_dir=str(tmp_path / "checkpoints"),
         default_checkpoint=str(tmp_path / "missing.pt"),
         vocab_path=str(tmp_path / "missing_vocab.json"),
@@ -194,8 +195,8 @@ def test_stream_close_cancels_worker_and_releases_admission(tmp_path) -> None:
 
     service = _service_without_assets(tmp_path, max_generation_sessions=1)
     generator = CancellableGenerator()
-    service.tokenizer = DummyTokenizer()  # type: ignore[assignment]
-    service.generator = generator  # type: ignore[assignment]
+    concrete_inference_runtime(service).tokenizer = DummyTokenizer()  # type: ignore[assignment]
+    concrete_inference_runtime(service).generator = generator  # type: ignore[assignment]
 
     stream = service.stream_generate("A", GenerationConfig(max_new_tokens=100))
     first = next(stream)
@@ -221,8 +222,8 @@ def test_generation_admission_is_bounded_before_worker_creation(tmp_path) -> Non
             raise AssertionError("sessions are intentionally not started in this test")
 
     service = _service_without_assets(tmp_path, max_generation_sessions=2)
-    service.tokenizer = DummyTokenizer()  # type: ignore[assignment]
-    service.generator = NoopGenerator()  # type: ignore[assignment]
+    concrete_inference_runtime(service).tokenizer = DummyTokenizer()  # type: ignore[assignment]
+    concrete_inference_runtime(service).generator = NoopGenerator()  # type: ignore[assignment]
 
     first = service.begin_generation("A", GenerationConfig(max_new_tokens=1))
     second = service.begin_generation("B", GenerationConfig(max_new_tokens=1))
@@ -238,10 +239,10 @@ def test_request_backend_snapshot_does_not_mutate_global_backend(tmp_path) -> No
     tokenizer = RecordingTokenizer()
     model = RecordingModel(block_size=8, next_token=1)
     service = _service_without_assets(tmp_path)
-    service.tokenizer = tokenizer  # type: ignore[assignment]
-    service.model = model  # type: ignore[assignment]
-    service.generator = TextGenerator(model, tokenizer, device="cpu")
-    service.current_backend = "local"
+    concrete_inference_runtime(service).tokenizer = tokenizer  # type: ignore[assignment]
+    concrete_inference_runtime(service).model = model  # type: ignore[assignment]
+    concrete_inference_runtime(service).generator = TextGenerator(model, tokenizer, device="cpu")
+    concrete_inference_runtime(service).backend = "local"
 
     events = list(
         service.stream_generate(
@@ -297,13 +298,13 @@ def test_alternate_backend_factory_waits_for_execution_slot(tmp_path) -> None:
     name = "deferred-factory-test"
     original = dict(GeneratorRegistry._registry)
     service = _service_without_assets(tmp_path)
-    service.tokenizer = DummyTokenizer()  # type: ignore[assignment]
-    service.model = object()  # type: ignore[assignment]
-    service.generator = DeferredFactoryGenerator()
-    service.current_backend = "local"
+    concrete_inference_runtime(service).tokenizer = DummyTokenizer()  # type: ignore[assignment]
+    concrete_inference_runtime(service).model = object()  # type: ignore[assignment]
+    concrete_inference_runtime(service).generator = DeferredFactoryGenerator()
+    concrete_inference_runtime(service).backend = "local"
 
     GeneratorRegistry.register(name)(DeferredFactoryGenerator)
-    service._generation_lock.acquire()
+    concrete_inference_runtime(service)._generation_lock.acquire()
     session = None
     consumer = None
     try:
@@ -315,13 +316,13 @@ def test_alternate_backend_factory_waits_for_execution_slot(tmp_path) -> None:
         time.sleep(0.08)
         assert not factory_called.is_set()
 
-        service._generation_lock.release()
+        concrete_inference_runtime(service)._generation_lock.release()
         consumer.join(timeout=1.0)
         assert not consumer.is_alive()
         assert factory_called.is_set()
     finally:
-        if service._generation_lock.locked():
-            service._generation_lock.release()
+        if concrete_inference_runtime(service)._generation_lock.locked():
+            concrete_inference_runtime(service)._generation_lock.release()
         if session is not None:
             session.close()
         if consumer is not None:
@@ -361,10 +362,10 @@ def test_stop_words_are_encoded_from_the_session_tokenizer_snapshot(tmp_path) ->
             )
 
     service = _service_without_assets(tmp_path)
-    service.tokenizer = TokenizerA()  # type: ignore[assignment]
-    service.generator = CapturingGenerator()  # type: ignore[assignment]
+    concrete_inference_runtime(service).tokenizer = TokenizerA()  # type: ignore[assignment]
+    concrete_inference_runtime(service).generator = CapturingGenerator()  # type: ignore[assignment]
     session = service.begin_generation("A", GenerationConfig(max_new_tokens=1), stop_words=["ab"])
-    service.tokenizer = TokenizerB()  # type: ignore[assignment]
+    concrete_inference_runtime(service).tokenizer = TokenizerB()  # type: ignore[assignment]
 
     list(session.iter_events())
 
@@ -384,8 +385,8 @@ def test_checkpoint_and_global_backend_mutation_are_rejected_while_session_is_li
         pass
 
     service = _service_without_assets(tmp_path)
-    service.tokenizer = DummyTokenizer()  # type: ignore[assignment]
-    service.generator = NoopGenerator()  # type: ignore[assignment]
+    concrete_inference_runtime(service).tokenizer = DummyTokenizer()  # type: ignore[assignment]
+    concrete_inference_runtime(service).generator = NoopGenerator()  # type: ignore[assignment]
     session = service.begin_generation("A", GenerationConfig(max_new_tokens=1))
     try:
         with pytest.raises(GenerationBusyError):
@@ -422,8 +423,8 @@ def test_done_payload_uses_authoritative_generation_output(tmp_path) -> None:
             )
 
     service = _service_without_assets(tmp_path)
-    service.tokenizer = DummyTokenizer()  # type: ignore[assignment]
-    service.generator = DivergentGenerator()  # type: ignore[assignment]
+    concrete_inference_runtime(service).tokenizer = DummyTokenizer()  # type: ignore[assignment]
+    concrete_inference_runtime(service).generator = DivergentGenerator()  # type: ignore[assignment]
 
     events = list(service.stream_generate("A", GenerationConfig(max_new_tokens=1)))
     done = next(event for event in events if event["type"] == "done")
@@ -509,10 +510,10 @@ def test_request_backend_uses_backend_inference_factory_hook(tmp_path) -> None:
     try:
         GeneratorRegistry.register(name)(FactoryGenerator)
         service = _service_without_assets(tmp_path)
-        service.tokenizer = DummyTokenizer()  # type: ignore[assignment]
-        service.model = object()  # type: ignore[assignment]
-        service.generator = FactoryGenerator("current")
-        service.current_backend = "local"
+        concrete_inference_runtime(service).tokenizer = DummyTokenizer()  # type: ignore[assignment]
+        concrete_inference_runtime(service).model = object()  # type: ignore[assignment]
+        concrete_inference_runtime(service).generator = FactoryGenerator("current")
+        concrete_inference_runtime(service).backend = "local"
 
         events = list(
             service.stream_generate("A", GenerationConfig(max_new_tokens=1), backend=name)
@@ -555,7 +556,7 @@ def test_generation_streaming_response_closes_session_on_asgi_send_disconnect() 
 
     from starlette.requests import ClientDisconnect
 
-    from src.application.inference import GenerationSession
+    from src.inference.api import GenerationSession
     from src.ui.responses import GenerationStreamingResponse
 
     class FakeSession:
@@ -676,13 +677,13 @@ def test_checkpoint_load_stages_checkpoint_on_cpu_before_device_commit(
     class FakeGenerator:
         pass
 
-    service = InferenceService(
+    service = make_inference_service(
         checkpoint_dir=str(tmp_path),
         default_checkpoint=str(tmp_path / "missing.pt"),
         vocab_path=str(vocab_path),
         device="cpu",
     )
-    service.device_str = "cuda:0"
+    concrete_inference_runtime(service).device = "cuda:0"
 
     real_load = torch.load
     load_calls = []
@@ -748,18 +749,18 @@ def test_checkpoint_swap_offloads_previous_model_before_new_device_move(
 
     old_model = TrackingModel("old")
     new_model = TrackingModel("new")
-    service = InferenceService(
+    service = make_inference_service(
         checkpoint_dir=str(tmp_path),
         default_checkpoint=str(tmp_path / "missing.pt"),
         vocab_path=str(vocab_path),
         device="cpu",
     )
     service.configured_device = "cuda:0"
-    service.device_str = "cuda:0"
+    concrete_inference_runtime(service).device = "cuda:0"
     monkeypatch.setattr("src.inference.runtime.resolve_device", lambda requested: requested)
-    service.model = old_model  # type: ignore[assignment]
-    service.tokenizer = tokenizer
-    service.generator = FakeGenerator()  # type: ignore[assignment]
+    concrete_inference_runtime(service).model = old_model  # type: ignore[assignment]
+    concrete_inference_runtime(service).tokenizer = tokenizer
+    concrete_inference_runtime(service).generator = FakeGenerator()  # type: ignore[assignment]
 
     monkeypatch.setattr(ModelRegistry, "create", lambda *args, **kwargs: new_model)
     monkeypatch.setattr(
@@ -771,7 +772,7 @@ def test_checkpoint_swap_offloads_previous_model_before_new_device_move(
     service.load_checkpoint(str(checkpoint_path))
 
     assert moves.index(("old", "cpu")) < moves.index(("new", "cuda:0"))
-    assert service.model is new_model
+    assert concrete_inference_runtime(service).model is new_model
 
 
 def test_checkpoint_swap_restores_previous_model_if_new_device_move_fails(
@@ -817,19 +818,19 @@ def test_checkpoint_swap_restores_previous_model_if_new_device_move_fails(
 
     old_model = OldModel()
     old_generator = OldGenerator()
-    service = InferenceService(
+    service = make_inference_service(
         checkpoint_dir=str(tmp_path),
         default_checkpoint=str(tmp_path / "missing.pt"),
         vocab_path=str(vocab_path),
         device="cpu",
     )
     service.configured_device = "cuda:0"
-    service.device_str = "cuda:0"
+    concrete_inference_runtime(service).device = "cuda:0"
     monkeypatch.setattr("src.inference.runtime.resolve_device", lambda requested: requested)
-    service.model = old_model  # type: ignore[assignment]
-    service.tokenizer = tokenizer
-    service.generator = old_generator  # type: ignore[assignment]
-    service.current_checkpoint_path = "old.pt"
+    concrete_inference_runtime(service).model = old_model  # type: ignore[assignment]
+    concrete_inference_runtime(service).tokenizer = tokenizer
+    concrete_inference_runtime(service).generator = old_generator  # type: ignore[assignment]
+    concrete_inference_runtime(service).current_checkpoint_path = "old.pt"
 
     monkeypatch.setattr(ModelRegistry, "create", lambda *args, **kwargs: FailingNewModel())
 
@@ -837,8 +838,8 @@ def test_checkpoint_swap_restores_previous_model_if_new_device_move_fails(
         service.load_checkpoint(str(checkpoint_path))
 
     assert moves == [("old", "cpu"), ("new", "cuda:0"), ("new", "cpu"), ("old", "cuda:0")]
-    assert service.model is old_model
-    assert service.generator is old_generator
+    assert concrete_inference_runtime(service).model is old_model
+    assert concrete_inference_runtime(service).generator is old_generator
     assert service.current_checkpoint_path == "old.pt"
 
 
@@ -883,8 +884,8 @@ def test_begin_generation_rejects_empty_prompt_before_admission(tmp_path) -> Non
             raise AssertionError("empty prompt must be rejected before worker creation")
 
     service = _service_without_assets(tmp_path, max_generation_sessions=1)
-    service.tokenizer = DummyTokenizer()  # type: ignore[assignment]
-    service.generator = NoopGenerator()  # type: ignore[assignment]
+    concrete_inference_runtime(service).tokenizer = DummyTokenizer()  # type: ignore[assignment]
+    concrete_inference_runtime(service).generator = NoopGenerator()  # type: ignore[assignment]
 
     with pytest.raises(EmptyPromptError):
         service.begin_generation("   ", GenerationConfig(max_new_tokens=1))
@@ -894,7 +895,7 @@ def test_begin_generation_rejects_empty_prompt_before_admission(tmp_path) -> Non
 
 
 def test_inference_generation_reservation_blocks_training_and_releases_on_close(tmp_path) -> None:
-    from src.application.runtime import AcceleratorCoordinator
+    from src.core.accelerator import AcceleratorCoordinator
     from src.core.exceptions import AcceleratorBusyError
 
     class DummyTokenizer:
@@ -908,15 +909,15 @@ def test_inference_generation_reservation_blocks_training_and_releases_on_close(
             raise AssertionError("session is intentionally never started")
 
     coordinator = AcceleratorCoordinator()
-    service = InferenceService(
+    service = make_inference_service(
         checkpoint_dir=str(tmp_path / "checkpoints"),
         default_checkpoint=str(tmp_path / "missing.pt"),
         vocab_path=str(tmp_path / "missing_vocab.json"),
         device="cuda",
         accelerator_coordinator=coordinator,
     )
-    service.tokenizer = DummyTokenizer()  # type: ignore[assignment]
-    service.generator = NoopGenerator()  # type: ignore[assignment]
+    concrete_inference_runtime(service).tokenizer = DummyTokenizer()  # type: ignore[assignment]
+    concrete_inference_runtime(service).generator = NoopGenerator()  # type: ignore[assignment]
 
     session = service.begin_generation("A", GenerationConfig(max_new_tokens=1))
     try:
@@ -930,7 +931,7 @@ def test_inference_generation_reservation_blocks_training_and_releases_on_close(
 
 
 def test_inference_generation_is_rejected_while_training_owns_accelerator(tmp_path) -> None:
-    from src.application.runtime import AcceleratorCoordinator
+    from src.core.accelerator import AcceleratorCoordinator
     from src.core.exceptions import AcceleratorBusyError
 
     class DummyTokenizer:
@@ -940,15 +941,15 @@ def test_inference_generation_is_rejected_while_training_owns_accelerator(tmp_pa
             return [1]
 
     coordinator = AcceleratorCoordinator()
-    service = InferenceService(
+    service = make_inference_service(
         checkpoint_dir=str(tmp_path / "checkpoints"),
         default_checkpoint=str(tmp_path / "missing.pt"),
         vocab_path=str(tmp_path / "missing_vocab.json"),
         device="cuda",
         accelerator_coordinator=coordinator,
     )
-    service.tokenizer = DummyTokenizer()  # type: ignore[assignment]
-    service.generator = object()  # type: ignore[assignment]
+    concrete_inference_runtime(service).tokenizer = DummyTokenizer()  # type: ignore[assignment]
+    concrete_inference_runtime(service).generator = object()  # type: ignore[assignment]
     coordinator.reserve_training("cuda")
     try:
         with pytest.raises(AcceleratorBusyError):
@@ -979,8 +980,8 @@ def test_application_generation_stream_is_transport_neutral(tmp_path) -> None:
                 finish_reason="length",
             )
 
-    service.tokenizer = DummyTokenizer()  # type: ignore[assignment]
-    service.generator = DummyGenerator()  # type: ignore[assignment]
+    concrete_inference_runtime(service).tokenizer = DummyTokenizer()  # type: ignore[assignment]
+    concrete_inference_runtime(service).generator = DummyGenerator()  # type: ignore[assignment]
 
     events = list(service.stream_generate("A", GenerationConfig(max_new_tokens=1)))
 

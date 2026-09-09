@@ -1,27 +1,21 @@
-from src.training.api import (
+from .contracts import (
     NullTrainingObserver,
-    PreparedTrainingRun,
+    TrainingCommand,
+    TrainingExecutionResult,
+    TrainingFeasibility,
     TrainingObserver,
-    TrainingPreparationAborted,
-    TrainingRunFactory,
+    TrainingStartResult,
 )
-
-from .background import TrainingService
-from .contracts import TrainingCommand, TrainingFeasibility, TrainingPlan
-from .launch import TrainingLaunchApplicationService
-from .service import TrainingApplicationService, generate_run_name
+from .gateway import TrainingGateway
+from .service import generate_run_name
 
 __all__ = [
     "NullTrainingObserver",
-    "PreparedTrainingRun",
-    "TrainingApplicationService",
     "TrainingCommand",
+    "TrainingExecutionResult",
     "TrainingFeasibility",
-    "TrainingLaunchApplicationService",
+    "TrainingGateway",
     "TrainingObserver",
-    "TrainingPlan",
-    "TrainingPreparationAborted",
-    "TrainingRunFactory",
-    "TrainingService",
+    "TrainingStartResult",
     "generate_run_name",
 ]
