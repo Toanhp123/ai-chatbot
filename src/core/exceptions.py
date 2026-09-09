@@ -34,6 +34,7 @@ class ErrorCode(str, Enum):
     HARDWARE_CUDA_UNAVAILABLE = "ERR_HW_CUDA_UNAVAILABLE"
     HARDWARE_OOM = "ERR_HW_OOM"
     HARDWARE_PERMISSION = "ERR_HW_PERMISSION"
+    HARDWARE_BUSY = "ERR_HW_BUSY"
 
     # Lỗi đường ống dữ liệu (Data Pipeline)
     DATA_FILE_NOT_FOUND = "ERR_DAT_FILE_NOT_FOUND"
@@ -202,6 +203,24 @@ class OutOfMemoryError(HardwareError):
             error_code=ErrorCode.HARDWARE_OOM,
             suggestion="Hãy giảm 'batch_size', giảm 'block_size' hoặc bật 'mixed_precision' để tiết kiệm VRAM.",
         )
+
+
+class AcceleratorBusyError(HardwareError):
+    """Raised when training and inference contend for the same accelerator family."""
+
+    def __init__(self, device: str, owner: str, requested_operation: str):
+        super().__init__(
+            message=f"Accelerator '{device}' đang được {owner} sử dụng.",
+            details={
+                "device": device,
+                "owner": owner,
+                "requested_operation": requested_operation,
+            },
+            error_code=ErrorCode.HARDWARE_BUSY,
+            suggestion="Chờ workload đang chạy hoàn tất hoặc dừng workload đó rồi thử lại.",
+        )
+        self.severity = ErrorSeverity.WARNING
+        self.is_recoverable = True
 
 
 # --- Data Pipeline Exceptions ---
@@ -597,6 +616,7 @@ __all__ = [
     "HardwareError",
     "CudaUnavailableError",
     "OutOfMemoryError",
+    "AcceleratorBusyError",
     "DataPipelineError",
     "VocabularyMissingError",
     "DatasetEmptyError",

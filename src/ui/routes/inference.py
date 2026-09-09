@@ -2,13 +2,13 @@
 Inference API Routes: Quản lý sinh văn bản streaming và tải checkpoint.
 """
 
+import asyncio
 import os
 from typing import Annotated, List, Optional
 
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, Field
 
-from src.core.config import GenerationConfig
 from src.core.exceptions import AIEngineError
 from src.ui.path_policy import resolve_path_within_root
 from src.ui.responses import GenerationStreamingResponse
@@ -33,14 +33,14 @@ class GenerateRequest(BaseModel):
         max_length=65_536,
         description="Câu mồi bắt đầu",
     )
-    temperature: float = Field(default=0.75, ge=0.0, le=2.0)
-    top_k: int = Field(default=40, ge=0, le=200)
-    top_p: float = Field(default=0.9, ge=0.0, le=1.0)
+    temperature: Optional[float] = Field(default=None, ge=0.0, le=2.0)
+    top_k: Optional[int] = Field(default=None, ge=0, le=200)
+    top_p: Optional[float] = Field(default=None, ge=0.0, le=1.0)
     min_p: Optional[float] = Field(default=None, ge=0.0, le=1.0)
-    repetition_penalty: float = Field(default=1.0, ge=1.0, le=2.0)
-    max_new_tokens: int = Field(default=200, ge=1, le=1000)
-    greedy: bool = Field(default=False)
-    use_cache: bool = Field(default=True)
+    repetition_penalty: Optional[float] = Field(default=None, ge=1.0, le=2.0)
+    max_new_tokens: Optional[int] = Field(default=None, ge=1, le=1000)
+    greedy: Optional[bool] = Field(default=None)
+    use_cache: Optional[bool] = Field(default=None)
     backend: Optional[str] = Field(
         default=None, description="Tên Generator backend trong GeneratorRegistry"
     )
@@ -70,6 +70,12 @@ async def list_generators_endpoint(request: Request):
     }
 
 
+@router.get("/inference/state")
+async def get_inference_state_endpoint(request: Request):
+    """Return authoritative inference preferences and loaded checkpoint identity."""
+    return await asyncio.to_thread(request.app.state.inference_service.get_runtime_state)
+
+
 @router.post("/generators/select")
 async def select_generator_endpoint(req: SelectGeneratorRequest, request: Request):
     """Chuyển đổi generator backend sinh văn bản theo thời gian thực."""
@@ -93,18 +99,29 @@ async def generate_stream_endpoint(req: GenerateRequest, request: Request):
     inference_service = request.app.state.inference_service
 
     requested_backend = req.backend
-    gen_config = GenerationConfig(
-        max_new_tokens=req.max_new_tokens,
-        temperature=0.0 if req.greedy else req.temperature,
-        top_k=req.top_k,
-        top_p=req.top_p,
-        min_p=req.min_p,
-        repetition_penalty=req.repetition_penalty,
-        do_sample=not req.greedy,
-        use_cache=req.use_cache,
+    defaults = inference_service.default_generation_config
+    temperature = defaults.temperature if req.temperature is None else req.temperature
+    do_sample = defaults.do_sample if req.greedy is None else not req.greedy
+    effective_temperature = 0.0 if req.greedy is True else temperature
+    gen_config = defaults.copy(
+        max_new_tokens=(
+            defaults.max_new_tokens if req.max_new_tokens is None else req.max_new_tokens
+        ),
+        temperature=effective_temperature,
+        top_k=defaults.top_k if req.top_k is None else req.top_k,
+        top_p=defaults.top_p if req.top_p is None else req.top_p,
+        min_p=defaults.min_p if req.min_p is None else req.min_p,
+        repetition_penalty=(
+            defaults.repetition_penalty
+            if req.repetition_penalty is None
+            else req.repetition_penalty
+        ),
+        do_sample=do_sample,
+        use_cache=defaults.use_cache if req.use_cache is None else req.use_cache,
     )
 
-    session = inference_service.begin_generation(
+    session = await asyncio.to_thread(
+        inference_service.begin_generation,
         req.prompt,
         gen_config,
         backend=requested_backend,
@@ -125,7 +142,7 @@ async def generate_stream_endpoint(req: GenerateRequest, request: Request):
 async def list_checkpoints_endpoint(request: Request):
     """Lấy danh sách các checkpoint có sẵn."""
     inference_service = request.app.state.inference_service
-    return {"checkpoints": inference_service.list_checkpoints()}
+    return {"checkpoints": await asyncio.to_thread(inference_service.list_checkpoints)}
 
 
 @router.post("/checkpoints/load")
@@ -133,13 +150,19 @@ async def load_checkpoint_endpoint(req: LoadCheckpointRequest, request: Request)
     """Nạp một checkpoint cụ thể vào bộ suy luận."""
     inference_service = request.app.state.inference_service
     try:
-        managed_path = inference_service.resolve_checkpoint_path(req.path)
-        inference_service.load_checkpoint(managed_path, backend=req.backend)
+        await asyncio.to_thread(
+            inference_service.load_checkpoint,
+            req.path,
+            backend=req.backend,
+            require_managed=True,
+        )
+        runtime_state = inference_service.get_runtime_state()
         return {
             "status": "success",
             "message": f"Đã nạp checkpoint thành công: {req.path}",
-            "current_checkpoint": req.path,
-            "current_backend": inference_service.current_backend,
+            "current_checkpoint": runtime_state["current_checkpoint"],
+            "current_checkpoint_revision": runtime_state["current_checkpoint_revision"],
+            "current_backend": runtime_state["current_backend"],
         }
     except FileNotFoundError as e:
         raise HTTPException(status_code=404, detail=str(e)) from e
@@ -169,8 +192,6 @@ async def delete_checkpoint_endpoint(filename: str, request: Request):
 @router.get("/checkpoints/{filename}/download")
 async def download_checkpoint_endpoint(filename: str, request: Request):
     """Tải file checkpoint trực tiếp về máy người dùng."""
-    import os
-
     from fastapi.responses import FileResponse
 
     safe_filename = os.path.basename(filename)
@@ -222,7 +243,7 @@ async def get_raw_config_endpoint(path: str = "configs/truyen_kieu.yaml"):
 
 
 @router.post("/configs/save")
-async def save_raw_config_endpoint(req: SaveConfigRequest):
+async def save_raw_config_endpoint(req: SaveConfigRequest, request: Request):
     """Validate and atomically persist an EngineConfig YAML file."""
     import tempfile
 
@@ -239,7 +260,7 @@ async def save_raw_config_endpoint(req: SaveConfigRequest):
             parsed = {}
         if not isinstance(parsed, dict):
             raise ConfigurationError("Nội dung YAML phải là một dictionary/mapping ở cấp cao nhất.")
-        EngineConfig.from_dict(parsed)
+        validated_config = EngineConfig.from_dict(parsed)
     except yaml.YAMLError as exc:
         raise HTTPException(status_code=400, detail=f"Cú pháp YAML không hợp lệ: {exc}") from exc
 
@@ -259,6 +280,8 @@ async def save_raw_config_endpoint(req: SaveConfigRequest):
             tmp.flush()
             os.fsync(tmp.fileno())
         os.replace(temp_path, norm_path)
+        if os.path.realpath(norm_path) == getattr(request.app.state, "config_path", ""):
+            request.app.state.inference_service.apply_engine_config(validated_config)
     finally:
         if temp_path and os.path.exists(temp_path):
             os.remove(temp_path)

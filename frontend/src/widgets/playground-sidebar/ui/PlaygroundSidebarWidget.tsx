@@ -217,6 +217,16 @@ export const PlaygroundSidebarWidget: React.FC<
 						onChange={(val) => updateParam("maxNewTokens", val)}
 					/>
 
+					{/* Sampling mode */}
+					<div className="pt-2 border-t border-stone-200/80">
+						<Switch
+							checked={params.doSample}
+							onChange={(val) => updateParam("doSample", val)}
+							label="Sampling"
+							description="Tắt để dùng giải mã greedy xác định"
+						/>
+					</div>
+
 					{/* KV Cache Switch */}
 					<div className="pt-2 border-t border-stone-200/80">
 						<Switch

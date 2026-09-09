@@ -32,10 +32,12 @@ _BAD_REQUEST_CODES = {
 }
 _TOO_MANY_REQUESTS_CODES = {ErrorCode.GEN_BUSY}
 _SERVICE_UNAVAILABLE_CODES = {ErrorCode.GEN_NOT_READY}
+_CONFLICT_CODES = {ErrorCode.HARDWARE_BUSY}
 _HARDWARE_CODES = {
     ErrorCode.HARDWARE_CUDA_UNAVAILABLE,
     ErrorCode.HARDWARE_OOM,
     ErrorCode.HARDWARE_PERMISSION,
+    ErrorCode.HARDWARE_BUSY,
     ErrorCode.DIAG_HEALTH_FAILED,
 }
 
@@ -50,6 +52,8 @@ def status_code_for_ai_error(error: AIEngineError) -> int:
         return 429
     if error.error_code in _SERVICE_UNAVAILABLE_CODES:
         return 503
+    if error.error_code in _CONFLICT_CODES:
+        return 409
     if error.error_code in _HARDWARE_CODES:
         return 503
     return 500

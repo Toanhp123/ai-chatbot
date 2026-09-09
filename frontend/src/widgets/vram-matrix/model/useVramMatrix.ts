@@ -1,100 +1,80 @@
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
 import { hardwareApi } from "@/entities/hardware";
 import type {
+	VRAMEstimateRequest,
 	VramScenariosResponse,
 	VramScenarioItem,
 } from "@/entities/hardware";
+import {
+	DEFAULT_TRAINING_CONFIG_PATH,
+	trainingApi,
+} from "@/entities/training";
+import type { TrainingScenarioOverrides } from "@/entities/training";
+import { resolvedConfigToVramParams } from "./scenarioMapping";
 
-export interface VramScenarioConfig {
-	batch_size?: number;
-	gradient_accumulation_steps?: number;
-	precision?: string;
-	gradient_checkpointing?: boolean;
-	optimizer_type?: string;
-}
+export type VramScenarioConfig = TrainingScenarioOverrides;
 
 export interface UseVramMatrixProps {
 	onApplyScenario?: (scenarioConfig: VramScenarioConfig) => void;
+	configRevision?: number;
 }
 
-export function useVramMatrix({ onApplyScenario }: UseVramMatrixProps = {}) {
+export function useVramMatrix({
+	onApplyScenario,
+	configRevision = 0,
+}: UseVramMatrixProps = {}) {
 	const [data, setData] = useState<VramScenariosResponse | null>(null);
 	const [loading, setLoading] = useState(true);
 	const [error, setError] = useState<string | null>(null);
-	const [selectedScenarioId, setSelectedScenarioId] =
-		useState<string>("amp_mixed");
+	const [selectedScenarioId, setSelectedScenarioId] = useState<string>("");
 	const [appliedId, setAppliedId] = useState<string | null>(null);
-
-	const [params] = useState({
-		batch_size: 64,
-		block_size: 128,
-		n_embd: 192,
-		n_layer: 4,
-		n_head: 6,
-		vocab_size: 129,
-		gradient_accumulation_steps: 1,
-	});
+	const [params, setParams] = useState<VRAMEstimateRequest | null>(null);
+	const requestRef = useRef(0);
 
 	const fetchScenarios = useCallback(async () => {
+		const requestId = ++requestRef.current;
 		setLoading(true);
 		setError(null);
 		try {
-			const res = await hardwareApi.getVramScenarios(params);
+			const config = await trainingApi.getResolvedConfig(
+				DEFAULT_TRAINING_CONFIG_PATH,
+			);
+			if (requestId !== requestRef.current) return;
+			const canonicalParams = resolvedConfigToVramParams(config);
+			const res = await hardwareApi.getVramScenarios(canonicalParams);
+			if (requestId !== requestRef.current) return;
+			setParams(canonicalParams);
 			setData(res);
-			if (res.recommended && !selectedScenarioId) {
-				setSelectedScenarioId(res.recommended.id);
-			}
+			setSelectedScenarioId((current) => {
+				if (current && res.scenarios.some((item) => item.id === current)) {
+					return current;
+				}
+				return res.recommended?.id ?? res.scenarios[0]?.id ?? "";
+			});
 		} catch (err: unknown) {
+			if (requestId !== requestRef.current) return;
 			const errObj = err as Error;
 			setError(errObj.message || "Không thể tính toán ma trận VRAM");
 		} finally {
-			setLoading(false);
+			if (requestId === requestRef.current) setLoading(false);
 		}
-	}, [params, selectedScenarioId]);
+	}, [configRevision]);
 
 	useEffect(() => {
-		let isMounted = true;
-		hardwareApi
-			.getVramScenarios(params)
-			.then((res) => {
-				if (isMounted) {
-					setData(res);
-					if (res.recommended) {
-						setSelectedScenarioId(
-							(prev) =>
-								prev || res.recommended?.id || "amp_mixed",
-						);
-					}
-				}
-			})
-			.catch((err: unknown) => {
-				if (isMounted) {
-					const errObj = err as Error;
-					setError(
-						errObj.message || "Không thể tính toán ma trận VRAM",
-					);
-				}
-			})
-			.finally(() => {
-				if (isMounted) setLoading(false);
-			});
-
-		return () => {
-			isMounted = false;
-		};
-	}, [params]);
+		void fetchScenarios();
+	}, [fetchScenarios]);
 
 	const handleApply = (sc: VramScenarioItem) => {
+		if (!onApplyScenario) return;
+		onApplyScenario({
+			batch_size: sc.batch_size,
+			gradient_accumulation_steps:
+				params?.gradient_accumulation_steps ?? 1,
+			precision: sc.precision,
+			gradient_checkpointing: sc.gradient_checkpointing,
+			optimizer_type: sc.optimizer,
+		});
 		setAppliedId(sc.id);
-		if (onApplyScenario) {
-			onApplyScenario({
-				batch_size: params.batch_size,
-				gradient_accumulation_steps: params.gradient_accumulation_steps,
-				precision: sc.precision,
-				gradient_checkpointing: sc.gradient_checkpointing,
-				optimizer_type: sc.optimizer,
-			});
-		}
 	};
 
 	return {

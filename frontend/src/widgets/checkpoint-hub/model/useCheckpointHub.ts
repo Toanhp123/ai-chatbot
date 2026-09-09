@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef, useMemo } from "react";
-import { checkpointApi } from "@/entities/checkpoint";
+import { checkpointApi, loadCheckpointThenCommit } from "@/entities/checkpoint";
 import type { Checkpoint } from "@/entities/checkpoint";
 
 export interface UseCheckpointHubProps {
@@ -8,6 +8,7 @@ export interface UseCheckpointHubProps {
 	onLoad?: (path: string) => void;
 	onDelete?: (filename: string) => void;
 	isLoading?: boolean;
+	configRevision?: number;
 }
 
 export function useCheckpointHub({
@@ -16,14 +17,17 @@ export function useCheckpointHub({
 	onLoad: controlledLoad,
 	onDelete: controlledDelete,
 	isLoading: controlledLoading,
+	configRevision = 0,
 }: UseCheckpointHubProps = {}) {
 	const [internalList, setInternalList] = useState<Checkpoint[]>([]);
 	const [loading, setLoading] = useState(false);
 	const [searchTerm, setSearchTerm] = useState("");
 	const isFetchingRef = useRef(false);
 	const queuedRef = useRef(false);
+	const requestRef = useRef(0);
 
 	const fetchCheckpoints = async () => {
+		++requestRef.current;
 		if (isFetchingRef.current) {
 			queuedRef.current = true;
 			return;
@@ -35,9 +39,11 @@ export function useCheckpointHub({
 		try {
 			do {
 				queuedRef.current = false;
+				const requestId = requestRef.current;
 				const startTime = Date.now();
 				try {
 					const data = await checkpointApi.getCheckpoints();
+					if (requestId !== requestRef.current) continue;
 					setInternalList(data.checkpoints || []);
 				} catch {
 					// ignore
@@ -57,10 +63,11 @@ export function useCheckpointHub({
 	useEffect(() => {
 		if (controlledCheckpoints) return;
 		let isMounted = true;
+		const requestId = ++requestRef.current;
 		checkpointApi
 			.getCheckpoints()
 			.then((data) => {
-				if (isMounted) {
+				if (isMounted && requestId === requestRef.current) {
 					setInternalList(data.checkpoints || []);
 				}
 			})
@@ -69,16 +76,16 @@ export function useCheckpointHub({
 		return () => {
 			isMounted = false;
 		};
-	}, [controlledCheckpoints]);
+	}, [controlledCheckpoints, configRevision]);
 
 	const rawCheckpoints = controlledCheckpoints || internalList;
 
-	// Sắp xếp: best_model.pt luôn ở vị trí đầu tiên, còn lại sắp xếp theo thời gian mới nhất (giảm dần)
+	// Sắp xếp: checkpoint được cấu hình làm best luôn ở đầu, còn lại theo thời gian mới nhất (giảm dần)
 	const checkpoints = useMemo(() => {
 		return [...rawCheckpoints].sort((a, b) => {
-			// 1. best_model.pt luôn ở trên đỉnh
-			const isBestA = a.filename === "best_model.pt";
-			const isBestB = b.filename === "best_model.pt";
+			// 1. Checkpoint best theo cấu hình luôn ở trên đỉnh
+			const isBestA = Boolean(a.is_configured_best);
+			const isBestB = Boolean(b.is_configured_best);
 			if (isBestA && !isBestB) return -1;
 			if (!isBestA && isBestB) return 1;
 
@@ -130,17 +137,23 @@ export function useCheckpointHub({
 		}
 	};
 
-	const handleLoad = async (path: string) => {
-		if (controlledLoad) {
-			controlledLoad(path);
-		} else {
-			try {
-				await checkpointApi.loadCheckpoint(path);
-				fetchCheckpoints();
-			} catch (err: unknown) {
-				const error = err as Error;
-				alert(`Lỗi nạp checkpoint: ${error.message}`);
+	const handleLoad = async (path: string, onLoaded?: (path: string) => void) => {
+		try {
+			if (controlledLoad) {
+				await Promise.resolve(controlledLoad(path));
+				onLoaded?.(path);
+				return;
 			}
+
+			await loadCheckpointThenCommit(
+				(checkpointPath) => checkpointApi.loadCheckpoint(checkpointPath),
+				path,
+				(loadedPath) => onLoaded?.(loadedPath),
+			);
+			await fetchCheckpoints();
+		} catch (err: unknown) {
+			const error = err as Error;
+			alert(`Lỗi nạp checkpoint: ${error.message}`);
 		}
 	};
 

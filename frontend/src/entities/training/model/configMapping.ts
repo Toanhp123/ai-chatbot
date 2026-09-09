@@ -3,6 +3,8 @@ import type {
 	ResolvedTrainingConfig,
 	TrainingConfigForm,
 	TrainingOverrideField,
+	TrainingScenarioOverrides,
+	TrainingScenarioUpdate,
 } from "./types";
 
 export const DEFAULT_TRAINING_CONFIG_PATH = "configs/truyen_kieu.yaml";
@@ -73,4 +75,45 @@ export function buildTrainingOverrides(
 			| boolean;
 	}
 	return overrides;
+}
+
+
+export function applyTrainingScenarioOverrides(
+	form: TrainingConfigForm,
+	overrides: TrainingScenarioOverrides,
+): { form: TrainingConfigForm; overrideFields: TrainingOverrideField[] } {
+	const next = { ...form };
+	const fields: TrainingOverrideField[] = [];
+	const keys = Object.keys(overrides) as (keyof TrainingScenarioOverrides)[];
+	for (const key of keys) {
+		const value = overrides[key];
+		if (value === undefined || next[key] === value) continue;
+		(next as unknown as Record<string, unknown>)[key] = value;
+		fields.push(key);
+	}
+	return { form: next, overrideFields: fields };
+}
+
+
+export function shouldApplyTrainingScenario(
+	scenario: Pick<TrainingScenarioUpdate, "revision"> | null | undefined,
+	lastAppliedRevision: number,
+): boolean {
+	return Boolean(scenario && scenario.revision > lastAppliedRevision);
+}
+
+export function applyTrainingScenarioUpdate(
+	form: TrainingConfigForm,
+	scenario: TrainingScenarioUpdate | null | undefined,
+	lastAppliedRevision: number,
+): {
+	form: TrainingConfigForm;
+	overrideFields: TrainingOverrideField[];
+	appliedRevision: number;
+} {
+	if (!shouldApplyTrainingScenario(scenario, lastAppliedRevision) || !scenario) {
+		return { form, overrideFields: [], appliedRevision: lastAppliedRevision };
+	}
+	const applied = applyTrainingScenarioOverrides(form, scenario.overrides);
+	return { ...applied, appliedRevision: scenario.revision };
 }

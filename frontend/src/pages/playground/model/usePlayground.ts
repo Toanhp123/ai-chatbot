@@ -1,17 +1,23 @@
-import { useState, useEffect, useCallback } from "react";
-import { checkpointApi } from "@/entities/checkpoint";
+import { useState, useEffect, useCallback, useRef } from "react";
+import { checkpointApi, loadCheckpointThenCommit } from "@/entities/checkpoint";
 import type { Checkpoint } from "@/entities/checkpoint";
-import { useGenerateStream } from "@/features/generate";
+import {
+	buildGenerationSamplingOverrides,
+	generationConfigToSamplingParams,
+	useGenerateStream,
+} from "@/features/generate";
 import type { SamplingHyperparams } from "@/features/generate";
 
 export interface UsePlaygroundProps {
 	activeCheckpoint?: string;
 	onCheckpointLoaded?: (path: string) => void;
+	configRevision?: number;
 }
 
 export function usePlayground({
 	activeCheckpoint = "",
 	onCheckpointLoaded,
+	configRevision = 0,
 }: UsePlaygroundProps = {}) {
 	const [prompt, setPrompt] = useState("");
 	const [submittedPrompt, setSubmittedPrompt] = useState("");
@@ -27,6 +33,12 @@ export function usePlayground({
 	const [selectedGenerator, setSelectedGenerator] =
 		useState<string>("default");
 	const [isLoadingCp, setIsLoadingCp] = useState<boolean>(false);
+	const [samplingHydratedRevision, setSamplingHydratedRevision] = useState(-1);
+	const [backendAuthoritative, setBackendAuthoritative] = useState(false);
+	const samplingDirtyFieldsRef = useRef<Set<keyof SamplingHyperparams>>(new Set());
+	const inferenceStateRequestRef = useRef(0);
+	const checkpointListRequestRef = useRef(0);
+	const backendMutationVersionRef = useRef(0);
 
 	const [params, setParams] = useState<SamplingHyperparams>({
 		temperature: 0.8,
@@ -35,6 +47,7 @@ export function usePlayground({
 		minP: 0.05,
 		repetitionPenalty: 1.1,
 		maxNewTokens: 128,
+		doSample: true,
 		useCache: true,
 		stopWords: "",
 	});
@@ -43,27 +56,80 @@ export function usePlayground({
 		useGenerateStream();
 
 	useEffect(() => {
-		let isMounted = true;
+		if (activeCheckpoint) setSelectedCheckpoint(activeCheckpoint);
+	}, [activeCheckpoint]);
 
+	useEffect(() => {
+		let isMounted = true;
+		const requestId = ++inferenceStateRequestRef.current;
+		const backendVersionAtStart = backendMutationVersionRef.current;
+		samplingDirtyFieldsRef.current = new Set();
+		setSamplingHydratedRevision(-1);
 		checkpointApi
-			.getCheckpoints()
-			.then((data) => {
-				if (!isMounted) return;
-				const list = data.checkpoints || [];
-				setCheckpoints(list);
-				if (list.length > 0) {
-					setSelectedCheckpoint((current) => current || list[0].path);
+			.getInferenceState()
+			.then((state) => {
+				if (!isMounted || requestId !== inferenceStateRequestRef.current) return;
+				const canonicalParams = generationConfigToSamplingParams(state.generation);
+				setParams((current) => {
+					const merged = { ...canonicalParams };
+					for (const field of samplingDirtyFieldsRef.current) {
+						(merged as unknown as Record<string, unknown>)[field] = current[field];
+					}
+					return merged;
+				});
+				setSamplingHydratedRevision(configRevision);
+				if (backendMutationVersionRef.current === backendVersionAtStart) {
+					setSelectedGenerator(state.current_backend);
+					setBackendAuthoritative(true);
+				}
+				if (state.current_checkpoint) {
+					setSelectedCheckpoint(state.current_checkpoint);
 				}
 			})
 			.catch(() => {});
+		return () => {
+			isMounted = false;
+		};
+	}, [configRevision]);
 
+	useEffect(() => {
+		let isMounted = true;
+		const requestId = ++checkpointListRequestRef.current;
+		checkpointApi
+			.getCheckpoints()
+			.then((data) => {
+				if (!isMounted || requestId !== checkpointListRequestRef.current) return;
+				const list = data.checkpoints || [];
+				setCheckpoints(list);
+				setSelectedCheckpoint((current) => {
+					if (current && list.some((checkpoint) => checkpoint.path === current)) {
+						return current;
+					}
+					return list[0]?.path ?? "";
+				});
+			})
+			.catch(() => {});
+
+		return () => {
+			isMounted = false;
+		};
+	}, [configRevision]);
+
+	useEffect(() => {
+		let isMounted = true;
+		const backendVersionAtStart = backendMutationVersionRef.current;
 		checkpointApi
 			.getGenerators()
 			.then((data) => {
 				if (!isMounted) return;
 				if (data.generators) setGenerators(data.generators);
-				if (data.current_backend)
+				if (
+					data.current_backend &&
+					backendMutationVersionRef.current === backendVersionAtStart
+				) {
 					setSelectedGenerator(data.current_backend);
+					setBackendAuthoritative(true);
+				}
 			})
 			.catch(() => {});
 
@@ -76,7 +142,9 @@ export function usePlayground({
 		if (isGenerating || gen === selectedGenerator) return;
 		try {
 			await checkpointApi.selectGenerator(gen);
+			backendMutationVersionRef.current += 1;
 			setSelectedGenerator(gen);
+			setBackendAuthoritative(true);
 		} catch (err: unknown) {
 			const error = err as Error;
 			alert(`Không thể đổi generator: ${error.message}`);
@@ -87,11 +155,21 @@ export function usePlayground({
 		if (!selectedCheckpoint) return;
 		setIsLoadingCp(true);
 		try {
-			await checkpointApi.loadCheckpoint(
+			await loadCheckpointThenCommit(
+				(path) =>
+					checkpointApi.loadCheckpoint(
+						path,
+						backendAuthoritative ? selectedGenerator : undefined,
+					),
 				selectedCheckpoint,
-				selectedGenerator,
+				(loadedPath, result) => {
+					backendMutationVersionRef.current += 1;
+					setSelectedCheckpoint(loadedPath);
+					setSelectedGenerator(result.current_backend);
+					setBackendAuthoritative(true);
+					onCheckpointLoaded?.(loadedPath);
+				},
 			);
-			onCheckpointLoaded?.(selectedCheckpoint);
 		} catch (err: unknown) {
 			const error = err as Error;
 			alert(`Lỗi nạp checkpoint: ${error.message}`);
@@ -99,6 +177,17 @@ export function usePlayground({
 			setIsLoadingCp(false);
 		}
 	};
+
+	const handleParamsChange = useCallback((next: SamplingHyperparams) => {
+		setParams((current) => {
+			const dirty = new Set(samplingDirtyFieldsRef.current);
+			for (const field of Object.keys(current) as (keyof SamplingHyperparams)[]) {
+				if (current[field] !== next[field]) dirty.add(field);
+			}
+			samplingDirtyFieldsRef.current = dirty;
+			return next;
+		});
+	}, []);
 
 	const handleStartGenerate = useCallback(
 		(overridePrompt?: string) => {
@@ -120,18 +209,17 @@ export function usePlayground({
 				.map((s) => s.trim())
 				.filter((s) => s.length > 0);
 
+			const samplingOverrides = buildGenerationSamplingOverrides(
+				params,
+				samplingHydratedRevision === configRevision,
+				samplingDirtyFieldsRef.current,
+			);
+
 			generate(
 				{
 					prompt: targetPrompt,
-					temperature: params.temperature,
-					top_k: params.topK,
-					top_p: params.topP,
-					min_p: params.minP > 0 ? params.minP : null,
-					repetition_penalty: params.repetitionPenalty,
-					max_new_tokens: params.maxNewTokens,
-					greedy: params.temperature <= 0,
-					use_cache: params.useCache,
-					backend: selectedGenerator,
+					...samplingOverrides,
+					backend: backendAuthoritative ? selectedGenerator : undefined,
 					stop_words: stops.length > 0 ? stops : undefined,
 				},
 				(err) => alert(err),
@@ -143,6 +231,9 @@ export function usePlayground({
 			isGenerating,
 			params,
 			selectedGenerator,
+			backendAuthoritative,
+			samplingHydratedRevision,
+			configRevision,
 			generate,
 			stop,
 		],
@@ -167,7 +258,7 @@ export function usePlayground({
 		selectedGenerator,
 		isLoadingCp,
 		params,
-		setParams,
+		setParams: handleParamsChange,
 		isGenerating,
 		generatedText,
 		stats,

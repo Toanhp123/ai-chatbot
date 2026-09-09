@@ -9,6 +9,8 @@ import {
 } from "@/pages";
 import { useConfigEditor } from "@/features/config";
 import { trainingApi } from "@/entities/training";
+import type { TrainingScenarioUpdate } from "@/entities/training";
+import { checkpointApi } from "@/entities/checkpoint";
 import { AppShell } from "@/shared/ui";
 import { ToastProvider, useToast } from "./providers";
 
@@ -19,6 +21,7 @@ function AIStudioContent() {
 	const [isSidebarCollapsed, setIsSidebarCollapsed] =
 		useState<boolean>(false);
 	const [configRevision, setConfigRevision] = useState(0);
+	const [trainingScenario, setTrainingScenario] = useState<TrainingScenarioUpdate | null>(null);
 	const resetPlaygroundRef = useRef<(() => void) | null>(null);
 
 	const { toast } = useToast();
@@ -32,6 +35,14 @@ function AIStudioContent() {
 			mainEl.scrollTo({ top: 0, left: 0, behavior: "instant" });
 		}
 	}, [activeTab]);
+
+	useEffect(() => {
+		let mounted = true;
+		checkpointApi.getInferenceState().then((state) => {
+			if (mounted) setActiveCheckpoint(state.current_checkpoint ?? "");
+		}).catch(() => {});
+		return () => { mounted = false; };
+	}, [configRevision]);
 
 	// Poll system/training status periodically to keep status indicator up to date
 	useEffect(() => {
@@ -137,6 +148,7 @@ function AIStudioContent() {
 				<PlaygroundPage
 					activeCheckpoint={activeCheckpoint}
 					onCheckpointLoaded={handleCheckpointLoaded}
+					configRevision={configRevision}
 					onRegisterReset={(resetFn) => {
 						resetPlaygroundRef.current = resetFn;
 					}}
@@ -154,6 +166,7 @@ function AIStudioContent() {
 					activeCheckpoint={activeCheckpoint}
 					onCheckpointLoaded={handleCheckpointLoaded}
 					configRevision={configRevision}
+					trainingScenario={trainingScenario}
 				/>
 			</div>
 
@@ -164,7 +177,16 @@ function AIStudioContent() {
 						: "hidden"
 				}
 			>
-				<DiagnosticsPage />
+				<DiagnosticsPage
+					configRevision={configRevision}
+					onApplyTrainingScenario={(overrides) => {
+						setTrainingScenario((current) => ({
+							revision: (current?.revision ?? 0) + 1,
+							overrides,
+						}));
+						setActiveTab("training");
+					}}
+				/>
 			</div>
 
 			<div
@@ -174,7 +196,7 @@ function AIStudioContent() {
 						: "hidden"
 				}
 			>
-				<ExplorerPage />
+				<ExplorerPage configRevision={configRevision} />
 			</div>
 
 			{/* Config Editor Modal */}

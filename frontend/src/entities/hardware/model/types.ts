@@ -105,6 +105,7 @@ export interface VramScenariosResponse {
 }
 
 export interface VRAMEstimateRequest {
+	device?: string;
 	model_name?: string;
 	batch_size?: number;
 	block_size?: number;

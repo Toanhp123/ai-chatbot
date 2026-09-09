@@ -1,13 +1,13 @@
 export interface GenerationParams {
 	prompt: string;
-	temperature: number;
-	top_k: number;
-	top_p: number;
+	temperature?: number;
+	top_k?: number;
+	top_p?: number;
 	min_p?: number | null;
-	repetition_penalty: number;
-	max_new_tokens: number;
-	greedy: boolean;
-	use_cache: boolean;
+	repetition_penalty?: number;
+	max_new_tokens?: number;
+	greedy?: boolean;
+	use_cache?: boolean;
 	backend?: string;
 	stop_words?: string[];
 }
@@ -25,6 +25,7 @@ export interface SamplingHyperparams {
 	minP: number;
 	repetitionPenalty: number;
 	maxNewTokens: number;
+	doSample: boolean;
 	useCache: boolean;
 	stopWords: string;
 }

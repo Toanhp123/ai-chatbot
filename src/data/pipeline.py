@@ -49,8 +49,10 @@ class DataPipeline:
             cleaner_kwargs.setdefault("normalize_punct", True)
             cleaner = get_cleaner(cleaner_type, **cleaner_kwargs)
 
-        # 1. Đọc file có sẵn nếu tồn tại
-        if os.path.exists(config.input_file) and os.path.getsize(config.input_file) > 100:
+        # 1. Existing local data is authoritative regardless of size. Never overwrite
+        # a user-provided corpus merely because it is small; downstream validation
+        # is responsible for rejecting genuinely insufficient datasets.
+        if os.path.isfile(config.input_file):
             logger.info(f"Đọc dữ liệu từ file có sẵn: {config.input_file}")
             with open(config.input_file, "r", encoding="utf-8", errors="replace") as f:
                 raw_text = f.read()

@@ -1,5 +1,7 @@
+from typing import cast
 from unittest.mock import Mock, patch
 
+import pytest
 import torch
 
 from src.core.config import EngineConfig
@@ -347,3 +349,327 @@ def test_late_stop_request_does_not_overwrite_already_completed_trainer_result()
     state = service.get_state()
     assert state["status"] == "COMPLETED"
     assert state["termination_reason"] == "COMPLETED"
+
+
+def test_training_worker_uses_resolved_config_snapshot_without_rereading_yaml():
+    service = TrainingService()
+    config = EngineConfig().copy(system=EngineConfig().system.copy(device="cpu"))
+    runtime_plan = resolve_training_plan(
+        config,
+        capabilities=RuntimeCapabilities(
+            cuda_available=False,
+            mps_available=False,
+            bf16_supported=False,
+            bitsandbytes_available=False,
+        ),
+    )
+    tokenizer = Mock(vocab_size=32)
+    model = Mock()
+
+    class FakeTrainer:
+        def __init__(self, **kwargs):
+            self.config = kwargs["config"]
+
+        def train(self, resume_checkpoint=None):
+            return TrainOutput(
+                global_step=0, total_steps=1, final_train_loss=0.0, interrupted=False
+            )
+
+    with (
+        patch(
+            "src.ui.services.training_service.EngineConfig.from_yaml",
+            side_effect=AssertionError("worker must not re-read mutable YAML"),
+        ),
+        patch(
+            "src.ui.services.training_service.DataPipeline.setup_data",
+            return_value=(torch.arange(64), torch.arange(32), tokenizer),
+        ),
+        patch("src.ui.services.training_service.get_batch_provider", return_value=Mock()),
+        patch("src.ui.services.training_service.ModelRegistry.create", return_value=model),
+        patch("src.ui.services.training_service.get_generator", return_value=Mock()),
+        patch("src.ui.services.training_service.Trainer", FakeTrainer),
+    ):
+        service.start_training(config_snapshot=config, runtime_plan=runtime_plan)
+        assert service._thread is not None
+        service._thread.join(timeout=1.0)
+
+    assert service.status == "COMPLETED"
+
+
+def test_training_service_defensively_copies_config_snapshot_before_worker_runs():
+    service = TrainingService()
+    config = EngineConfig().copy(
+        system=EngineConfig().system.copy(device="cpu"),
+        training=EngineConfig().training.copy(max_iters=123, run_name="stable"),
+    )
+    runtime_plan = resolve_training_plan(
+        config,
+        capabilities=RuntimeCapabilities(
+            cuda_available=False,
+            mps_available=False,
+            bf16_supported=False,
+            bitsandbytes_available=False,
+        ),
+    )
+    observed = {}
+
+    def setup_data(*args, **kwargs):
+        observed["max_iters"] = captured.training.max_iters
+        observed["run_name"] = captured.training.run_name
+        return torch.arange(64), torch.arange(32), Mock(vocab_size=32)
+
+    captured = config
+
+    class FakeTrainer:
+        def __init__(self, **kwargs):
+            observed["worker_config"] = kwargs["config"]
+
+        def train(self, resume_checkpoint=None):
+            return TrainOutput(
+                global_step=0, total_steps=1, final_train_loss=0.0, interrupted=False
+            )
+
+    with (
+        patch("src.ui.services.training_service.DataPipeline.setup_data", side_effect=setup_data),
+        patch("src.ui.services.training_service.get_batch_provider", return_value=Mock()),
+        patch("src.ui.services.training_service.ModelRegistry.create", return_value=Mock()),
+        patch("src.ui.services.training_service.get_generator", return_value=Mock()),
+        patch("src.ui.services.training_service.Trainer", FakeTrainer),
+    ):
+        service.start_training(config_snapshot=config, runtime_plan=runtime_plan)
+        # Mutation after submission must not affect the worker snapshot.
+        config.training.max_iters = 999
+        config.training.run_name = "mutated"
+        assert service._thread is not None
+        service._thread.join(timeout=1.0)
+
+    assert observed["worker_config"].training.max_iters == 123
+    assert observed["worker_config"].training.run_name == "stable"
+
+
+def test_training_start_rejected_while_generation_owns_same_accelerator():
+    from src.core.exceptions import AcceleratorBusyError
+    from src.ui.services.accelerator_coordinator import AcceleratorCoordinator
+
+    coordinator = AcceleratorCoordinator()
+    coordinator.reserve_generation("cuda")
+    service = TrainingService(accelerator_coordinator=coordinator)
+    config = EngineConfig().copy(system=EngineConfig().system.copy(device="cuda"))
+    runtime_plan = resolve_training_plan(
+        config,
+        capabilities=RuntimeCapabilities(
+            cuda_available=True,
+            mps_available=False,
+            bf16_supported=False,
+            bitsandbytes_available=False,
+        ),
+    )
+
+    with pytest.raises(AcceleratorBusyError):
+        service.start_training(config_snapshot=config, runtime_plan=runtime_plan)
+
+    assert service.status == "IDLE"
+    coordinator.release_generation("cuda")
+
+
+def _cuda_plan_for_test():
+    from src.core.runtime import ResolvedTrainingPlan
+
+    return ResolvedTrainingPlan(
+        requested_device="cuda",
+        device="cuda",
+        device_type="cuda",
+        requested_precision="float32",
+        precision="float32",
+        use_amp=False,
+        requested_optimizer="adamw",
+        optimizer_type="adamw",
+        micro_batch_size=1,
+        gradient_accumulation_steps=1,
+        effective_batch_size=1,
+        gradient_checkpointing=False,
+    )
+
+
+def test_training_start_rejected_before_state_commit_when_generation_owns_accelerator():
+    from src.core.exceptions import AcceleratorBusyError
+    from src.ui.services.accelerator_coordinator import AcceleratorCoordinator
+
+    coordinator = AcceleratorCoordinator()
+    coordinator.reserve_generation("cuda")
+    service = TrainingService(accelerator_coordinator=coordinator)
+    config = EngineConfig().copy(system=EngineConfig().system.copy(device="cuda"))
+    try:
+        with pytest.raises(AcceleratorBusyError):
+            service.start_training(config_snapshot=config, runtime_plan=_cuda_plan_for_test())
+        assert service.status == "IDLE"
+        assert service._thread is None
+    finally:
+        coordinator.release_generation("cuda")
+
+
+def test_training_releases_accelerator_after_worker_failure():
+    from src.ui.services.accelerator_coordinator import AcceleratorCoordinator
+
+    coordinator = AcceleratorCoordinator()
+    service = TrainingService(accelerator_coordinator=coordinator)
+    config = EngineConfig().copy(system=EngineConfig().system.copy(device="cuda"))
+
+    with patch(
+        "src.ui.services.training_service.DataPipeline.setup_data",
+        side_effect=RuntimeError("synthetic startup failure"),
+    ):
+        service.start_training(config_snapshot=config, runtime_plan=_cuda_plan_for_test())
+        assert service._thread is not None
+        service._thread.join(timeout=1.0)
+
+    assert service.status == "ERROR"
+    coordinator.reserve_generation("cuda")
+    coordinator.release_generation("cuda")
+
+
+def test_training_thread_start_failure_rolls_back_state_and_accelerator_reservation():
+    from src.ui.services.accelerator_coordinator import AcceleratorCoordinator
+
+    coordinator = AcceleratorCoordinator()
+    service = TrainingService(accelerator_coordinator=coordinator)
+    config = EngineConfig().copy(system=EngineConfig().system.copy(device="cuda"))
+
+    with patch(
+        "src.ui.services.training_service.threading.Thread.start",
+        side_effect=RuntimeError("thread start failed"),
+    ):
+        with pytest.raises(RuntimeError, match="thread start failed"):
+            service.start_training(config_snapshot=config, runtime_plan=_cuda_plan_for_test())
+
+    assert service.status == "IDLE"
+    assert service._thread is None
+    coordinator.reserve_generation("cuda")
+    coordinator.release_generation("cuda")
+
+
+def test_training_sample_generation_uses_canonical_generation_config():
+    from src.training.callbacks import SampleGenerationCallback, TrainerProtocol
+
+    service = TrainingService()
+    base = EngineConfig()
+    config = base.copy(
+        system=base.system.copy(device="cpu"),
+        generation=base.generation.copy(
+            max_new_tokens=37,
+            temperature=0.31,
+            top_k=13,
+            top_p=0.72,
+            min_p=0.08,
+            repetition_penalty=1.19,
+            do_sample=False,
+            use_cache=False,
+        ),
+    )
+    tokenizer = Mock(vocab_size=32)
+    batch_provider = Mock()
+    model = Mock()
+    sample_generator = Mock()
+    sample_generator.generate.return_value = "sample"
+    runtime_plan = resolve_training_plan(
+        config,
+        capabilities=RuntimeCapabilities(
+            cuda_available=False,
+            mps_available=False,
+            bf16_supported=False,
+            bitsandbytes_available=False,
+        ),
+    )
+
+    class FakeTrainer:
+        def __init__(self, **kwargs):
+            self.callbacks = kwargs["callbacks"]
+
+        def train(self, resume_checkpoint=None):
+            sample_callback = next(
+                callback
+                for callback in self.callbacks
+                if isinstance(callback, SampleGenerationCallback)
+            )
+            sample_callback.on_eval_end(cast(TrainerProtocol, self), 1, {})
+            return TrainOutput(
+                global_step=1,
+                total_steps=1,
+                final_train_loss=0.0,
+            )
+
+    with (
+        patch(
+            "src.ui.services.training_service.DataPipeline.setup_data",
+            return_value=(torch.arange(64), torch.arange(32), tokenizer),
+        ),
+        patch(
+            "src.ui.services.training_service.get_batch_provider",
+            return_value=batch_provider,
+        ),
+        patch(
+            "src.ui.services.training_service.ModelRegistry.create",
+            return_value=model,
+        ),
+        patch(
+            "src.ui.services.training_service.get_generator",
+            return_value=sample_generator,
+        ),
+        patch("src.ui.services.training_service.Trainer", FakeTrainer),
+    ):
+        service.start_training(config_snapshot=config, runtime_plan=runtime_plan)
+        assert service._thread is not None
+        service._thread.join(timeout=1.0)
+
+    assert not service._thread.is_alive()
+    sample_config = sample_generator.generate.call_args.kwargs["config"]
+    assert sample_config == config.generation
+    assert sample_config is not config.generation
+
+
+def test_training_service_forwards_pinned_resume_identity_to_trainer():
+    service = TrainingService()
+    config = EngineConfig().copy(system=EngineConfig().system.copy(device="cpu"))
+    runtime_plan = resolve_training_plan(
+        config,
+        capabilities=RuntimeCapabilities(
+            cuda_available=False,
+            mps_available=False,
+            bf16_supported=False,
+            bitsandbytes_available=False,
+        ),
+    )
+    identity = (1, 2, 3, 4)
+    observed = {}
+
+    class FakeTrainer:
+        def __init__(self, **kwargs):
+            pass
+
+        def train(self, **kwargs):
+            observed.update(kwargs)
+            return TrainOutput(
+                global_step=0, total_steps=1, final_train_loss=0.0, interrupted=False
+            )
+
+    with (
+        patch(
+            "src.ui.services.training_service.DataPipeline.setup_data",
+            return_value=(torch.arange(64), torch.arange(32), Mock(vocab_size=32)),
+        ),
+        patch("src.ui.services.training_service.get_batch_provider", return_value=Mock()),
+        patch("src.ui.services.training_service.ModelRegistry.create", return_value=Mock()),
+        patch("src.ui.services.training_service.get_generator", return_value=Mock()),
+        patch("src.ui.services.training_service.Trainer", FakeTrainer),
+    ):
+        service.start_training(
+            config_snapshot=config,
+            runtime_plan=runtime_plan,
+            resume_checkpoint="checkpoints/resume.pt",
+            resume_checkpoint_identity=identity,
+        )
+        assert service._thread is not None
+        service._thread.join(timeout=1.0)
+
+    assert observed["resume_checkpoint"] == "checkpoints/resume.pt"
+    assert observed["resume_checkpoint_identity"] == identity

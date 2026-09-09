@@ -7,12 +7,14 @@ export interface PlaygroundPageProps {
 	onCheckpointLoaded?: (path: string) => void;
 	activeCheckpoint?: string;
 	onRegisterReset?: (resetFn: () => void) => void;
+	configRevision?: number;
 }
 
 export const PlaygroundPage: React.FC<PlaygroundPageProps> = ({
 	onCheckpointLoaded,
 	activeCheckpoint = "",
 	onRegisterReset,
+	configRevision = 0,
 }) => {
 	const [isParamsOpen, setIsParamsOpen] = useState(false);
 
@@ -36,7 +38,7 @@ export const PlaygroundPage: React.FC<PlaygroundPageProps> = ({
 		handleStartGenerate,
 		handleClearSession,
 		stop,
-	} = usePlayground({ activeCheckpoint, onCheckpointLoaded });
+	} = usePlayground({ activeCheckpoint, onCheckpointLoaded, configRevision });
 
 	// Register reset function to parent (e.g. sidebar "+ Sáng tác mới")
 	React.useEffect(() => {

@@ -19,10 +19,12 @@ export type { VramScenarioConfig };
 
 export interface VramMatrixWidgetProps {
 	onApplyScenario?: (scenarioConfig: VramScenarioConfig) => void;
+	configRevision?: number;
 }
 
 export const VramMatrixWidget: React.FC<VramMatrixWidgetProps> = ({
 	onApplyScenario,
+	configRevision = 0,
 }) => {
 	const {
 		data,
@@ -33,7 +35,7 @@ export const VramMatrixWidget: React.FC<VramMatrixWidgetProps> = ({
 		appliedId,
 		fetchScenarios,
 		handleApply,
-	} = useVramMatrix({ onApplyScenario });
+	} = useVramMatrix({ onApplyScenario, configRevision });
 
 	const getScenarioTheme = (id: string) => {
 		switch (id) {

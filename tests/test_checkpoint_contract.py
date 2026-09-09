@@ -387,3 +387,54 @@ def test_resume_allows_max_iters_extension_and_checkpoint_output_changes(tmp_pat
 
     assert resumed_step == 1
     assert target.start_step == 2
+
+
+def test_resume_rejects_checkpoint_revision_changed_after_start_intent(tmp_path) -> None:
+    import os
+
+    tokenizer = CharTokenizer(vocab=list("abcdef"))
+    cfg = _tiny_config()
+    cfg.model.vocab_size = tokenizer.vocab_size
+    provider = get_batch_provider(
+        "tensor",
+        train_data=torch.randint(0, cfg.model.vocab_size, (32,)),
+        val_data=torch.randint(0, cfg.model.vocab_size, (32,)),
+    )
+    source = Trainer(
+        model=ModelRegistry.create("minigpt", cfg.model),
+        batch_provider=provider,
+        config=cfg,
+        tokenizer=tokenizer,
+        device="cpu",
+    )
+    first = tmp_path / "resume.pt"
+    replacement = tmp_path / "replacement.pt"
+    state = source.get_checkpoint_state()
+    state["step"] = 1
+    torch.save(state, first)
+    first_stat = os.stat(first)
+    expected_identity = (
+        int(first_stat.st_dev),
+        int(first_stat.st_ino),
+        int(first_stat.st_size),
+        int(first_stat.st_mtime_ns),
+    )
+    state["step"] = 2
+    torch.save(state, replacement)
+    os.replace(replacement, first)
+
+    target_model = ModelRegistry.create("minigpt", cfg.model)
+    before = {key: value.detach().clone() for key, value in target_model.state_dict().items()}
+    target = Trainer(
+        model=target_model,
+        batch_provider=provider,
+        config=cfg,
+        tokenizer=tokenizer,
+        device="cpu",
+    )
+
+    with pytest.raises(ValueError, match="revision|thay đổi|changed"):
+        target.resume_from_checkpoint(str(first), expected_identity=expected_identity)
+
+    for key, value in target_model.state_dict().items():
+        assert torch.equal(value, before[key]), key

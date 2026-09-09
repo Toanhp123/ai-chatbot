@@ -9,12 +9,14 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 
+from src.core.config import EngineConfig
 from src.core.logging import get_logger
 from src.ui.errors import register_ai_engine_error_handlers
 from src.ui.routes.diagnostics import router as diagnostics_router
 from src.ui.routes.explorer import router as explorer_router
 from src.ui.routes.inference import router as inference_router
 from src.ui.routes.training import router as training_router
+from src.ui.services.accelerator_coordinator import AcceleratorCoordinator
 from src.ui.services.inference_service import InferenceService
 from src.ui.services.training_service import TrainingService
 
@@ -39,9 +41,19 @@ def create_app() -> FastAPI:
         allow_headers=["*"],
     )
 
-    # Khởi tạo Services trong app state
-    app.state.inference_service = InferenceService()
-    app.state.training_service = TrainingService()
+    # Bootstrap services from the same canonical EngineConfig used by the UI/trainer.
+    config_path = os.path.realpath(os.path.abspath("configs/truyen_kieu.yaml"))
+    boot_config = (
+        EngineConfig.from_yaml(config_path) if os.path.isfile(config_path) else EngineConfig()
+    )
+    app.state.config_path = config_path
+    app.state.accelerator_coordinator = AcceleratorCoordinator()
+    app.state.inference_service = InferenceService.from_engine_config(
+        boot_config, accelerator_coordinator=app.state.accelerator_coordinator
+    )
+    app.state.training_service = TrainingService(
+        accelerator_coordinator=app.state.accelerator_coordinator
+    )
 
     # Đăng ký các Route API
     app.include_router(inference_router)

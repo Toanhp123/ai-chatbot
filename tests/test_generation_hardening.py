@@ -762,7 +762,11 @@ def test_checkpoint_swap_offloads_previous_model_before_new_device_move(
         vocab_path=str(vocab_path),
         device="cpu",
     )
+    service.configured_device = "cuda:0"
     service.device_str = "cuda:0"
+    monkeypatch.setattr(
+        "src.ui.services.inference_service.resolve_device", lambda requested: requested
+    )
     service.model = old_model  # type: ignore[assignment]
     service.tokenizer = tokenizer
     service.generator = FakeGenerator()  # type: ignore[assignment]
@@ -829,7 +833,11 @@ def test_checkpoint_swap_restores_previous_model_if_new_device_move_fails(
         vocab_path=str(vocab_path),
         device="cpu",
     )
+    service.configured_device = "cuda:0"
     service.device_str = "cuda:0"
+    monkeypatch.setattr(
+        "src.ui.services.inference_service.resolve_device", lambda requested: requested
+    )
     service.model = old_model  # type: ignore[assignment]
     service.tokenizer = tokenizer
     service.generator = old_generator  # type: ignore[assignment]
@@ -895,3 +903,67 @@ def test_begin_generation_rejects_empty_prompt_before_admission(tmp_path) -> Non
 
     replacement = service.begin_generation("ok", GenerationConfig(max_new_tokens=1))
     replacement.close()
+
+
+def test_inference_generation_reservation_blocks_training_and_releases_on_close(tmp_path) -> None:
+    from src.core.exceptions import AcceleratorBusyError
+    from src.ui.services.accelerator_coordinator import AcceleratorCoordinator
+
+    class DummyTokenizer:
+        eos_token_id = None
+
+        def encode(self, text):
+            return [1]
+
+    class NoopGenerator:
+        def generate(self, *args, **kwargs):
+            raise AssertionError("session is intentionally never started")
+
+    coordinator = AcceleratorCoordinator()
+    service = InferenceService(
+        checkpoint_dir=str(tmp_path / "checkpoints"),
+        default_checkpoint=str(tmp_path / "missing.pt"),
+        vocab_path=str(tmp_path / "missing_vocab.json"),
+        device="cuda",
+        accelerator_coordinator=coordinator,
+    )
+    service.tokenizer = DummyTokenizer()  # type: ignore[assignment]
+    service.generator = NoopGenerator()  # type: ignore[assignment]
+
+    session = service.begin_generation("A", GenerationConfig(max_new_tokens=1))
+    try:
+        with pytest.raises(AcceleratorBusyError):
+            coordinator.reserve_training("cuda")
+    finally:
+        session.close()
+
+    coordinator.reserve_training("cuda")
+    coordinator.release_training("cuda")
+
+
+def test_inference_generation_is_rejected_while_training_owns_accelerator(tmp_path) -> None:
+    from src.core.exceptions import AcceleratorBusyError
+    from src.ui.services.accelerator_coordinator import AcceleratorCoordinator
+
+    class DummyTokenizer:
+        eos_token_id = None
+
+        def encode(self, text):
+            return [1]
+
+    coordinator = AcceleratorCoordinator()
+    service = InferenceService(
+        checkpoint_dir=str(tmp_path / "checkpoints"),
+        default_checkpoint=str(tmp_path / "missing.pt"),
+        vocab_path=str(tmp_path / "missing_vocab.json"),
+        device="cuda",
+        accelerator_coordinator=coordinator,
+    )
+    service.tokenizer = DummyTokenizer()  # type: ignore[assignment]
+    service.generator = object()  # type: ignore[assignment]
+    coordinator.reserve_training("cuda")
+    try:
+        with pytest.raises(AcceleratorBusyError):
+            service.begin_generation("A", GenerationConfig(max_new_tokens=1))
+    finally:
+        coordinator.release_training("cuda")

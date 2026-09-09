@@ -2,6 +2,11 @@
 Training API Routes: Bắt đầu, dừng và truyền dữ liệu biểu đồ huấn luyện thời gian thực qua SSE.
 """
 
+import asyncio
+import os
+import stat
+import time
+import uuid
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, HTTPException, Request
@@ -12,6 +17,12 @@ from src.core.exceptions import AIEngineError
 from src.ui.path_policy import resolve_path_within_root
 
 router = APIRouter(prefix="/api/training", tags=["Training"])
+
+
+def _generate_run_name() -> str:
+    """Create a filesystem-safe run identity that cannot collide at second precision."""
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    return f"kieu_{timestamp}_{uuid.uuid4().hex[:8]}"
 
 
 def _resolve_training_config_path(path: str) -> str:
@@ -36,6 +47,25 @@ def _resolve_resume_checkpoint(path: str, checkpoint_dir: str) -> str:
             status_code=400,
             detail="Checkpoint resume phải nằm bên trong checkpoint_dir đã cấu hình.",
         ) from exc
+
+
+def _capture_resume_checkpoint_identity(path: str) -> tuple[int, int, int, int]:
+    """Capture the exact regular-file revision selected by a Start request.
+
+    Open first and derive identity from that descriptor so disappearance or replacement
+    during validation cannot silently pin a different pathname revision. The Trainer
+    re-opens the path later and requires this exact identity before loading any state.
+    """
+    with open(path, "rb") as checkpoint_file:
+        file_stat = os.fstat(checkpoint_file.fileno())
+        if not stat.S_ISREG(file_stat.st_mode):
+            raise OSError(f"Checkpoint resume không phải file thường: {path}")
+        return (
+            int(file_stat.st_dev),
+            int(file_stat.st_ino),
+            int(file_stat.st_size),
+            int(file_stat.st_mtime_ns),
+        )
 
 
 class TrainingConfigRequest(BaseModel):
@@ -127,7 +157,7 @@ def _override_value(value: Any) -> str:
     return str(value)
 
 
-def _build_overrides(req: TrainingConfigRequest, *, auto_run_name: bool = False) -> List[str]:
+def _build_overrides(req: TrainingConfigRequest) -> List[str]:
     extras = req.model_extra or {}
     ignored_legacy_envelope_fields = {"quick_check", "resume_checkpoint"}
     unknown_legacy = sorted(
@@ -158,11 +188,6 @@ def _build_overrides(req: TrainingConfigRequest, *, auto_run_name: bool = False)
         if path not in _CANONICAL_OVERRIDE_PATHS:
             raise ValueError(f"Training override key không hợp lệ: '{path}'.")
         values[path] = value
-
-    if auto_run_name and "training.run_name" not in values:
-        import time
-
-        values["training.run_name"] = f"kieu_{time.strftime('%Y%m%d_%H%M%S')}"
 
     return [f"{path}={_override_value(value)}" for path, value in values.items()]
 
@@ -203,7 +228,7 @@ async def start_training_endpoint(req: StartTrainingRequest, request: Request):
     training_service = request.app.state.training_service
 
     try:
-        overrides = _build_overrides(req, auto_run_name=True)
+        overrides = _build_overrides(req)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -215,34 +240,52 @@ async def start_training_endpoint(req: StartTrainingRequest, request: Request):
     config_path = _resolve_training_config_path(req.config_path)
     chk_config = EngineConfig.from_yaml(config_path, overrides=overrides if overrides else None)
     resume_checkpoint = None
+    resume_checkpoint_identity: Optional[tuple[int, int, int, int]] = None
     if req.resume_checkpoint:
-        import os
-
         resume_checkpoint = _resolve_resume_checkpoint(
             req.resume_checkpoint, chk_config.training.checkpoint_dir
         )
-        if not os.path.isfile(resume_checkpoint):
+        try:
+            resume_checkpoint_identity = _capture_resume_checkpoint_identity(resume_checkpoint)
+        except FileNotFoundError as exc:
             raise HTTPException(
                 status_code=400,
                 detail=f"Không tìm thấy file checkpoint để resume: '{req.resume_checkpoint}'",
-            )
+            ) from exc
+        except (IsADirectoryError, OSError) as exc:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "Không thể chốt revision checkpoint để resume; file có thể đã bị "
+                    f"thay thế hoặc không còn hợp lệ: '{req.resume_checkpoint}'"
+                ),
+            ) from exc
     runtime_plan = resolve_training_plan(chk_config)
     feasible, mem_msg, budget = check_memory_feasibility(
         model_config=chk_config.model,
         training_config=chk_config.training,
         runtime_plan=runtime_plan,
     )
+    if chk_config.training.run_name is None:
+        chk_config = chk_config.copy(
+            training=chk_config.training.copy(run_name=_generate_run_name())
+        )
 
     try:
-        training_service.start_training(
+        await asyncio.to_thread(
+            request.app.state.inference_service.prepare_for_training, runtime_plan.device
+        )
+        await asyncio.to_thread(
+            training_service.start_training,
             config_path=config_path,
             overrides=overrides if overrides else None,
             quick_check=req.quick_check,
             resume_checkpoint=resume_checkpoint,
+            resume_checkpoint_identity=resume_checkpoint_identity,
             runtime_plan=runtime_plan,
+            config_snapshot=chk_config,
         )
-        request.app.state.inference_service.set_checkpoint_dir(chk_config.training.checkpoint_dir)
-        request.app.state.inference_service.set_vocab_path(chk_config.data.vocab_file)
+        await asyncio.to_thread(request.app.state.inference_service.apply_engine_config, chk_config)
         return {
             "status": "success",
             "message": "Đã khởi chạy huấn luyện trên luồng nền.",

@@ -359,12 +359,35 @@ class Trainer:
             # Restore last: initialization/state loading above must not perturb the resumed stream.
             restore_rng_state(rng_state)
 
-    def resume_from_checkpoint(self, checkpoint_path: str) -> int:
-        """Nạp trọng số mô hình và trạng thái optimizer từ checkpoint để tiếp tục huấn luyện."""
-        if not os.path.exists(checkpoint_path):
-            raise CheckpointNotFoundError(checkpoint_path=checkpoint_path)
+    def resume_from_checkpoint(
+        self,
+        checkpoint_path: str,
+        expected_identity: Optional[tuple[int, int, int, int]] = None,
+    ) -> int:
+        """Load one exact checkpoint revision for semantic resume.
 
-        state = torch.load(checkpoint_path, map_location=self.device, weights_only=True)
+        When ``expected_identity`` is supplied by the Start request, bind the payload
+        to the same opened file descriptor used for ``torch.load``. Atomic pathname
+        replacement after Start is therefore rejected instead of silently resuming a
+        different artifact.
+        """
+        try:
+            with open(checkpoint_path, "rb") as checkpoint_file:
+                file_stat = os.fstat(checkpoint_file.fileno())
+                actual_identity = (
+                    int(file_stat.st_dev),
+                    int(file_stat.st_ino),
+                    int(file_stat.st_size),
+                    int(file_stat.st_mtime_ns),
+                )
+                if expected_identity is not None and actual_identity != expected_identity:
+                    raise ValueError(
+                        "Checkpoint resume đã thay đổi revision sau khi yêu cầu Start được chốt; "
+                        "từ chối nạp artifact khác với artifact đã chọn."
+                    )
+                state = torch.load(checkpoint_file, map_location=self.device, weights_only=True)
+        except FileNotFoundError as exc:
+            raise CheckpointNotFoundError(checkpoint_path=checkpoint_path) from exc
 
         # Validate semantic compatibility before mutating model/optimizer/runtime state.
         # A rejected resume must be atomic from the caller's perspective.
@@ -455,7 +478,11 @@ class Trainer:
 
         return metrics
 
-    def train(self, resume_checkpoint: Optional[str] = None) -> TrainOutput:
+    def train(
+        self,
+        resume_checkpoint: Optional[str] = None,
+        resume_checkpoint_identity: Optional[tuple[int, int, int, int]] = None,
+    ) -> TrainOutput:
         """Vòng lặp huấn luyện chính với Gradient Accumulation, AMP và Graceful Shutdown."""
         start_time = time.time()
 
@@ -466,7 +493,9 @@ class Trainer:
             cb.on_train_begin(self)
 
         if resume_checkpoint is not None:
-            self.resume_from_checkpoint(resume_checkpoint)
+            self.resume_from_checkpoint(
+                resume_checkpoint, expected_identity=resume_checkpoint_identity
+            )
 
         max_iters = self.config.training.max_iters
         eval_interval = self.config.training.eval_interval

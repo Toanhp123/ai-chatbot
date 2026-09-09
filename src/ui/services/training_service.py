@@ -11,7 +11,7 @@ from typing import Any, Dict, Generator, List, Optional
 
 import torch
 
-from src.core.config import EngineConfig, GenerationConfig
+from src.core.config import EngineConfig
 from src.core.logging import configure_logging_from_system, get_logger
 from src.core.runtime import ResolvedTrainingPlan, resolve_training_plan, validate_training_plan
 from src.data.batch_provider import get_batch_provider
@@ -27,6 +27,7 @@ from src.training.callbacks import (
     TrainerProtocol,
 )
 from src.training.trainer import Trainer, TrainingTerminationReason, TrainOutput
+from src.ui.services.accelerator_coordinator import AcceleratorCoordinator
 from src.utils.seed import set_seed
 
 logger = get_logger("TrainingService")
@@ -80,7 +81,7 @@ class TrainingService:
     MAX_EVAL_HISTORY = 1000
     MAX_SAMPLE_HISTORY = 200
 
-    def __init__(self) -> None:
+    def __init__(self, accelerator_coordinator: Optional[AcceleratorCoordinator] = None) -> None:
         self.status: str = "IDLE"  # IDLE, STARTING, RUNNING, STOPPING, STOPPED, COMPLETED, ERROR
         self.current_step: int = 0
         self.max_iters: int = 0
@@ -96,6 +97,7 @@ class TrainingService:
         self._thread: Optional[threading.Thread] = None
         self._lock = threading.Lock()
         self._abort_requested = threading.Event()
+        self._accelerator_coordinator = accelerator_coordinator
 
         # Hệ thống Pub/Sub phát sóng đa thuê bao
         self._subscribers: List["queue.Queue[Dict[str, Any]]"] = []
@@ -282,9 +284,25 @@ class TrainingService:
         overrides: Optional[List[str]] = None,
         quick_check: bool = False,
         resume_checkpoint: Optional[str] = None,
+        resume_checkpoint_identity: Optional[tuple[int, int, int, int]] = None,
         runtime_plan: Optional[ResolvedTrainingPlan] = None,
+        config_snapshot: Optional[EngineConfig] = None,
     ) -> None:
-        """Start one exclusive background training run with versioned UI state."""
+        """Start one exclusive background training run with versioned UI state.
+
+        ``config_snapshot`` freezes the effective request config so the worker cannot
+        observe later edits to the YAML file after preflight.
+        """
+        frozen_config = (
+            EngineConfig.from_dict(config_snapshot.to_dict())
+            if config_snapshot is not None
+            else None
+        )
+        admission_device: Optional[str] = runtime_plan.device if runtime_plan is not None else None
+        if admission_device is None and frozen_config is not None:
+            runtime_plan = resolve_training_plan(frozen_config)
+            admission_device = runtime_plan.device
+
         old_thread: Optional[threading.Thread] = None
         with self._lock:
             if self.status in ("RUNNING", "STARTING"):
@@ -305,6 +323,7 @@ class TrainingService:
                     "Vui lòng đợi 1-2 giây rồi thử lại."
                 )
 
+        reserved_accelerator = False
         with self._lock:
             if self.status in ("RUNNING", "STARTING", "STOPPING"):
                 raise RuntimeError(
@@ -316,6 +335,9 @@ class TrainingService:
                     "Tiến trình huấn luyện trước đó vẫn đang trong quá trình giải phóng tài nguyên. "
                     "Vui lòng đợi 1-2 giây."
                 )
+            if admission_device is not None and self._accelerator_coordinator is not None:
+                self._accelerator_coordinator.reserve_training(admission_device)
+                reserved_accelerator = True
 
             self._abort_requested.clear()
             self.run_id += 1
@@ -343,7 +365,11 @@ class TrainingService:
 
         def train_worker() -> None:
             try:
-                config = EngineConfig.from_yaml(config_path, overrides=overrides)
+                config = (
+                    EngineConfig.from_dict(frozen_config.to_dict())
+                    if frozen_config is not None
+                    else EngineConfig.from_yaml(config_path, overrides=overrides)
+                )
                 configure_logging_from_system(
                     config.system, name="TrainingService", force_reconfigure=True
                 )
@@ -421,12 +447,9 @@ class TrainingService:
                     tokenizer=tokenizer,
                     device=effective_runtime_plan.device,
                 )
-                sample_cfg = GenerationConfig(
-                    max_new_tokens=60,
-                    temperature=0.8,
-                    top_k=40,
-                    use_cache=True,
-                )
+                # Qualitative samples must follow the same canonical generation
+                # policy exposed to inference instead of maintaining hidden defaults.
+                sample_cfg = config.generation.copy()
 
                 def sample_fn(step: int) -> str:
                     text = sample_gen.generate("Trăm năm", config=sample_cfg)
@@ -478,7 +501,10 @@ class TrainingService:
                 if running_event is not None:
                     self.broadcast(running_event)
 
-                train_out: TrainOutput = trainer.train(resume_checkpoint=resume_checkpoint)
+                train_kwargs: Dict[str, Any] = {"resume_checkpoint": resume_checkpoint}
+                if resume_checkpoint_identity is not None:
+                    train_kwargs["resume_checkpoint_identity"] = resume_checkpoint_identity
+                train_out: TrainOutput = trainer.train(**train_kwargs)
 
                 with self._lock:
                     reason = train_out.termination_reason
@@ -522,6 +548,12 @@ class TrainingService:
                     final_status = self.status
                 if cleanup_event is not None:
                     self.broadcast(cleanup_event)
+                if (
+                    reserved_accelerator
+                    and admission_device is not None
+                    and self._accelerator_coordinator is not None
+                ):
+                    self._accelerator_coordinator.release_training(admission_device)
                 if torch.cuda.is_available():
                     try:
                         torch.cuda.empty_cache()
@@ -534,7 +566,26 @@ class TrainingService:
         with self._lock:
             self._thread = threading.Thread(target=train_worker, daemon=True)
             thread = self._thread
-        thread.start()
+        try:
+            thread.start()
+        except Exception as exc:
+            with self._lock:
+                if self._thread is thread:
+                    self._thread = None
+                self.status = "IDLE"
+                self.termination_reason = TrainingTerminationReason.FAILED.value
+                self.error_message = str(exc)
+                rollback_event = self._status_event_locked(
+                    "Không thể khởi chạy luồng huấn luyện; trạng thái đã được hoàn nguyên."
+                )
+            if (
+                reserved_accelerator
+                and admission_device is not None
+                and self._accelerator_coordinator is not None
+            ):
+                self._accelerator_coordinator.release_training(admission_device)
+            self.broadcast(rollback_event)
+            raise
 
     def stop_training(self) -> None:
         """Request a safe stop without erasing terminal run metrics."""

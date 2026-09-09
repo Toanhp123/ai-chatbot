@@ -4,10 +4,14 @@ import type {
 	GeneratorsResponse,
 	LoadCheckpointResponse,
 	SelectGeneratorResponse,
+	InferenceStateResponse,
 } from "../model/types";
 
 export const checkpointApi = {
-	getCheckpoints: () => request<CheckpointsResponse>("/api/checkpoints"),
+	getCheckpoints: () => request<CheckpointsResponse>("/api/checkpoints", { skipCache: true }),
+
+	getInferenceState: () =>
+		request<InferenceStateResponse>("/api/inference/state", { skipCache: true }),
 
 	loadCheckpoint: (path: string, backend?: string) =>
 		request<LoadCheckpointResponse>("/api/checkpoints/load", {

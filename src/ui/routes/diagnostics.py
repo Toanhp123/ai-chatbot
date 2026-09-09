@@ -2,13 +2,15 @@
 Diagnostics API Routes: Lấy thông số hệ thống, phần cứng và tính toán ngân sách VRAM theo thời gian thực.
 """
 
+import asyncio
 import os
 from typing import Any, Dict, Optional
 
-from fastapi import APIRouter
+from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
 from src.core.config.model import ModelConfig
+from src.core.config.system import SystemConfig
 from src.core.config.training import TrainingConfig
 from src.core.diagnostics.estimator import estimate_vram_budget
 from src.core.diagnostics.hardware import (
@@ -19,11 +21,13 @@ from src.core.diagnostics.hardware import (
 )
 from src.core.diagnostics.storage import get_disk_info, verify_directory_permissions
 from src.core.diagnostics.system import get_system_info
+from src.ui.path_policy import resolve_path_within_root
 
 router = APIRouter(prefix="/api/diagnostics", tags=["Diagnostics"])
 
 
 class VRAMEstimateRequest(BaseModel):
+    device: str = Field(default="auto")
     model_name: str = Field(default="minigpt")
     batch_size: int = Field(default=64, ge=1, le=512)
     block_size: int = Field(default=128, ge=16, le=2048)
@@ -84,7 +88,8 @@ async def estimate_vram_endpoint(req: VRAMEstimateRequest):
         gradient_checkpointing=req.gradient_checkpointing,
         gradient_accumulation_steps=req.gradient_accumulation_steps,
     )
-    engine_cfg = EngineConfig(model=model_cfg, training=training_cfg)
+    system_cfg = SystemConfig(device=req.device.strip().lower())
+    engine_cfg = EngineConfig(system=system_cfg, model=model_cfg, training=training_cfg)
     engine_cfg.validate()
     runtime_plan = resolve_training_plan(engine_cfg)
 
@@ -135,9 +140,11 @@ async def scenarios_endpoint(req: VRAMEstimateRequest):
         gradient_accumulation_steps=req.gradient_accumulation_steps,
     )
 
+    system_cfg = SystemConfig(device=req.device.strip().lower())
     scenarios = analyze_vram_scenarios(
         model_config=model_cfg,
         training_config=training_cfg,
+        system_config=system_cfg,
     )
     return scenarios
 
@@ -147,12 +154,18 @@ async def get_hardware_advisor_endpoint():
     """Cố vấn cấu hình phần cứng tự động, kiểm tra nhân attention, phân quyền lưu trữ và trạng thái sức khỏe."""
     from src.core.diagnostics.runner import DiagnosticsRunner
 
-    runner = DiagnosticsRunner()
-    report = runner.run(test_tensor_allocation=True)
-    gpu = get_gpu_info()
-    backends = check_attention_backends()
-    disk = get_disk_info(".")
-    permissions = verify_directory_permissions(["logs", "checkpoints", "data", "configs"])
+    def _collect():
+        runner = DiagnosticsRunner()
+        report = runner.run(test_tensor_allocation=True)
+        return (
+            report,
+            get_gpu_info(),
+            check_attention_backends(),
+            get_disk_info("."),
+            verify_directory_permissions(["logs", "checkpoints", "data", "configs"]),
+        )
+
+    report, gpu, backends, disk, permissions = await asyncio.to_thread(_collect)
 
     return {
         "gpu": gpu,
@@ -189,12 +202,12 @@ async def run_quality_gates_endpoint():
         run_test_suite_gate,
     ]
 
-    t0 = time.time()
-    results = []
-    for gate_fn in gates:
-        res = gate_fn()
-        results.append(res)
-    total_elapsed = round(time.time() - t0, 2)
+    def _run_all_gates():
+        t0 = time.time()
+        results = [gate_fn() for gate_fn in gates]
+        return results, round(time.time() - t0, 2)
+
+    results, total_elapsed = await asyncio.to_thread(_run_all_gates)
     all_passed = all(r.get("passed", False) for r in results)
 
     return {
@@ -213,11 +226,19 @@ async def inspect_model_endpoint(
     n_layer: Optional[int] = None,
     block_size: Optional[int] = None,
 ):
-    """Phân tích chi tiết kiến trúc mô hình và phân bổ tham số từng tầng."""
+    """Inspect the effective model configuration without blocking lifecycle endpoints."""
     from src.core.config import EngineConfig
     from src.models.registry import ModelRegistry
 
-    config = EngineConfig.from_yaml(config_path)
+    try:
+        safe_config_path = resolve_path_within_root(config_path, "configs")
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail="Chỉ cho phép dùng file cấu hình trong thư mục configs/",
+        ) from exc
+
+    config = EngineConfig.from_yaml(safe_config_path)
     actual_model_name = (
         model_name.strip().lower() if model_name and model_name.strip() else config.model.name
     )
@@ -231,35 +252,37 @@ async def inspect_model_endpoint(
     if block_size is not None and block_size > 0:
         model_overrides["block_size"] = block_size
     model_config = config.model.copy(**model_overrides)
+    model_config.validate()
 
-    model = ModelRegistry.create(actual_model_name, model_config)
+    def _inspect() -> Dict[str, Any]:
+        model = ModelRegistry.create(actual_model_name, model_config)
+        layers_info = []
+        total_params = 0
+        for name, param in model.named_parameters():
+            num_p = param.numel()
+            total_params += num_p
+            layers_info.append(
+                {
+                    "name": name,
+                    "shape": list(param.shape),
+                    "params": num_p,
+                    "trainable": param.requires_grad,
+                    "memory_kb": round((num_p * param.element_size()) / 1024, 2),
+                }
+            )
+        return {
+            "model_name": actual_model_name,
+            "total_parameters": total_params,
+            "total_parameters_formatted": f"{total_params:,}",
+            "vocab_size": model_config.vocab_size,
+            "block_size": model_config.block_size,
+            "n_embd": model_config.n_embd,
+            "n_head": model_config.n_head,
+            "n_layer": model_config.n_layer,
+            "layers": layers_info[:35],
+        }
 
-    layers_info = []
-    total_params = 0
-    for name, param in model.named_parameters():
-        num_p = param.numel()
-        total_params += num_p
-        layers_info.append(
-            {
-                "name": name,
-                "shape": list(param.shape),
-                "params": num_p,
-                "trainable": param.requires_grad,
-                "memory_kb": round((num_p * param.element_size()) / 1024, 2),
-            }
-        )
-
-    return {
-        "model_name": actual_model_name,
-        "total_parameters": total_params,
-        "total_parameters_formatted": f"{total_params:,}",
-        "vocab_size": model_config.vocab_size,
-        "block_size": config.model.block_size,
-        "n_embd": config.model.n_embd,
-        "n_head": config.model.n_head,
-        "n_layer": config.model.n_layer,
-        "layers": layers_info[:35],  # Top 35 layers tiêu biểu
-    }
+    return await asyncio.to_thread(_inspect)
 
 
 @router.get("/logs")

@@ -2,6 +2,7 @@
 Explorer API Routes: Trực quan hóa Tokenizer và xem trước dữ liệu huấn luyện.
 """
 
+import asyncio
 import os
 from typing import Any, Dict, List, Optional
 
@@ -12,8 +13,29 @@ from src.data.cleaners import get_cleaner
 from src.data.cleaners.standard import DeduplicationFilter, LineLengthFilter, RepetitionFilter
 from src.data.tokenizers import ByteTokenizer, load_tokenizer
 from src.data.tokenizers.gemini import GeminiTokenizer
+from src.ui.path_policy import resolve_path_within_root
 
 router = APIRouter(prefix="/api/explorer", tags=["Explorer"])
+
+
+def _serialize_api_path(path: str) -> str:
+    """Use a stable slash convention for filesystem paths crossing the HTTP boundary."""
+    return str(path).replace("\\", "/")
+
+
+def _load_engine_config(request: Request, config_path: Optional[str] = None):
+    from src.core.config import EngineConfig
+
+    if config_path is None:
+        return request.app.state.inference_service.get_engine_config()
+    try:
+        path = resolve_path_within_root(config_path, "configs")
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail="Chỉ cho phép dùng file cấu hình trong thư mục configs/",
+        ) from exc
+    return EngineConfig.from_yaml(path)
 
 
 class TokenizeRequest(BaseModel):
@@ -21,6 +43,10 @@ class TokenizeRequest(BaseModel):
     tokenizer_type: str = Field(
         default="char",
         description="Loại tokenizer: 'char', 'byte'; 'gemini' chỉ là alias legacy của byte",
+    )
+    config_path: Optional[str] = Field(
+        default=None,
+        description="Config override tùy chọn; mặc định dùng effective runtime config",
     )
 
 
@@ -69,21 +95,23 @@ async def clean_endpoint(req: CleanRequest):
 @router.post("/tokenize")
 async def tokenize_endpoint(req: TokenizeRequest, request: Request):
     """Mã hóa văn bản thành Token ID; ``gemini`` được giữ như alias legacy của ByteTokenizer."""
-    if req.tokenizer_type == "byte":
+    requested_type = req.tokenizer_type.strip().lower()
+    if requested_type == "byte":
         tokenizer = ByteTokenizer()
-    elif req.tokenizer_type == "gemini":
+    elif requested_type == "gemini":
         tokenizer = GeminiTokenizer()
+    elif requested_type == "char":
+        config = _load_engine_config(request, req.config_path)
+        if not os.path.isfile(config.data.vocab_file):
+            raise HTTPException(
+                status_code=404,
+                detail=f"Không tìm thấy file từ điển {config.data.vocab_file}",
+            )
+        tokenizer = load_tokenizer(config.data.vocab_file)
     else:
-        inference_service = request.app.state.inference_service
-        tokenizer = inference_service.tokenizer
-
-        if tokenizer is None:
-            if os.path.exists("data/vocab.json"):
-                tokenizer = load_tokenizer("data/vocab.json")
-            else:
-                raise HTTPException(
-                    status_code=404, detail="Không tìm thấy file từ điển data/vocab.json"
-                )
+        raise HTTPException(
+            status_code=400, detail=f"Tokenizer không được hỗ trợ: {requested_type}"
+        )
 
     token_ids = tokenizer.encode(req.text)
 
@@ -120,7 +148,11 @@ async def tokenize_endpoint(req: TokenizeRequest, request: Request):
 
     return {
         "text": req.text,
-        "tokenizer_type": req.tokenizer_type,
+        "tokenizer_type": (
+            "gemini"
+            if requested_type == "gemini"
+            else str(tokenizer.identity_payload().get("tokenizer_type", requested_type))
+        ),
         "token_ids": token_ids,
         "tokens": tokens_detail,
         "char_count": len(req.text),
@@ -130,16 +162,17 @@ async def tokenize_endpoint(req: TokenizeRequest, request: Request):
 
 
 @router.get("/dataset-sample")
-async def get_dataset_sample():
-    """Xem trước dữ liệu huấn luyện và thông tin từ vựng."""
-    input_file = "data/input.txt"
-    vocab_file = "data/vocab.json"
+async def get_dataset_sample(request: Request, config_path: Optional[str] = None):
+    """Preview the effective runtime dataset, or an explicitly requested config."""
+    config = _load_engine_config(request, config_path)
+    input_file = config.data.input_file
+    vocab_file = config.data.vocab_file
 
     sample_lines: List[str] = []
     total_chars = 0
     total_lines = 0
 
-    if os.path.exists(input_file):
+    if os.path.isfile(input_file):
         with open(input_file, "r", encoding="utf-8") as f:
             lines = f.readlines()
             total_lines = len(lines)
@@ -148,16 +181,17 @@ async def get_dataset_sample():
 
     vocab_size = 0
     vocab_chars: List[str] = []
-    if os.path.exists(vocab_file):
-        import json
-
-        with open(vocab_file, "r", encoding="utf-8") as vf:
-            vocab_data = json.load(vf)
-            vocab_size = len(vocab_data)
-            vocab_chars = list(vocab_data.keys())[:50]
+    if os.path.isfile(vocab_file):
+        tokenizer = load_tokenizer(vocab_file)
+        vocab_size = tokenizer.vocab_size
+        payload = tokenizer.identity_payload()
+        raw_vocab = payload.get("vocab")
+        if isinstance(raw_vocab, list):
+            vocab_chars = [str(token) for token in raw_vocab[:50]]
 
     return {
-        "input_file": input_file,
+        "input_file": _serialize_api_path(input_file),
+        "vocab_file": _serialize_api_path(vocab_file),
         "total_lines": total_lines,
         "total_chars": total_chars,
         "sample_lines": sample_lines,
@@ -167,34 +201,31 @@ async def get_dataset_sample():
 
 
 @router.post("/export-binary")
-async def export_binary_endpoint():
-    """Đóng gói toàn bộ tập dữ liệu thành định dạng nhị phân (.bin) cho Memmap loader siêu tốc."""
-    from src.core.config import EngineConfig
+async def export_binary_endpoint(request: Request, config_path: Optional[str] = None):
+    """Package the effective dataset without blocking the API loop."""
     from src.data.pipeline import DataPipeline
 
-    config = EngineConfig.from_yaml("configs/truyen_kieu.yaml")
-    train_data, val_data, _ = DataPipeline.setup_data(config.data)
+    config = _load_engine_config(request, config_path)
 
-    data_dir = os.path.dirname(os.path.abspath(config.data.input_file))
-    train_bin = os.path.join(data_dir, "train.bin")
-    val_bin = os.path.join(data_dir, "val.bin")
+    def _export() -> Dict[str, Any]:
+        train_data, val_data, _ = DataPipeline.setup_data(config.data)
+        data_dir = os.path.dirname(os.path.abspath(config.data.input_file))
+        train_bin = os.path.join(data_dir, "train.bin")
+        val_bin = os.path.join(data_dir, "val.bin")
+        DataPipeline.save_to_binary(train_data, train_bin)
+        DataPipeline.save_to_binary(val_data, val_bin)
+        return {
+            "status": "success",
+            "message": "Đã đóng gói dữ liệu nhị phân thành công!",
+            "train_tokens": len(train_data),
+            "val_tokens": len(val_data),
+            "train_bin": train_bin,
+            "val_bin": val_bin,
+            "train_size_mb": round(os.path.getsize(train_bin) / (1024 * 1024), 2),
+            "val_size_mb": round(os.path.getsize(val_bin) / (1024 * 1024), 2),
+        }
 
-    DataPipeline.save_to_binary(train_data, train_bin)
-    DataPipeline.save_to_binary(val_data, val_bin)
-
-    train_size_mb = round(os.path.getsize(train_bin) / (1024 * 1024), 2)
-    val_size_mb = round(os.path.getsize(val_bin) / (1024 * 1024), 2)
-
-    return {
-        "status": "success",
-        "message": "Đã đóng gói dữ liệu nhị phân thành công!",
-        "train_tokens": len(train_data),
-        "val_tokens": len(val_data),
-        "train_bin": train_bin,
-        "val_bin": val_bin,
-        "train_size_mb": train_size_mb,
-        "val_size_mb": val_size_mb,
-    }
+    return await asyncio.to_thread(_export)
 
 
 class CompareTokenizersRequest(BaseModel):
@@ -202,16 +233,26 @@ class CompareTokenizersRequest(BaseModel):
 
 
 @router.post("/compare-tokenizers")
-async def compare_tokenizers_endpoint(req: CompareTokenizersRequest):
-    """So sánh các tokenizer có semantics khác nhau; bỏ alias Gemini trùng Byte."""
-    char_tok = load_tokenizer("data/vocab.json") if os.path.exists("data/vocab.json") else None
+async def compare_tokenizers_endpoint(
+    req: CompareTokenizersRequest, request: Request, config_path: Optional[str] = None
+):
+    """Compare effective canonical tokenizer semantics with byte tokenization."""
+    config = _load_engine_config(request, config_path)
+    configured_tok = (
+        load_tokenizer(config.data.vocab_file) if os.path.isfile(config.data.vocab_file) else None
+    )
     byte_tok = ByteTokenizer()
+    candidates = []
+    if configured_tok is not None:
+        configured_type = str(configured_tok.identity_payload().get("tokenizer_type", "configured"))
+        if configured_type != "byte":
+            candidates.append(
+                (configured_type, f"{configured_type.title()} Tokenizer", configured_tok)
+            )
+    candidates.append(("byte", "Byte Tokenizer (Zero-OOV)", byte_tok))
 
     results: Dict[str, Any] = {}
-    for key, label, tok in [
-        ("char", "Char Tokenizer", char_tok),
-        ("byte", "Byte Tokenizer (Zero-OOV)", byte_tok),
-    ]:
+    for key, label, tok in candidates:
         if tok is None:
             continue
         token_ids = tok.encode(req.text)

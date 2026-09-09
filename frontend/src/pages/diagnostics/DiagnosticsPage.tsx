@@ -6,10 +6,20 @@ import {
 	ModelInspectorWidget,
 	SystemLogsWidget,
 } from "@/widgets";
-import { PageHeader, PageContainer } from "@/shared/ui";
+import { PageHeader, PageContainer, useToast } from "@/shared/ui";
 import { Cpu } from "lucide-react";
+import type { TrainingScenarioOverrides } from "@/entities/training";
 
-export const DiagnosticsPage: React.FC = () => {
+export interface DiagnosticsPageProps {
+	onApplyTrainingScenario?: (scenario: TrainingScenarioOverrides) => void;
+	configRevision?: number;
+}
+
+export const DiagnosticsPage: React.FC<DiagnosticsPageProps> = ({
+	onApplyTrainingScenario,
+	configRevision = 0,
+}) => {
+	const { toast } = useToast();
 	return (
 		<PageContainer maxWidth="standard" spacing="normal">
 			{/* Unified PageHeader Component */}
@@ -24,15 +34,15 @@ export const DiagnosticsPage: React.FC = () => {
 
 			{/* Widget 2: VRAM Scenarios Matrix */}
 			<VramMatrixWidget
+				configRevision={configRevision}
 				onApplyScenario={(scenario) => {
-					alert(
-						`Đã áp dụng kịch bản:\n- Batch Size: ${scenario.batch_size}\n- Precision: ${scenario.precision}\n- Gradient Checkpointing: ${scenario.gradient_checkpointing}`,
-					);
+					onApplyTrainingScenario?.(scenario);
+					toast("Đã áp dụng kịch bản VRAM vào cấu hình Training.", "success");
 				}}
 			/>
 
 			{/* Widget 3: Model Architecture Inspector */}
-			<ModelInspectorWidget />
+			<ModelInspectorWidget configRevision={configRevision} />
 
 			{/* Widget 4: Quality Gates Audit */}
 			<QualityGatesAuditWidget />

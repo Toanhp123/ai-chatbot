@@ -9,16 +9,19 @@ import {
 import { PageContainer, useToast } from "@/shared/ui";
 import { useTrainingDashboard } from "./model/useTrainingDashboard";
 import type { Checkpoint } from "@/entities/checkpoint";
+import type { TrainingScenarioUpdate } from "@/entities/training";
 
 export interface TrainingPageProps {
 	onCheckpointLoaded?: (path: string) => void;
 	activeCheckpoint?: string;
 	configRevision?: number;
+	trainingScenario?: TrainingScenarioUpdate | null;
 }
 
 export const TrainingPage: React.FC<TrainingPageProps> = ({
 	onCheckpointLoaded,
 	configRevision = 0,
+	trainingScenario = null,
 }) => {
 	const { toast } = useToast();
 	const {
@@ -48,7 +51,7 @@ export const TrainingPage: React.FC<TrainingPageProps> = ({
 		resumeTarget,
 		handleSelectResume,
 		handleCancelResume,
-	} = useTrainingDashboard(configRevision);
+	} = useTrainingDashboard(configRevision, trainingScenario);
 
 	const onResumeSelected = (cp: Checkpoint) => {
 		handleSelectResume(cp);
@@ -123,6 +126,7 @@ export const TrainingPage: React.FC<TrainingPageProps> = ({
 
 			{/* Section 4: Checkpoint Artifact Hub (Full Width Table) */}
 			<CheckpointHubWidget
+				configRevision={configRevision}
 				onSelectCheckpoint={(cp) => {
 					onCheckpointLoaded?.(cp.path);
 				}}

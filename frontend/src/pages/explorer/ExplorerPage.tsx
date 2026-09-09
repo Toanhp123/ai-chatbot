@@ -21,7 +21,11 @@ import {
 	Hash,
 } from "lucide-react";
 
-export const ExplorerPage: React.FC = () => {
+export interface ExplorerPageProps {
+	configRevision?: number;
+}
+
+export const ExplorerPage: React.FC<ExplorerPageProps> = ({ configRevision = 0 }) => {
 	const {
 		datasetInfo,
 		exportingBinary,
@@ -29,7 +33,7 @@ export const ExplorerPage: React.FC = () => {
 		tokenizerInputText,
 		setTokenizerInputText,
 		handleExportBinary,
-	} = useExplorer();
+	} = useExplorer(configRevision);
 
 	return (
 		<PageContainer maxWidth="standard" spacing="normal">
@@ -55,7 +59,7 @@ export const ExplorerPage: React.FC = () => {
 							<p className="text-xs text-stone-500 mt-0.5">
 								Chuyển đổi tập tin thô{" "}
 								<span className="font-mono text-stone-700">
-									data/input.txt
+									{datasetInfo?.input_file ?? "tập tin nguồn theo cấu hình"}
 								</span>{" "}
 								thành mảng uint16 nén cho Memmap DataLoader
 							</p>

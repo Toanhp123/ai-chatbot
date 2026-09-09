@@ -1032,3 +1032,658 @@ def test_ui_generate_rejects_oversized_stop_word_before_service(client: TestClie
 
     assert response.status_code == 422
     assert calls == []
+
+
+def test_training_start_preserves_run_name_from_resolved_yaml(tmp_path, monkeypatch):
+    from unittest.mock import Mock
+
+    from src.ui.app import create_app
+
+    monkeypatch.chdir(tmp_path)
+    configs = tmp_path / "configs"
+    configs.mkdir()
+    (configs / "custom.yaml").write_text(
+        "system:\n  device: cpu\ntraining:\n  run_name: yaml_run\n",
+        encoding="utf-8",
+    )
+
+    app = create_app()
+    start_mock = Mock()
+    app.state.training_service.start_training = start_mock
+
+    with TestClient(app) as local_client:
+        response = local_client.post(
+            "/api/training/start",
+            json={"config_path": "configs/custom.yaml"},
+        )
+
+    assert response.status_code == 200
+    snapshot = start_mock.call_args.kwargs["config_snapshot"]
+    assert snapshot.training.run_name == "yaml_run"
+    assert not any(
+        override.startswith("training.run_name=")
+        for override in (start_mock.call_args.kwargs.get("overrides") or [])
+    )
+
+
+def test_create_app_bootstraps_inference_from_canonical_engine_config(tmp_path, monkeypatch):
+    from src.ui.app import create_app
+
+    monkeypatch.chdir(tmp_path)
+    configs = tmp_path / "configs"
+    configs.mkdir()
+    (configs / "truyen_kieu.yaml").write_text(
+        "system:\n  device: cpu\n"
+        "data:\n  vocab_file: custom/vocab.json\n"
+        "training:\n  checkpoint_dir: custom/checkpoints\n  checkpoint_name: champion.pt\n"
+        "generation:\n  temperature: 0.23\n  max_new_tokens: 77\n",
+        encoding="utf-8",
+    )
+
+    app = create_app()
+    service = app.state.inference_service
+
+    assert service.checkpoint_dir == "custom/checkpoints"
+    assert service.checkpoint_name == "champion.pt"
+    assert service.vocab_path == "custom/vocab.json"
+    assert service.default_generation_config.temperature == 0.23
+    assert service.default_generation_config.max_new_tokens == 77
+
+
+def test_config_save_updates_inference_preferences_and_state_endpoint(tmp_path, monkeypatch):
+    from src.ui.app import create_app
+
+    monkeypatch.chdir(tmp_path)
+    configs = tmp_path / "configs"
+    configs.mkdir()
+    (configs / "truyen_kieu.yaml").write_text("system:\n  device: cpu\n", encoding="utf-8")
+    app = create_app()
+
+    content = (
+        "system:\n  device: cpu\n"
+        "data:\n  vocab_file: data/new-vocab.json\n"
+        "training:\n  checkpoint_dir: runs/checkpoints\n  checkpoint_name: chosen.pt\n"
+        "generation:\n  temperature: 0.31\n  top_k: 7\n"
+    )
+    with TestClient(app) as local_client:
+        saved = local_client.post(
+            "/api/configs/save",
+            json={"path": "configs/truyen_kieu.yaml", "content": content},
+        )
+        state = local_client.get("/api/inference/state")
+
+    assert saved.status_code == 200
+    assert state.status_code == 200
+    payload = state.json()
+    assert payload["checkpoint_dir"] == "runs/checkpoints"
+    assert payload["checkpoint_name"] == "chosen.pt"
+    assert payload["vocab_path"] == "data/new-vocab.json"
+    assert payload["generation"]["temperature"] == 0.31
+    assert payload["generation"]["top_k"] == 7
+
+
+def test_ui_generate_omitted_sampling_fields_inherit_canonical_generation_config(
+    client: TestClient, monkeypatch
+):
+    from src.core.config import GenerationConfig
+
+    service = _app_state(client).inference_service
+    service.default_generation_config = GenerationConfig(
+        max_new_tokens=77,
+        temperature=0.23,
+        top_k=7,
+        top_p=0.81,
+        min_p=0.12,
+        repetition_penalty=1.17,
+        do_sample=False,
+        use_cache=False,
+    )
+    captured = {}
+
+    class FakeSession:
+        def iter_sse(self):
+            yield 'data: {"type":"done","generated_text":"","full_text":"x","token_count":0,"elapsed_sec":0.0,"tps":0.0}\n\n'
+
+        def close(self):
+            pass
+
+    def fake_begin(prompt, config, backend=None, stop_words=None):
+        captured["config"] = config
+        return FakeSession()
+
+    monkeypatch.setattr(service, "begin_generation", fake_begin)
+    response = client.post("/api/generate/stream", json={"prompt": "x"})
+
+    assert response.status_code == 200
+    config = captured["config"]
+    assert config.max_new_tokens == 77
+    assert config.temperature == 0.23
+    assert config.top_k == 7
+    assert config.top_p == 0.81
+    assert config.min_p == 0.12
+    assert config.repetition_penalty == 1.17
+    assert config.do_sample is False
+    assert config.use_cache is False
+
+
+def test_explorer_dataset_sample_uses_requested_canonical_config(tmp_path, monkeypatch):
+    import json
+
+    from fastapi.testclient import TestClient as LocalTestClient
+
+    from src.ui.app import create_app
+
+    monkeypatch.chdir(tmp_path)
+    configs = tmp_path / "configs"
+    configs.mkdir()
+    custom_data = tmp_path / "custom-data"
+    custom_data.mkdir()
+    input_path = custom_data / "corpus.txt"
+    vocab_path = custom_data / "vocab.json"
+    input_path.write_text("alpha\nbeta\n", encoding="utf-8")
+    vocab_path.write_text(json.dumps(["a", "b", "e", "h", "l", "p", "t"]), encoding="utf-8")
+    (configs / "custom.yaml").write_text(
+        "system:\n  device: cpu\n"
+        f"data:\n  input_file: {input_path.as_posix()}\n  vocab_file: {vocab_path.as_posix()}\n",
+        encoding="utf-8",
+    )
+
+    with LocalTestClient(create_app()) as local_client:
+        response = local_client.get(
+            "/api/explorer/dataset-sample",
+            params={"config_path": "configs/custom.yaml"},
+        )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["input_file"] == input_path.as_posix()
+    assert payload["total_lines"] == 2
+    assert payload["sample_lines"] == ["alpha", "beta"]
+    assert payload["vocab_size"] == 7
+
+
+def test_explorer_tokenize_reports_actual_tokenizer_semantics_from_configured_vocab(
+    tmp_path, monkeypatch
+):
+    from fastapi.testclient import TestClient as LocalTestClient
+
+    from src.data.tokenizers import ByteTokenizer
+    from src.ui.app import create_app
+
+    monkeypatch.chdir(tmp_path)
+    configs = tmp_path / "configs"
+    configs.mkdir()
+    custom_data = tmp_path / "custom-data"
+    custom_data.mkdir()
+    vocab_path = custom_data / "byte-vocab.json"
+    ByteTokenizer().save_vocab(str(vocab_path))
+    (configs / "custom.yaml").write_text(
+        f"system:\n  device: cpu\ndata:\n  vocab_file: {vocab_path.as_posix()}\n",
+        encoding="utf-8",
+    )
+
+    with LocalTestClient(create_app()) as local_client:
+        response = local_client.post(
+            "/api/explorer/tokenize",
+            json={
+                "text": "Trăm",
+                "tokenizer_type": "char",
+                "config_path": "configs/custom.yaml",
+            },
+        )
+
+    assert response.status_code == 200
+    assert response.json()["tokenizer_type"] == "byte"
+
+
+def test_diagnostics_inspect_returns_effective_model_override_metadata(client: TestClient):
+    response = client.get("/api/diagnostics/inspect?n_layer=2&block_size=64")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["n_layer"] == 2
+    assert payload["block_size"] == 64
+
+
+def test_explorer_dataset_sample_serializes_paths_with_stable_forward_slashes(
+    client: TestClient, monkeypatch
+):
+    """Explorer wire paths stay platform-neutral even when runtime paths use Windows separators."""
+    service = _app_state(client).inference_service
+    original = service.get_engine_config()
+    cfg = original.copy(
+        data=original.data.copy(
+            input_file=r"C:\data\active-corpus.txt",
+            vocab_file=r"C:\data\active-vocab.json",
+        )
+    )
+    try:
+        service.apply_engine_config(cfg)
+        monkeypatch.setattr("src.ui.routes.explorer.os.path.isfile", lambda _path: False)
+        res = client.get("/api/explorer/dataset-sample")
+        assert res.status_code == 200
+        data = res.json()
+        assert data["input_file"] == "C:/data/active-corpus.txt"
+        assert data["vocab_file"] == "C:/data/active-vocab.json"
+    finally:
+        service.apply_engine_config(original)
+
+
+def test_explorer_dataset_sample_uses_active_engine_config(client: TestClient, tmp_path):
+    """Explorer must inspect the same data/vocab paths currently applied to runtime."""
+    from src.data.tokenizers import CharTokenizer
+
+    state = _app_state(client)
+    service = state.inference_service
+    original = service.get_engine_config()
+    input_file = tmp_path / "active-corpus.txt"
+    vocab_file = tmp_path / "active-vocab.json"
+    input_file.write_text("alpha\nbeta\n", encoding="utf-8")
+    CharTokenizer(text="alphabet\n").save_vocab(str(vocab_file))
+    cfg = original.copy(
+        data=original.data.copy(input_file=str(input_file), vocab_file=str(vocab_file))
+    )
+    try:
+        service.apply_engine_config(cfg)
+        res = client.get("/api/explorer/dataset-sample")
+        assert res.status_code == 200
+        data = res.json()
+        assert data["input_file"] == str(input_file).replace("\\", "/")
+        assert data["sample_lines"] == ["alpha", "beta"]
+        assert data["vocab_size"] == len(CharTokenizer.load_vocab(str(vocab_file)).chars)
+    finally:
+        service.apply_engine_config(original)
+
+
+def test_explorer_char_tokenizer_does_not_reuse_incompatible_loaded_byte_tokenizer(
+    client: TestClient, tmp_path
+):
+    """A request labelled char must actually execute the canonical char tokenizer."""
+    from src.data.tokenizers import ByteTokenizer, CharTokenizer
+
+    state = _app_state(client)
+    service = state.inference_service
+    original_config = service.get_engine_config()
+    original_tokenizer = service.tokenizer
+    vocab_file = tmp_path / "char-vocab.json"
+    CharTokenizer(text="Trăm năm").save_vocab(str(vocab_file))
+    cfg = original_config.copy(
+        data=original_config.data.copy(vocab_file=str(vocab_file), tokenizer_type="char")
+    )
+    try:
+        service.apply_engine_config(cfg)
+        service.tokenizer = ByteTokenizer()
+        res = client.post("/api/explorer/tokenize", json={"text": "Trăm", "tokenizer_type": "char"})
+        assert res.status_code == 200
+        data = res.json()
+        assert data["tokenizer_type"] == "char"
+        assert len(data["token_ids"]) <= len("Trăm")
+    finally:
+        service.tokenizer = original_tokenizer
+        service.apply_engine_config(original_config)
+
+
+def test_diagnostics_inspect_reports_effective_model_overrides(client: TestClient):
+    """Inspector metadata must describe the model that was actually instantiated."""
+    res = client.get("/api/diagnostics/inspect?n_layer=2&block_size=64")
+    assert res.status_code == 200
+    data = res.json()
+    assert data["n_layer"] == 2
+    assert data["block_size"] == 64
+
+
+def test_slow_checkpoint_listing_does_not_block_control_plane(client: TestClient, monkeypatch):
+    import asyncio
+    import time
+
+    import httpx
+
+    service = _app_state(client).inference_service
+
+    def slow_list_checkpoints():
+        time.sleep(0.20)
+        return []
+
+    monkeypatch.setattr(service, "list_checkpoints", slow_list_checkpoints)
+
+    async def exercise():
+        transport = httpx.ASGITransport(app=client.app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as async_client:
+            started = time.perf_counter()
+            listing = asyncio.create_task(async_client.get("/api/checkpoints"))
+            await asyncio.sleep(0.01)
+            health = await async_client.get("/healthz")
+            health_elapsed = time.perf_counter() - started
+            await listing
+            return health, health_elapsed
+
+    health, health_elapsed = asyncio.run(exercise())
+    assert health.status_code == 200
+    assert health_elapsed < 0.12
+
+
+def test_slow_checkpoint_load_does_not_block_control_plane(client: TestClient, monkeypatch):
+    import asyncio
+    import time
+
+    import httpx
+
+    service = _app_state(client).inference_service
+
+    def slow_load_checkpoint(path, backend=None, **kwargs):
+        time.sleep(0.20)
+
+    monkeypatch.setattr(service, "load_checkpoint", slow_load_checkpoint)
+
+    async def exercise():
+        transport = httpx.ASGITransport(app=client.app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as async_client:
+            started = time.perf_counter()
+            loading = asyncio.create_task(
+                async_client.post(
+                    "/api/checkpoints/load",
+                    json={"path": "fake.pt"},
+                )
+            )
+            await asyncio.sleep(0.01)
+            health = await async_client.get("/healthz")
+            health_elapsed = time.perf_counter() - started
+            response = await loading
+            return health, health_elapsed, response
+
+    health, health_elapsed, response = asyncio.run(exercise())
+    assert response.status_code == 200
+    assert health.status_code == 200
+    assert health_elapsed < 0.12
+
+
+def test_slow_training_start_handoff_does_not_block_control_plane(client: TestClient, monkeypatch):
+    import asyncio
+    import time
+
+    import httpx
+
+    state = _app_state(client)
+
+    def slow_start_training(*args, **kwargs):
+        time.sleep(0.20)
+
+    monkeypatch.setattr(state.training_service, "start_training", slow_start_training)
+
+    async def exercise():
+        transport = httpx.ASGITransport(app=client.app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as async_client:
+            started = time.perf_counter()
+            starting = asyncio.create_task(
+                async_client.post(
+                    "/api/training/start",
+                    json={"config_path": "configs/truyen_kieu.yaml"},
+                )
+            )
+            await asyncio.sleep(0.01)
+            health = await async_client.get("/healthz")
+            health_elapsed = time.perf_counter() - started
+            response = await starting
+            return health, health_elapsed, response
+
+    health, health_elapsed, response = asyncio.run(exercise())
+    assert response.status_code == 200
+    assert health.status_code == 200
+    assert health_elapsed < 0.12
+
+
+def test_slow_inference_state_read_does_not_block_control_plane(client: TestClient, monkeypatch):
+    import asyncio
+    import time
+
+    import httpx
+
+    service = _app_state(client).inference_service
+    original = service.get_runtime_state
+
+    def slow_state():
+        time.sleep(0.20)
+        return original()
+
+    monkeypatch.setattr(service, "get_runtime_state", slow_state)
+
+    async def exercise():
+        transport = httpx.ASGITransport(app=client.app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as async_client:
+            started = time.perf_counter()
+            reading = asyncio.create_task(async_client.get("/api/inference/state"))
+            await asyncio.sleep(0.01)
+            health = await async_client.get("/healthz")
+            health_elapsed = time.perf_counter() - started
+            response = await reading
+            return health, health_elapsed, response
+
+    health, health_elapsed, response = asyncio.run(exercise())
+    assert response.status_code == 200
+    assert health.status_code == 200
+    assert health_elapsed < 0.12
+
+
+def test_slow_generation_admission_does_not_block_control_plane(client: TestClient, monkeypatch):
+    import asyncio
+    import time
+
+    import httpx
+
+    from src.core.exceptions import GenerationNotReadyError
+
+    service = _app_state(client).inference_service
+
+    def slow_begin(*args, **kwargs):
+        time.sleep(0.20)
+        raise GenerationNotReadyError()
+
+    monkeypatch.setattr(service, "begin_generation", slow_begin)
+
+    async def exercise():
+        transport = httpx.ASGITransport(app=client.app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as async_client:
+            started = time.perf_counter()
+            generating = asyncio.create_task(
+                async_client.post("/api/generate/stream", json={"prompt": "hello"})
+            )
+            await asyncio.sleep(0.01)
+            health = await async_client.get("/healthz")
+            health_elapsed = time.perf_counter() - started
+            response = await generating
+            return health, health_elapsed, response
+
+    health, health_elapsed, response = asyncio.run(exercise())
+    assert response.status_code >= 400
+    assert health.status_code == 200
+    assert health_elapsed < 0.12
+
+
+def test_checkpoint_load_response_uses_authoritative_service_path(client: TestClient, monkeypatch):
+    import os
+
+    service = _app_state(client).inference_service
+    canonical_path = os.path.abspath(os.path.join(service.checkpoint_dir, "best.pt")).replace(
+        "\\", "/"
+    )
+
+    def fake_load_checkpoint(path, backend=None, **kwargs):
+        service.current_checkpoint_path = canonical_path
+        service._current_checkpoint_identity = (1, 2, 3, 4)
+
+    monkeypatch.setattr(service, "load_checkpoint", fake_load_checkpoint)
+
+    response = client.post("/api/checkpoints/load", json={"path": "best.pt"})
+
+    assert response.status_code == 200
+    assert response.json()["current_checkpoint"] == canonical_path
+
+
+def test_vram_scenarios_use_requested_canonical_device(client: TestClient, monkeypatch):
+    captured = {}
+
+    def fake_analyze_vram_scenarios(**kwargs):
+        captured.update(kwargs)
+        return {
+            "available_vram_gb": 0.0,
+            "safety_margin_gb": 0.5,
+            "scenarios": [],
+            "recommended": None,
+        }
+
+    monkeypatch.setattr(
+        "src.core.diagnostics.estimator.analyze_vram_scenarios",
+        fake_analyze_vram_scenarios,
+    )
+
+    response = client.post("/api/diagnostics/scenarios", json={"device": "cpu"})
+
+    assert response.status_code == 200
+    assert captured["system_config"].device == "cpu"
+
+
+def test_auto_training_run_names_are_collision_resistant():
+    from src.ui.routes.training import _generate_run_name
+
+    first = _generate_run_name()
+    second = _generate_run_name()
+
+    assert first.startswith("kieu_")
+    assert second.startswith("kieu_")
+    assert first != second
+    assert "/" not in first and "\\" not in first
+    assert "/" not in second and "\\" not in second
+
+
+def test_ui_training_start_prepares_inference_residency_before_gpu_training(
+    client: TestClient, monkeypatch
+):
+    training_service = _app_state(client).training_service
+    inference_service = _app_state(client).inference_service
+    calls = []
+
+    from src.core.runtime import ResolvedTrainingPlan
+
+    plan = ResolvedTrainingPlan(
+        requested_device="cuda",
+        device="cuda",
+        device_type="cuda",
+        requested_precision="float32",
+        precision="float32",
+        use_amp=False,
+        requested_optimizer="adamw",
+        optimizer_type="adamw",
+        micro_batch_size=1,
+        gradient_accumulation_steps=1,
+        effective_batch_size=1,
+        gradient_checkpointing=False,
+    )
+    monkeypatch.setattr("src.core.runtime.resolve_training_plan", lambda config: plan)
+    monkeypatch.setattr(
+        "src.core.diagnostics.estimator.check_memory_feasibility",
+        lambda **kwargs: (True, "ok", {"total_estimated_gb": 0.1, "total_estimated_mb": 100}),
+    )
+    monkeypatch.setattr(
+        inference_service,
+        "prepare_for_training",
+        lambda device: calls.append(("prepare", device)),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        training_service,
+        "start_training",
+        lambda *args, **kwargs: calls.append(("start", kwargs["runtime_plan"].device)),
+    )
+    monkeypatch.setattr(inference_service, "apply_engine_config", lambda config: None)
+
+    response = client.post("/api/training/start", json={})
+
+    assert response.status_code == 200
+    assert calls[:2] == [("prepare", "cuda"), ("start", "cuda")]
+
+
+def test_ui_training_start_pins_resume_checkpoint_revision(
+    client: TestClient, monkeypatch, tmp_path
+):
+    import os
+
+    from src.core.runtime import ResolvedTrainingPlan
+
+    training_service = _app_state(client).training_service
+    inference_service = _app_state(client).inference_service
+    checkpoint_dir = tmp_path / "checkpoints"
+    checkpoint_dir.mkdir()
+    checkpoint = checkpoint_dir / "resume.pt"
+    checkpoint.write_bytes(b"pinned-revision")
+    stat = os.stat(checkpoint)
+    expected = (int(stat.st_dev), int(stat.st_ino), int(stat.st_size), int(stat.st_mtime_ns))
+    captured = {}
+
+    plan = ResolvedTrainingPlan(
+        requested_device="cpu",
+        device="cpu",
+        device_type="cpu",
+        requested_precision="float32",
+        precision="float32",
+        use_amp=False,
+        requested_optimizer="adamw",
+        optimizer_type="adamw",
+        micro_batch_size=1,
+        gradient_accumulation_steps=1,
+        effective_batch_size=1,
+        gradient_checkpointing=False,
+    )
+    monkeypatch.setattr("src.core.runtime.resolve_training_plan", lambda config: plan)
+    monkeypatch.setattr(
+        "src.core.diagnostics.estimator.check_memory_feasibility",
+        lambda **kwargs: (True, "ok", {"total_estimated_gb": 0.1, "total_estimated_mb": 100}),
+    )
+    monkeypatch.setattr(inference_service, "prepare_for_training", lambda device: False)
+    monkeypatch.setattr(inference_service, "apply_engine_config", lambda config: None)
+
+    def fake_start(*args, **kwargs):
+        captured.update(kwargs)
+
+    monkeypatch.setattr(training_service, "start_training", fake_start)
+
+    response = client.post(
+        "/api/training/start",
+        json={
+            "resume_checkpoint": str(checkpoint),
+            "overrides": {"training.checkpoint_dir": str(checkpoint_dir)},
+        },
+    )
+
+    assert response.status_code == 200
+    assert captured["resume_checkpoint_identity"] == expected
+
+
+def test_ui_training_start_reports_resume_disappeared_during_revision_pin(
+    client: TestClient, monkeypatch, tmp_path
+):
+    training_service = _app_state(client).training_service
+    inference_service = _app_state(client).inference_service
+    checkpoint_dir = tmp_path / "checkpoints"
+    checkpoint_dir.mkdir()
+    checkpoint = checkpoint_dir / "resume.pt"
+    checkpoint.write_bytes(b"exists-at-validation")
+
+    monkeypatch.setattr(
+        "src.ui.routes.training._capture_resume_checkpoint_identity",
+        lambda path: (_ for _ in ()).throw(FileNotFoundError(path)),
+        raising=False,
+    )
+    monkeypatch.setattr(inference_service, "prepare_for_training", lambda device: False)
+    monkeypatch.setattr(inference_service, "apply_engine_config", lambda config: None)
+    monkeypatch.setattr(training_service, "start_training", lambda *args, **kwargs: None)
+
+    response = client.post(
+        "/api/training/start",
+        json={
+            "resume_checkpoint": str(checkpoint),
+            "overrides": {"training.checkpoint_dir": str(checkpoint_dir)},
+        },
+    )
+
+    assert response.status_code == 400
+    assert "checkpoint" in response.json()["detail"].lower()

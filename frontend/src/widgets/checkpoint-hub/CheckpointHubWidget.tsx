@@ -36,6 +36,7 @@ export interface CheckpointHubWidgetProps {
 	onSelectResume?: (cp: Checkpoint) => void;
 	activeResumePath?: string;
 	isLoading?: boolean;
+	configRevision?: number;
 }
 
 export const CheckpointHubWidget: React.FC<CheckpointHubWidgetProps> = ({
@@ -47,6 +48,7 @@ export const CheckpointHubWidget: React.FC<CheckpointHubWidgetProps> = ({
 	onSelectResume,
 	activeResumePath,
 	isLoading: controlledLoading,
+	configRevision = 0,
 }) => {
 	const {
 		checkpoints,
@@ -65,6 +67,7 @@ export const CheckpointHubWidget: React.FC<CheckpointHubWidgetProps> = ({
 		onLoad: controlledLoad,
 		onDelete: controlledDelete,
 		isLoading: controlledLoading,
+		configRevision,
 	});
 
 	return (
@@ -139,7 +142,7 @@ export const CheckpointHubWidget: React.FC<CheckpointHubWidgetProps> = ({
 						<TableRow
 							key={c.path}
 							active={c.is_active}
-							highlight={c.filename === "best_model.pt"}
+							highlight={Boolean(c.is_configured_best)}
 						>
 							<TableCell className="w-[34%]">
 								<div className="flex flex-col gap-1 py-1 max-w-full">
@@ -173,7 +176,7 @@ export const CheckpointHubWidget: React.FC<CheckpointHubWidgetProps> = ({
 
 									{/* Hàng 2: Các nhãn/tag mô tả chuyên dụng (chống co ép hàng ngang) */}
 									<div className="flex items-center flex-wrap gap-1.5">
-										{c.filename === "best_model.pt" && (
+										{c.is_configured_best && (
 											<Badge
 												variant="amber"
 												className="font-bold flex items-center gap-1 shadow-warm-xs text-[10px] py-0.5 px-2 whitespace-nowrap shrink-0"
@@ -192,7 +195,7 @@ export const CheckpointHubWidget: React.FC<CheckpointHubWidgetProps> = ({
 												Mới nhất toàn cục
 											</Badge>
 										)}
-										{c.filename !== "best_model.pt" &&
+										{!c.is_configured_best &&
 											c.filename !== "last_model.pt" &&
 											c.filename.endsWith("_last.pt") && (
 												<Badge
@@ -207,7 +210,7 @@ export const CheckpointHubWidget: React.FC<CheckpointHubWidgetProps> = ({
 												</Badge>
 											)}
 										{c.is_best_val &&
-											c.filename !== "best_model.pt" && (
+											!c.is_configured_best && (
 												<Badge
 													variant="emerald"
 													className="text-[10px] font-medium text-emerald-700 bg-emerald-50 border border-emerald-200 whitespace-nowrap shrink-0"
@@ -270,8 +273,9 @@ export const CheckpointHubWidget: React.FC<CheckpointHubWidgetProps> = ({
 										size="sm"
 										disabled={c.is_active}
 										onClick={() => {
-											handleLoad(c.path);
-											onSelectCheckpoint?.(c);
+											void handleLoad(c.path, (loadedPath) => {
+												onSelectCheckpoint?.({ ...c, path: loadedPath });
+											});
 										}}
 										className="h-7 px-3 text-xs font-medium shadow-warm-sm"
 									>
@@ -326,8 +330,7 @@ export const CheckpointHubWidget: React.FC<CheckpointHubWidgetProps> = ({
 													);
 												},
 											},
-											...(c.filename !==
-												"best_model.pt" && !c.is_active
+											...(!c.is_configured_best && !c.is_active
 												? [
 														{
 															separatorBefore: true,

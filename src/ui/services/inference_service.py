@@ -4,6 +4,7 @@ Inference Service: Quản lý nạp mô hình, hoán đổi checkpoint và đi�
 
 import math
 import os
+import stat as stat_module
 import threading
 import time
 from dataclasses import replace
@@ -11,7 +12,7 @@ from typing import Any, Callable, Dict, Generator, List, Optional
 
 import torch
 
-from src.core.config import GenerationConfig, ModelConfig
+from src.core.config import EngineConfig, GenerationConfig, ModelConfig
 from src.core.exceptions import EmptyPromptError, GenerationBusyError, GenerationNotReadyError
 from src.core.logging import get_logger
 from src.data.tokenizers import BaseTokenizer, load_tokenizer, load_tokenizer_state
@@ -22,6 +23,10 @@ from src.generation import (
 )
 from src.models.base import BaseModel
 from src.models.registry import ModelRegistry
+from src.ui.services.accelerator_coordinator import (
+    AcceleratorCoordinator,
+    same_accelerator_family,
+)
 from src.ui.services.generation_session import GenerationSession
 from src.utils.device import resolve_device
 
@@ -34,19 +39,33 @@ class InferenceService:
     def __init__(
         self,
         checkpoint_dir: str = "checkpoints",
-        default_checkpoint: str = "checkpoints/best_model.pt",
+        default_checkpoint: Optional[str] = None,
         vocab_path: str = "data/vocab.json",
         device: str = "auto",
         backend: str = "local",
         max_generation_sessions: int = 2,
+        checkpoint_name: str = "best_model.pt",
+        generation_config: Optional[GenerationConfig] = None,
+        accelerator_coordinator: Optional[AcceleratorCoordinator] = None,
     ) -> None:
         if max_generation_sessions <= 0:
             raise ValueError("max_generation_sessions phải > 0")
         self.checkpoint_dir = checkpoint_dir
+        self.checkpoint_name = checkpoint_name
         self.current_checkpoint_path: Optional[str] = None
+        self._current_checkpoint_identity: Optional[tuple[int, int, int, int]] = None
         self.vocab_path = vocab_path
+        self.configured_device = device
         self.device_str = resolve_device(device)
+        self._engine_config: Optional[EngineConfig] = None
+        self.default_generation_config = (
+            GenerationConfig.from_kwargs_safe(generation_config.to_dict())
+            if generation_config is not None
+            else GenerationConfig()
+        )
         self.current_backend: str = backend
+        self._accelerator_coordinator = accelerator_coordinator
+        self._residency_device: Optional[str] = None
         self.tokenizer: Optional[BaseTokenizer] = None
         self.model: Optional[BaseModel] = None
         self.generator: Optional[BaseGenerator] = None
@@ -55,6 +74,9 @@ class InferenceService:
         self._generation_sessions = 0
         # Model instances own mutable KV-cache state, so workers execute one at a time.
         self._generation_lock = threading.Lock()
+
+        if default_checkpoint is None:
+            default_checkpoint = os.path.join(checkpoint_dir, checkpoint_name)
 
         # Nạp mặc định nếu checkpoint và từ vựng tồn tại
         if os.path.exists(vocab_path):
@@ -69,23 +91,86 @@ class InferenceService:
             except Exception as e:
                 logger.warning(f"Chưa thể nạp checkpoint mặc định {default_checkpoint}: {e}")
 
-    def set_checkpoint_dir(self, checkpoint_dir: str) -> None:
-        """Update the single checkpoint directory used by list/delete/download flows."""
-        if not checkpoint_dir or not checkpoint_dir.strip():
-            raise ValueError("checkpoint_dir không được để trống.")
-        with self._lock:
-            self.checkpoint_dir = checkpoint_dir
+    @classmethod
+    def from_engine_config(
+        cls,
+        config: EngineConfig,
+        *,
+        backend: str = "local",
+        max_generation_sessions: int = 2,
+        accelerator_coordinator: Optional[AcceleratorCoordinator] = None,
+    ) -> "InferenceService":
+        """Build inference preferences from the same canonical EngineConfig used by training."""
+        service = cls(
+            checkpoint_dir=config.training.checkpoint_dir,
+            checkpoint_name=config.training.checkpoint_name,
+            default_checkpoint=os.path.join(
+                config.training.checkpoint_dir, config.training.checkpoint_name
+            ),
+            vocab_path=config.data.vocab_file,
+            device=config.system.device,
+            backend=backend,
+            max_generation_sessions=max_generation_sessions,
+            generation_config=config.generation,
+            accelerator_coordinator=accelerator_coordinator,
+        )
+        service.apply_engine_config(config)
+        return service
 
-    def set_vocab_path(self, vocab_path: str) -> None:
-        """Update the vocab source used for future checkpoint loads without disturbing the active model."""
-        if not vocab_path or not vocab_path.strip():
-            raise ValueError("vocab_path không được để trống.")
-        with self._lock:
-            self.vocab_path = vocab_path
+    def apply_engine_config(self, config: EngineConfig) -> None:
+        """Update canonical preferences for future inference operations.
 
-    def resolve_checkpoint_path(self, path: str, *, filename_only: bool = False) -> str:
-        """Resolve a managed checkpoint path without allowing traversal or symlink escape."""
-        root = os.path.realpath(os.path.abspath(self.checkpoint_dir))
+        An already-loaded model remains on its current device and keeps its embedded
+        tokenizer; the next checkpoint load uses these newly configured preferences.
+        """
+        config.validate()
+        snapshot = EngineConfig.from_dict(config.to_dict())
+        with self._lock:
+            self._engine_config = snapshot
+            self.checkpoint_dir = snapshot.training.checkpoint_dir
+            self.checkpoint_name = snapshot.training.checkpoint_name
+            self.vocab_path = snapshot.data.vocab_file
+            self.configured_device = snapshot.system.device
+            self.default_generation_config = GenerationConfig.from_kwargs_safe(
+                snapshot.generation.to_dict()
+            )
+
+    def get_engine_config(self) -> EngineConfig:
+        """Return a defensive copy of the effective canonical runtime configuration."""
+        with self._lock:
+            if self._engine_config is None:
+                fallback = EngineConfig()
+                fallback = fallback.copy(
+                    data=fallback.data.copy(vocab_file=self.vocab_path),
+                    training=fallback.training.copy(
+                        checkpoint_dir=self.checkpoint_dir, checkpoint_name=self.checkpoint_name
+                    ),
+                    system=fallback.system.copy(device=self.configured_device),
+                    generation=GenerationConfig.from_kwargs_safe(
+                        self.default_generation_config.to_dict()
+                    ),
+                )
+                return fallback
+            return EngineConfig.from_dict(self._engine_config.to_dict())
+
+    @staticmethod
+    def _identity_from_stat(stat_result: os.stat_result) -> tuple[int, int, int, int]:
+        return (
+            int(stat_result.st_dev),
+            int(stat_result.st_ino),
+            int(stat_result.st_size),
+            int(stat_result.st_mtime_ns),
+        )
+
+    @classmethod
+    def _checkpoint_identity(cls, path: str) -> tuple[int, int, int, int]:
+        return cls._identity_from_stat(os.stat(path))
+
+    @staticmethod
+    def _resolve_checkpoint_path_for_dir(
+        checkpoint_dir: str, path: str, *, filename_only: bool = False
+    ) -> str:
+        root = os.path.realpath(os.path.abspath(checkpoint_dir))
         if filename_only:
             candidate = os.path.realpath(os.path.join(root, os.path.basename(path)))
         else:
@@ -99,94 +184,156 @@ class InferenceService:
             raise ValueError("Checkpoint phải nằm bên trong checkpoint_dir đã cấu hình.") from exc
         return candidate
 
+    def get_runtime_state(self) -> Dict[str, Any]:
+        """Return authoritative inference preferences and the loaded artifact revision."""
+        with self._lock:
+            active_path = self.current_checkpoint_path
+            active_identity = self._current_checkpoint_identity
+            return {
+                "current_checkpoint": active_path.replace("\\", "/") if active_path else None,
+                "current_checkpoint_revision": (
+                    ":".join(str(part) for part in active_identity) if active_identity else None
+                ),
+                "current_backend": self.current_backend,
+                "checkpoint_dir": self.checkpoint_dir.replace("\\", "/"),
+                "checkpoint_name": self.checkpoint_name,
+                "vocab_path": self.vocab_path.replace("\\", "/"),
+                "configured_device": self.configured_device,
+                "active_device": self.device_str,
+                "generation": self.default_generation_config.to_dict(),
+            }
+
+    def set_checkpoint_dir(self, checkpoint_dir: str) -> None:
+        """Update the single checkpoint directory used by list/delete/download flows."""
+        if not checkpoint_dir or not checkpoint_dir.strip():
+            raise ValueError("checkpoint_dir không được để trống.")
+        with self._lock:
+            self.checkpoint_dir = checkpoint_dir
+            if self._engine_config is not None:
+                self._engine_config = self._engine_config.copy(
+                    training=self._engine_config.training.copy(checkpoint_dir=checkpoint_dir)
+                )
+
+    def set_vocab_path(self, vocab_path: str) -> None:
+        """Update the vocab source used for future checkpoint loads without disturbing the active model."""
+        if not vocab_path or not vocab_path.strip():
+            raise ValueError("vocab_path không được để trống.")
+        with self._lock:
+            self.vocab_path = vocab_path
+            if self._engine_config is not None:
+                self._engine_config = self._engine_config.copy(
+                    data=self._engine_config.data.copy(vocab_file=vocab_path)
+                )
+
+    def resolve_checkpoint_path(self, path: str, *, filename_only: bool = False) -> str:
+        """Resolve a managed checkpoint path without allowing traversal or symlink escape."""
+        with self._lock:
+            checkpoint_dir = self.checkpoint_dir
+        return self._resolve_checkpoint_path_for_dir(
+            checkpoint_dir, path, filename_only=filename_only
+        )
+
     def list_checkpoints(self) -> List[Dict[str, Any]]:
-        """Quét và trả về danh sách tất cả checkpoint cùng metadata."""
+        """Scan one coherent checkpoint-directory snapshot and return stable file metadata."""
+        with self._lock:
+            checkpoint_dir = self.checkpoint_dir
+            checkpoint_name = self.checkpoint_name
+            active_path = self.current_checkpoint_path
+            active_identity = self._current_checkpoint_identity
+
         checkpoints: List[Dict[str, Any]] = []
-        if not os.path.exists(self.checkpoint_dir):
+        if not os.path.exists(checkpoint_dir):
             return checkpoints
 
-        for fname in os.listdir(self.checkpoint_dir):
-            if fname.endswith(".pt") or fname.endswith(".pth"):
-                try:
-                    fpath = self.resolve_checkpoint_path(fname, filename_only=True)
-                except ValueError:
-                    continue
-                if not os.path.isfile(fpath):
-                    continue
-                stat = os.stat(fpath)
-                size_mb = round(stat.st_size / (1024 * 1024), 2)
-                modified_time = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(stat.st_mtime))
-                is_active = os.path.abspath(fpath) == (
-                    os.path.abspath(self.current_checkpoint_path)
-                    if self.current_checkpoint_path
-                    else ""
+        try:
+            filenames = os.listdir(checkpoint_dir)
+        except OSError:
+            return checkpoints
+
+        for fname in filenames:
+            if not (fname.endswith(".pt") or fname.endswith(".pth")):
+                continue
+            try:
+                fpath = self._resolve_checkpoint_path_for_dir(
+                    checkpoint_dir, fname, filename_only=True
                 )
+                with open(fpath, "rb") as checkpoint_file:
+                    file_stat = os.fstat(checkpoint_file.fileno())
+                    if not stat_module.S_ISREG(file_stat.st_mode):
+                        continue
+                    current_identity = self._identity_from_stat(file_stat)
+                    size_mb = round(file_stat.st_size / (1024 * 1024), 2)
+                    modified_time = time.strftime(
+                        "%Y-%m-%d %H:%M:%S", time.localtime(file_stat.st_mtime)
+                    )
+                    step = None
+                    val_loss = None
+                    run_name = None
+                    try:
+                        meta = torch.load(checkpoint_file, map_location="cpu", weights_only=True)
+                        if isinstance(meta, dict):
+                            step = meta.get("step")
+                            raw_val = meta.get("val_loss")
+                            if raw_val is not None:
+                                try:
+                                    value = float(raw_val)
+                                    if math.isfinite(value):
+                                        val_loss = round(value, 4)
+                                except (ValueError, TypeError):
+                                    pass
+                            run_name = meta.get("run_name")
+                    except Exception:
+                        pass
+            except (OSError, ValueError):
+                continue
 
-                # Đọc nhanh metadata nếu có
-                step = None
-                val_loss = None
-                run_name = None
-                try:
-                    meta = torch.load(fpath, map_location="cpu", weights_only=True)
-                    if isinstance(meta, dict):
-                        step = meta.get("step")
-                        raw_val = meta.get("val_loss")
-                        if raw_val is not None:
-                            try:
-                                v = float(raw_val)
-                                if math.isfinite(v):
-                                    val_loss = round(v, 4)
-                            except (ValueError, TypeError):
-                                pass
-                        run_name = meta.get("run_name")
-                except Exception:
-                    pass
+            is_active = (
+                active_path is not None
+                and os.path.abspath(fpath) == os.path.abspath(active_path)
+                and active_identity == current_identity
+            )
+            checkpoints.append(
+                {
+                    "filename": fname,
+                    "path": fpath.replace("\\", "/"),
+                    "size_mb": size_mb,
+                    "modified_time": modified_time,
+                    "is_active": is_active,
+                    "step": step,
+                    "val_loss": val_loss,
+                    "run_name": run_name,
+                    "is_configured_best": fname == checkpoint_name,
+                }
+            )
 
-                checkpoints.append(
-                    {
-                        "filename": fname,
-                        "path": fpath.replace("\\", "/"),
-                        "size_mb": size_mb,
-                        "modified_time": modified_time,
-                        "is_active": is_active,
-                        "step": step,
-                        "val_loss": val_loss,
-                        "run_name": run_name,
-                    }
-                )
-
-        # Xác định val_loss thấp nhất thực tế trên toàn bộ checkpoint
         valid_losses = [c["val_loss"] for c in checkpoints if c.get("val_loss") is not None]
         min_loss = min(valid_losses) if valid_losses else None
-
-        for c in checkpoints:
-            c["is_best_val"] = (
+        for checkpoint in checkpoints:
+            checkpoint["is_best_val"] = (
                 min_loss is not None
-                and c.get("val_loss") is not None
-                and abs(c["val_loss"] - min_loss) < 1e-5
+                and checkpoint.get("val_loss") is not None
+                and abs(checkpoint["val_loss"] - min_loss) < 1e-5
             )
-            fname = c["filename"]
-            if fname == "best_model.pt":
-                c["tag"] = "best"
+            fname = checkpoint["filename"]
+            if fname == checkpoint_name:
+                checkpoint["tag"] = "best"
             elif fname == "last_model.pt":
-                c["tag"] = "canonical_last"
+                checkpoint["tag"] = "canonical_last"
             elif fname.endswith("_last.pt"):
-                c["tag"] = "run_last"
+                checkpoint["tag"] = "run_last"
             elif "_step" in fname:
-                c["tag"] = "top_k"
+                checkpoint["tag"] = "top_k"
             else:
-                c["tag"] = "custom"
+                checkpoint["tag"] = "custom"
 
-        def _checkpoint_sort_key(x: Dict[str, Any]):
-            # best_model.pt luôn được ghim ở đầu bảng (ưu tiên 0 so với 1)
-            is_best = 0 if x["filename"] == "best_model.pt" else 1
+        def _checkpoint_sort_key(item: Dict[str, Any]):
+            is_best = 0 if item["filename"] == checkpoint_name else 1
             mtime = 0.0
             try:
-                mtime = time.mktime(time.strptime(x["modified_time"], "%Y-%m-%d %H:%M:%S"))
+                mtime = time.mktime(time.strptime(item["modified_time"], "%Y-%m-%d %H:%M:%S"))
             except Exception:
                 pass
-            step = x.get("step") or 0
-            # Sắp xếp: best lên trước, sau đó là thời gian mới nhất (mtime giảm dần), step giảm dần
+            step = item.get("step") or 0
             return (is_best, -mtime, -step)
 
         checkpoints.sort(key=_checkpoint_sort_key)
@@ -207,6 +354,54 @@ class InferenceService:
             empty_cache = getattr(mps, "empty_cache", None)
             if callable(empty_cache):
                 empty_cache()
+
+    def prepare_for_training(self, training_device: str) -> bool:
+        """Offload idle inference weights when training needs the same accelerator.
+
+        The checkpoint identity remains active; only its execution residency changes.
+        A persistent coordinator residency lease prevents a checkpoint reload from
+        silently reoccupying the accelerator between this handoff and training admission.
+        """
+        with self._lock:
+            if not same_accelerator_family(self.device_str, training_device):
+                return False
+            if self._generation_sessions:
+                raise GenerationBusyError(
+                    active=self._generation_sessions,
+                    limit=self._max_generation_sessions,
+                    operation="prepare_training",
+                )
+            if self.model is None or self.tokenizer is None:
+                return False
+
+            previous_device = self.device_str
+            previous_generator = self.generator
+            model = self.model
+            tokenizer = self.tokenizer
+            backend = self.current_backend
+
+            if isinstance(model, torch.nn.Module):
+                model.to("cpu")
+            self._empty_accelerator_cache(previous_device)
+            try:
+                cpu_generator = GeneratorRegistry.create_for_inference(
+                    backend, model=model, tokenizer=tokenizer, device="cpu"
+                )
+            except Exception:
+                try:
+                    if isinstance(model, torch.nn.Module):
+                        model.to(previous_device)
+                finally:
+                    self.generator = previous_generator
+                raise
+
+            self.generator = cpu_generator
+            self.device_str = "cpu"
+            residency_device = self._residency_device
+            self._residency_device = None
+            if residency_device is not None and self._accelerator_coordinator is not None:
+                self._accelerator_coordinator.release_inference_residency(residency_device)
+            return True
 
     def set_backend(self, backend: str) -> None:
         """Chuyển đổi generator backend sang một backend khác trong GeneratorRegistry."""
@@ -232,9 +427,19 @@ class InferenceService:
             self.current_backend = backend_clean
             logger.info(f"Đã chuyển đổi Generator backend sang: '{backend_clean}'")
 
-    def load_checkpoint(self, checkpoint_path: str, backend: Optional[str] = None) -> None:
-        """Nạp checkpoint mới và chỉ commit state sau khi toàn bộ quá trình thành công."""
+    def load_checkpoint(
+        self,
+        checkpoint_path: str,
+        backend: Optional[str] = None,
+        *,
+        require_managed: bool = False,
+    ) -> None:
+        """Load a checkpoint and atomically publish it only after validation succeeds."""
         with self._lock:
+            if require_managed:
+                checkpoint_path = self._resolve_checkpoint_path_for_dir(
+                    self.checkpoint_dir, checkpoint_path
+                )
             if self._generation_sessions:
                 raise GenerationBusyError(
                     active=self._generation_sessions,
@@ -249,105 +454,163 @@ class InferenceService:
             if not os.path.exists(checkpoint_path):
                 raise FileNotFoundError(f"Không tìm thấy file checkpoint: {checkpoint_path}")
 
-            # Stage checkpoint tensors on CPU first. Loading directly onto the active
-            # inference device would temporarily duplicate checkpoint + old model + new model
-            # in VRAM before the atomic service-state commit.
-            checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
-            checkpoint_identity = checkpoint.get("tokenizer_identity")
-            if not isinstance(checkpoint_identity, dict):
-                raise ValueError(
-                    "Checkpoint legacy không có tokenizer identity; từ chối nạp để tránh ánh xạ token sai."
+            target_device = resolve_device(self.configured_device)
+            reserved_accelerator = False
+            new_residency_acquired: Optional[str] = None
+            residency_committed = False
+            previous_residency_device = self._residency_device
+            if self._accelerator_coordinator is not None:
+                self._accelerator_coordinator.reserve_generation(
+                    target_device, operation="checkpoint_load"
                 )
-            checkpoint_version = int(checkpoint.get("checkpoint_version", 1))
-            embedded_state = checkpoint.get("tokenizer_state")
-            if checkpoint_version >= 3 and not isinstance(embedded_state, dict):
-                raise ValueError("Checkpoint v3 thiếu tokenizer state bắt buộc.")
-            if isinstance(embedded_state, dict):
-                tokenizer = load_tokenizer_state(embedded_state)
-            else:
-                tokenizer = (
-                    load_tokenizer(self.vocab_path)
-                    if os.path.exists(self.vocab_path)
-                    else self.tokenizer
-                )
-            if tokenizer is None:
-                raise ValueError(
-                    "Không thể nạp checkpoint khi chưa có tokenizer/từ vựng tương ứng."
-                )
-            current_identity = get_tokenizer_identity(tokenizer)
-            if checkpoint_identity.get("fingerprint") != current_identity.get("fingerprint"):
-                raise ValueError(
-                    "Tokenizer/từ vựng hiện tại không khớp tokenizer identity của checkpoint."
-                )
-
-            cfg_dict = checkpoint.get("config", {}).get("model", {})
-            model_config = ModelConfig.from_kwargs_safe(cfg_dict, ignore_unknown=True)
-            model = ModelRegistry.create(model_config.name, model_config)
-
-            if isinstance(model, torch.nn.Module):
-                model.load_state_dict(checkpoint["model_state_dict"])
-
-            # The checkpoint payload is no longer needed after the CPU model has been
-            # populated. Drop it before an accelerator swap to avoid retaining another
-            # full copy of the weights in host memory during the handoff.
-            del checkpoint
-
-            previous_model = self.model
-            previous_model_to_restore: Optional[BaseModel] = None
-            accelerator_target = self.device_str != "cpu"
-            if accelerator_target and previous_model is not None:
-                previous_model.to("cpu")
-                previous_model_to_restore = previous_model
-                self._empty_accelerator_cache(self.device_str)
+                reserved_accelerator = True
 
             try:
+                # Stage checkpoint tensors on CPU first. Loading directly onto the active
+                # inference device would temporarily duplicate checkpoint + old model + new model
+                # in VRAM before the atomic service-state commit.
+                with open(checkpoint_path, "rb") as checkpoint_file:
+                    loaded_checkpoint_identity = self._identity_from_stat(
+                        os.fstat(checkpoint_file.fileno())
+                    )
+                    checkpoint = torch.load(checkpoint_file, map_location="cpu", weights_only=True)
+                checkpoint_identity = checkpoint.get("tokenizer_identity")
+                if not isinstance(checkpoint_identity, dict):
+                    raise ValueError(
+                        "Checkpoint legacy không có tokenizer identity; từ chối nạp để tránh ánh xạ token sai."
+                    )
+                checkpoint_version = int(checkpoint.get("checkpoint_version", 1))
+                embedded_state = checkpoint.get("tokenizer_state")
+                if checkpoint_version >= 3 and not isinstance(embedded_state, dict):
+                    raise ValueError("Checkpoint v3 thiếu tokenizer state bắt buộc.")
+                if isinstance(embedded_state, dict):
+                    tokenizer = load_tokenizer_state(embedded_state)
+                else:
+                    tokenizer = (
+                        load_tokenizer(self.vocab_path)
+                        if os.path.exists(self.vocab_path)
+                        else self.tokenizer
+                    )
+                if tokenizer is None:
+                    raise ValueError(
+                        "Không thể nạp checkpoint khi chưa có tokenizer/từ vựng tương ứng."
+                    )
+                current_identity = get_tokenizer_identity(tokenizer)
+                if checkpoint_identity.get("fingerprint") != current_identity.get("fingerprint"):
+                    raise ValueError(
+                        "Tokenizer/từ vựng hiện tại không khớp tokenizer identity của checkpoint."
+                    )
+
+                cfg_dict = checkpoint.get("config", {}).get("model", {})
+                model_config = ModelConfig.from_kwargs_safe(cfg_dict, ignore_unknown=True)
+                model = ModelRegistry.create(model_config.name, model_config)
+
                 if isinstance(model, torch.nn.Module):
-                    model.to(self.device_str)
-                    model.eval()
+                    model.load_state_dict(checkpoint["model_state_dict"])
 
-                generator = GeneratorRegistry.create_for_inference(
-                    target_backend,
-                    model=model,
-                    tokenizer=tokenizer,
-                    device=self.device_str,
+                # The checkpoint payload is no longer needed after the CPU model has been
+                # populated. Drop it before an accelerator swap to avoid retaining another
+                # full copy of the weights in host memory during the handoff.
+                del checkpoint
+
+                previous_model = self.model
+                previous_model_to_restore: Optional[BaseModel] = None
+                previous_device = self.device_str
+                previous_was_accelerator_resident = same_accelerator_family(
+                    previous_device, previous_device
                 )
-            except Exception:
-                if previous_model_to_restore is not None:
-                    if isinstance(model, torch.nn.Module):
-                        try:
-                            model.to("cpu")
-                        except Exception as cleanup_exc:
-                            logger.warning(
-                                "Không thể offload model mới sau khi checkpoint swap lỗi: %s",
-                                cleanup_exc,
-                            )
-                    self._empty_accelerator_cache(self.device_str)
-                    try:
-                        previous_model_to_restore.to(self.device_str)
-                    except Exception as restore_exc:
-                        raise RuntimeError(
-                            "Checkpoint swap thất bại và không thể khôi phục model trước đó "
-                            "lên inference device."
-                        ) from restore_exc
-                raise
+                if previous_was_accelerator_resident and previous_model is not None:
+                    previous_model.to("cpu")
+                    previous_model_to_restore = previous_model
+                    self._empty_accelerator_cache(previous_device)
 
-            # Atomic state commit: failed validation/load above must leave the active service untouched.
-            self.tokenizer = tokenizer
-            self.model = model
-            self.generator = generator
-            self.current_backend = target_backend
-            self.current_checkpoint_path = checkpoint_path
-            logger.info(
-                f"Đã nạp checkpoint thành công: {checkpoint_path} trên {self.device_str} (Backend: '{self.current_backend}')"
-            )
+                try:
+                    if isinstance(model, torch.nn.Module):
+                        model.to(target_device)
+                        model.eval()
+
+                    generator = GeneratorRegistry.create_for_inference(
+                        target_backend,
+                        model=model,
+                        tokenizer=tokenizer,
+                        device=target_device,
+                    )
+                except Exception:
+                    if previous_model_to_restore is not None:
+                        if isinstance(model, torch.nn.Module):
+                            try:
+                                model.to("cpu")
+                            except Exception as cleanup_exc:
+                                logger.warning(
+                                    "Không thể offload model mới sau khi checkpoint swap lỗi: %s",
+                                    cleanup_exc,
+                                )
+                        self._empty_accelerator_cache(target_device)
+                        try:
+                            previous_model_to_restore.to(previous_device)
+                        except Exception as restore_exc:
+                            raise RuntimeError(
+                                "Checkpoint swap thất bại và không thể khôi phục model trước đó "
+                                "lên inference device."
+                            ) from restore_exc
+                    raise
+
+                next_residency_device: Optional[str] = None
+                if same_accelerator_family(target_device, target_device):
+                    if previous_residency_device is not None and same_accelerator_family(
+                        previous_residency_device, target_device
+                    ):
+                        next_residency_device = previous_residency_device
+                    elif self._accelerator_coordinator is not None:
+                        self._accelerator_coordinator.reserve_inference_residency(target_device)
+                        new_residency_acquired = target_device
+                        next_residency_device = target_device
+
+                # Atomic state commit: failed validation/load above must leave the active service untouched.
+                self.tokenizer = tokenizer
+                self.model = model
+                self.generator = generator
+                self.current_backend = target_backend
+                self.current_checkpoint_path = checkpoint_path
+                self._current_checkpoint_identity = loaded_checkpoint_identity
+                self.device_str = target_device
+                self._residency_device = next_residency_device
+                if (
+                    previous_residency_device is not None
+                    and previous_residency_device != next_residency_device
+                    and self._accelerator_coordinator is not None
+                ):
+                    self._accelerator_coordinator.release_inference_residency(
+                        previous_residency_device
+                    )
+                residency_committed = True
+                logger.info(
+                    f"Đã nạp checkpoint thành công: {checkpoint_path} trên {self.device_str} (Backend: '{self.current_backend}')"
+                )
+            finally:
+                if (
+                    new_residency_acquired is not None
+                    and not residency_committed
+                    and self._accelerator_coordinator is not None
+                ):
+                    self._accelerator_coordinator.release_inference_residency(
+                        new_residency_acquired
+                    )
+                if reserved_accelerator and self._accelerator_coordinator is not None:
+                    self._accelerator_coordinator.release_generation(target_device)
 
     def delete_checkpoint(self, filename: str) -> bool:
         """Xóa một checkpoint khỏi thư mục lưu trữ an toàn."""
         with self._lock:
             safe_filename = os.path.basename(filename)
-            target_path = self.resolve_checkpoint_path(safe_filename, filename_only=True)
+            target_path = self._resolve_checkpoint_path_for_dir(
+                self.checkpoint_dir, safe_filename, filename_only=True
+            )
             if not os.path.exists(target_path):
                 raise FileNotFoundError(f"Không tìm thấy file checkpoint: {safe_filename}")
+
+            if safe_filename == self.checkpoint_name:
+                raise ValueError("Không thể xóa checkpoint tốt nhất đang được cấu hình!")
 
             if self.current_checkpoint_path and os.path.abspath(target_path) == os.path.abspath(
                 self.current_checkpoint_path
@@ -358,9 +621,11 @@ class InferenceService:
             logger.info(f"🗑️ Đã xóa checkpoint: {safe_filename}")
             return True
 
-    def _release_generation_admission(self) -> None:
+    def _release_generation_admission(self, device: str) -> None:
         with self._lock:
             self._generation_sessions = max(0, self._generation_sessions - 1)
+        if self._accelerator_coordinator is not None:
+            self._accelerator_coordinator.release_generation(device)
 
     def begin_generation(
         self,
@@ -430,13 +695,25 @@ class InferenceService:
                 stop_tokens=list(config.stop_tokens) if config.stop_tokens else None,
                 stop_sequences=stop_sequences or None,
             )
-            session = GenerationSession(
-                generator_provider=generator_provider,
-                prompt=prompt,
-                config=frozen_config,
-                execution_lock=self._generation_lock,
-                release_admission=self._release_generation_admission,
-            )
+            device_snapshot = self.device_str
+            if self._accelerator_coordinator is not None:
+                self._accelerator_coordinator.reserve_generation(device_snapshot)
+
+            def release_admission() -> None:
+                self._release_generation_admission(device_snapshot)
+
+            try:
+                session = GenerationSession(
+                    generator_provider=generator_provider,
+                    prompt=prompt,
+                    config=frozen_config,
+                    execution_lock=self._generation_lock,
+                    release_admission=release_admission,
+                )
+            except Exception:
+                if self._accelerator_coordinator is not None:
+                    self._accelerator_coordinator.release_generation(device_snapshot)
+                raise
             self._generation_sessions += 1
             return session
 

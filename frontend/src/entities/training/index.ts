@@ -8,6 +8,8 @@ export type {
 	SampleRecord,
 	TrainingConfigForm,
 	TrainingOverrideField,
+	TrainingScenarioOverrides,
+	TrainingScenarioUpdate,
 	CanonicalTrainingOverrides,
 	TrainingStartPayload,
 	TrainingFeasibilityPayload,
@@ -20,8 +22,11 @@ export type {
 
 export {
 	applyResumeToTrainingForm,
+	applyTrainingScenarioOverrides,
+	applyTrainingScenarioUpdate,
 	DEFAULT_TRAINING_CONFIG_PATH,
 	resolvedConfigToTrainingForm,
+	shouldApplyTrainingScenario,
 	buildTrainingOverrides,
 } from "./model/configMapping";
 

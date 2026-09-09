@@ -66,6 +66,23 @@ export type TrainingOverrideField = Exclude<
 	"config_path" | "resume_checkpoint"
 >;
 
+
+export type TrainingScenarioOverrides = Partial<
+	Pick<
+		TrainingConfigForm,
+		| "batch_size"
+		| "precision"
+		| "optimizer_type"
+		| "gradient_accumulation_steps"
+		| "gradient_checkpointing"
+	>
+>;
+
+export interface TrainingScenarioUpdate {
+	revision: number;
+	overrides: TrainingScenarioOverrides;
+}
+
 export type CanonicalTrainingOverrides = Record<string, string | number | boolean>;
 
 export interface TrainingStartPayload {
@@ -88,8 +105,23 @@ export interface PreflightMemoryInfo {
 }
 
 export interface ResolvedTrainingConfig {
+	system: {
+		device: string;
+	};
 	model: {
 		name: string;
+		block_size: number;
+		n_embd: number;
+		n_layer: number;
+		n_head: number;
+		vocab_size: number;
+		model_kwargs?: {
+			intermediate_size?: number | null;
+			multiple_of?: number;
+			[key: string]: unknown;
+		};
+		tie_word_embeddings?: boolean;
+		bias?: boolean;
 	};
 	training: {
 		batch_size: number;

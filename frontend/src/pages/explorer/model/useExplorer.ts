@@ -2,7 +2,7 @@ import { useState, useEffect } from "react";
 import { datasetApi } from "@/entities/dataset";
 import type { DatasetSampleInfo, BinaryExportResult } from "@/entities/dataset";
 
-export function useExplorer() {
+export function useExplorer(configRevision = 0) {
 	const [datasetInfo, setDatasetInfo] = useState<DatasetSampleInfo | null>(
 		null,
 	);
@@ -26,7 +26,7 @@ export function useExplorer() {
 		return () => {
 			isMounted = false;
 		};
-	}, []);
+	}, [configRevision]);
 
 	const handleExportBinary = async () => {
 		setExportingBinary(true);

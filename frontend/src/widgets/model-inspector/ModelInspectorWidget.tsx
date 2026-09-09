@@ -16,7 +16,13 @@ import {
 import { useModelInspector } from "./model/useModelInspector";
 import { Boxes, Cpu, Layers, Database, Hash, RefreshCw } from "lucide-react";
 
-export const ModelInspectorWidget: React.FC = () => {
+export interface ModelInspectorWidgetProps {
+	configRevision?: number;
+}
+
+export const ModelInspectorWidget: React.FC<ModelInspectorWidgetProps> = ({
+	configRevision = 0,
+}) => {
 	const {
 		modelName,
 		setModelName,
@@ -27,7 +33,7 @@ export const ModelInspectorWidget: React.FC = () => {
 		setSearchTerm,
 		filteredLayers,
 		fetchInspection,
-	} = useModelInspector();
+	} = useModelInspector(configRevision);
 
 	return (
 		<Card className="border-stone-300/80 bg-[#faf8f5] shadow-warm-sm">

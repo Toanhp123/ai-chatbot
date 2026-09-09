@@ -264,3 +264,21 @@ def test_multiworker_dataloader_provider_does_not_claim_exact_resume() -> None:
     provider = DataLoaderBatchProvider(dataset, dataset, num_workers=1)
 
     assert provider.supports_exact_resume is False
+
+
+def test_existing_small_local_input_is_never_overwritten(tmp_path) -> None:
+    input_file = tmp_path / "tiny.txt"
+    original = "tiny corpus\n"
+    input_file.write_text(original, encoding="utf-8")
+    config = DataConfig(
+        data_dir=str(tmp_path),
+        input_file=str(input_file),
+        vocab_file=str(tmp_path / "vocab.json"),
+        source_url="https://example.invalid/should-not-be-used",
+        cleaner_type="none",
+    )
+
+    text = DataPipeline.fetch_or_load_text(config)
+
+    assert text == original
+    assert input_file.read_text(encoding="utf-8") == original
