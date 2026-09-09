@@ -1,13 +1,14 @@
-from .contracts import (
+from src.training.api import (
     NullTrainingObserver,
     PreparedTrainingRun,
-    TrainingCommand,
-    TrainingFeasibility,
     TrainingObserver,
-    TrainingPlan,
     TrainingPreparationAborted,
+    TrainingRunFactory,
 )
-from .run import TrainingRunFactory
+
+from .background import TrainingService
+from .contracts import TrainingCommand, TrainingFeasibility, TrainingPlan
+from .launch import TrainingLaunchApplicationService
 from .service import TrainingApplicationService, generate_run_name
 
 __all__ = [
@@ -16,16 +17,11 @@ __all__ = [
     "TrainingApplicationService",
     "TrainingCommand",
     "TrainingFeasibility",
+    "TrainingLaunchApplicationService",
     "TrainingObserver",
     "TrainingPlan",
     "TrainingPreparationAborted",
     "TrainingRunFactory",
+    "TrainingService",
     "generate_run_name",
 ]
-from .background import TrainingService
-
-__all__.append("TrainingService")
-
-from .launch import TrainingLaunchApplicationService
-
-__all__.append("TrainingLaunchApplicationService")

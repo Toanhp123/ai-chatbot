@@ -2,7 +2,7 @@ import queue
 
 
 def test_training_event_hub_broadcasts_independently_and_unregisters():
-    from src.application.training.events import TrainingEventHub
+    from src.training.api import TrainingEventHub
 
     hub = TrainingEventHub(queue_size=2)
     first = hub.subscribe()
@@ -22,7 +22,7 @@ def test_training_event_hub_broadcasts_independently_and_unregisters():
 
 
 def test_training_event_hub_drops_only_the_slow_subscriber_when_full():
-    from src.application.training.events import TrainingEventHub
+    from src.training.api import TrainingEventHub
 
     hub = TrainingEventHub(queue_size=1)
     slow = hub.subscribe()

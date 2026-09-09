@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 from typing import Optional, Sequence
 
 from src.core.config import EngineConfig
@@ -63,8 +62,6 @@ class ConfigurationService:
 
     def save_raw(self, content: str, source: Optional[str] = None) -> tuple[str, EngineConfig]:
         path, config = self._provider.save_raw(content, source)
-        if os.path.realpath(os.path.abspath(path)) == os.path.realpath(
-            os.path.abspath(self.default_path)
-        ):
+        if self._provider.is_default_path(path):
             self._active = self.snapshot(config)
         return path, self.snapshot(config)

@@ -44,6 +44,42 @@ class CompareTokenizersRequest(BaseModel):
     text: str = Field(default="Trăm năm trong cõi người ta,")
 
 
+def _present_token(tokenizer_type: str, token: dict) -> dict:
+    if "raw" in token:
+        return {"id": token.get("id"), "raw": token.get("raw")}
+
+    token_id = int(token.get("id", 0))
+    if tokenizer_type == "byte":
+        if token_id == 32:
+            raw = "␣"
+        elif token_id == 10:
+            raw = "⏎\n"
+        elif 33 <= token_id <= 126:
+            raw = chr(token_id)
+        else:
+            raw = f"0x{token_id:02X}"
+    else:
+        decoded = token.get("decoded")
+        if decoded == " ":
+            raw = "␣"
+        elif decoded == "\n":
+            raw = "⏎\n"
+        elif decoded is None:
+            raw = f"<{token_id}>"
+        else:
+            raw = str(decoded)
+    return {"id": token_id, "raw": raw}
+
+
+def _present_tokenize_result(result: dict) -> dict:
+    payload = dict(result)
+    tokenizer_type = str(payload.get("tokenizer_type", ""))
+    payload["tokens"] = [
+        _present_token(tokenizer_type, token) for token in payload.get("tokens", [])
+    ]
+    return payload
+
+
 @router.post("/clean")
 async def clean_endpoint(req: CleanRequest, request: Request):
     return request.app.state.explorer_service.clean(**req.model_dump())
@@ -52,11 +88,12 @@ async def clean_endpoint(req: CleanRequest, request: Request):
 @router.post("/tokenize")
 async def tokenize_endpoint(req: TokenizeRequest, request: Request):
     try:
-        return request.app.state.explorer_service.tokenize(
+        result = request.app.state.explorer_service.tokenize(
             text=req.text,
             tokenizer_type=req.tokenizer_type,
             source=_safe_config_path(req.config_path),
         )
+        return _present_tokenize_result(result)
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except ValueError as exc:

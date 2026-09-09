@@ -6,21 +6,20 @@ from dataclasses import dataclass
 from typing import Any, Dict, Optional
 
 from src.application.config import ConfigRequest, ConfigurationService
-from src.core.diagnostics.estimator import (
+from src.core.diagnostics import (
+    DiagnosticsRunner,
     analyze_vram_scenarios,
-    estimate_vram_budget,
-)
-from src.core.diagnostics.hardware import (
     check_attention_backends,
+    estimate_vram_budget,
     get_cpu_info,
+    get_disk_info,
     get_gpu_info,
     get_memory_info,
+    get_system_info,
+    verify_directory_permissions,
 )
-from src.core.diagnostics.runner import DiagnosticsRunner
-from src.core.diagnostics.storage import get_disk_info, verify_directory_permissions
-from src.core.diagnostics.system import get_system_info
 from src.core.runtime import resolve_training_plan
-from src.models.registry import ModelRegistry
+from src.models.api import inspect_model
 
 
 @dataclass(frozen=True)
@@ -172,36 +171,8 @@ class DiagnosticsApplicationService:
             if value is not None and value > 0:
                 model_updates[key] = value
         model_config = config.model.copy(**model_updates)
-        model = ModelRegistry.create(actual_model_name, model_config)
-        layers_info = []
-        total_params = 0
-        for name, param in model.named_parameters():
-            num_p = param.numel()
-            total_params += num_p
-            layers_info.append(
-                {
-                    "name": name,
-                    "shape": list(param.shape),
-                    "params": num_p,
-                    "trainable": param.requires_grad,
-                    "memory_kb": round((num_p * param.element_size()) / 1024, 2),
-                }
-            )
-        return {
-            "model_name": actual_model_name,
-            "total_parameters": total_params,
-            "total_parameters_formatted": f"{total_params:,}",
-            "vocab_size": model_config.vocab_size,
-            "block_size": model_config.block_size,
-            "n_embd": model_config.n_embd,
-            "n_head": model_config.n_head,
-            "n_layer": model_config.n_layer,
-            "layers": layers_info[:35],
-        }
+        return inspect_model(actual_model_name, model_config)
 
-    def model_for_inspection(self, source: Optional[str], overrides=()):
-        """Return the configured model object for an outer renderer without printing here."""
-        config = self.config_service.resolve(
-            ConfigRequest(source=source, overrides=tuple(overrides))
-        )
-        return ModelRegistry.create(config.model.name, config.model)
+    def report(self, *, test_tensor_allocation: bool = True) -> Dict[str, Any]:
+        """Return a transport-neutral diagnostics report for outer renderers."""
+        return DiagnosticsRunner().run(test_tensor_allocation=test_tensor_allocation).to_dict()

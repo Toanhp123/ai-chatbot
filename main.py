@@ -71,7 +71,7 @@ def _configure_from_request(
 def cmd_check(args: argparse.Namespace) -> None:
     config_service = _config_service()
     _configure_from_request(config_service, args)
-    print_system_report()
+    print_system_report(DiagnosticsApplicationService(config_service))
 
 
 def cmd_estimate(args: argparse.Namespace) -> None:

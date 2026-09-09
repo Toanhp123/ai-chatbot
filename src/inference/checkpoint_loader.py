@@ -8,12 +8,15 @@ from typing import Optional
 
 import torch
 
-from src.application.inference.checkpoint_catalog import identity_from_stat
 from src.core.config import ModelConfig
-from src.data.tokenizers import BaseTokenizer, load_tokenizer, load_tokenizer_state
-from src.data.tokenizers.base import get_tokenizer_identity
-from src.models.base import BaseModel
-from src.models.registry import ModelRegistry
+from src.data.api import (
+    BaseTokenizer,
+    get_tokenizer_identity,
+    load_tokenizer,
+    load_tokenizer_state,
+)
+from src.inference.checkpoint_catalog import identity_from_stat
+from src.models.api import BaseModel, create_model
 
 
 @dataclass(frozen=True)
@@ -59,9 +62,8 @@ def load_checkpoint_artifacts(
 
     cfg_dict = checkpoint.get("config", {}).get("model", {})
     model_config = ModelConfig.from_kwargs_safe(cfg_dict, ignore_unknown=True)
-    model = ModelRegistry.create(model_config.name, model_config)
-    if isinstance(model, torch.nn.Module):
-        model.load_state_dict(checkpoint["model_state_dict"])
+    model = create_model(model_config.name, model_config)
+    model.load_state_dict(checkpoint["model_state_dict"])
 
     return LoadedCheckpointArtifacts(
         identity=loaded_identity,

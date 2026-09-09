@@ -10,7 +10,7 @@ from typing import Any, Callable, Iterator, List, Optional
 from src.core.config import GenerationConfig
 from src.core.exceptions import AIEngineError, GenerationError
 from src.core.logging import get_logger
-from src.generation import (
+from src.generation.api import (
     BaseGenerator,
     GenerationCancellation,
     GenerationOutput,

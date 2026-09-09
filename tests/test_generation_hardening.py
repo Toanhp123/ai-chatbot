@@ -6,6 +6,7 @@ import pytest
 import torch
 import torch.nn as nn
 
+from src.application.inference import InferenceService
 from src.core.config import GenerationConfig
 from src.core.exceptions import GenerationBusyError, SamplingError
 from src.generation import (
@@ -15,7 +16,6 @@ from src.generation import (
     TextIteratorStreamer,
     sample_next_token,
 )
-from src.ui.services.inference_service import InferenceService
 
 
 class RecordingTokenizer:
@@ -555,8 +555,8 @@ def test_generation_streaming_response_closes_session_on_asgi_send_disconnect() 
 
     from starlette.requests import ClientDisconnect
 
+    from src.application.inference import GenerationSession
     from src.ui.responses import GenerationStreamingResponse
-    from src.ui.services.generation_session import GenerationSession
 
     class FakeSession:
         def __init__(self) -> None:
@@ -693,7 +693,7 @@ def test_checkpoint_load_stages_checkpoint_on_cpu_before_device_commit(
         safe_kwargs["map_location"] = "cpu"
         return real_load(*args, **safe_kwargs)
 
-    monkeypatch.setattr("src.ui.services.inference_service.torch.load", recording_load)
+    monkeypatch.setattr("src.inference.checkpoint_loader.torch.load", recording_load)
     monkeypatch.setattr(ModelRegistry, "create", lambda *args, **kwargs: FakeModel())
     monkeypatch.setattr(
         GeneratorRegistry,
@@ -756,9 +756,7 @@ def test_checkpoint_swap_offloads_previous_model_before_new_device_move(
     )
     service.configured_device = "cuda:0"
     service.device_str = "cuda:0"
-    monkeypatch.setattr(
-        "src.ui.services.inference_service.resolve_device", lambda requested: requested
-    )
+    monkeypatch.setattr("src.inference.runtime.resolve_device", lambda requested: requested)
     service.model = old_model  # type: ignore[assignment]
     service.tokenizer = tokenizer
     service.generator = FakeGenerator()  # type: ignore[assignment]
@@ -827,9 +825,7 @@ def test_checkpoint_swap_restores_previous_model_if_new_device_move_fails(
     )
     service.configured_device = "cuda:0"
     service.device_str = "cuda:0"
-    monkeypatch.setattr(
-        "src.ui.services.inference_service.resolve_device", lambda requested: requested
-    )
+    monkeypatch.setattr("src.inference.runtime.resolve_device", lambda requested: requested)
     service.model = old_model  # type: ignore[assignment]
     service.tokenizer = tokenizer
     service.generator = old_generator  # type: ignore[assignment]
@@ -898,8 +894,8 @@ def test_begin_generation_rejects_empty_prompt_before_admission(tmp_path) -> Non
 
 
 def test_inference_generation_reservation_blocks_training_and_releases_on_close(tmp_path) -> None:
+    from src.application.runtime import AcceleratorCoordinator
     from src.core.exceptions import AcceleratorBusyError
-    from src.ui.services.accelerator_coordinator import AcceleratorCoordinator
 
     class DummyTokenizer:
         eos_token_id = None
@@ -934,8 +930,8 @@ def test_inference_generation_reservation_blocks_training_and_releases_on_close(
 
 
 def test_inference_generation_is_rejected_while_training_owns_accelerator(tmp_path) -> None:
+    from src.application.runtime import AcceleratorCoordinator
     from src.core.exceptions import AcceleratorBusyError
-    from src.ui.services.accelerator_coordinator import AcceleratorCoordinator
 
     class DummyTokenizer:
         eos_token_id = None

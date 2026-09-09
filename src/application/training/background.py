@@ -4,22 +4,24 @@ HTTP/SSE adapters call this service; concrete training assembly is delegated to
 TrainingApplicationService so Web and CLI share one canonical run graph.
 """
 
-import threading
 import time
 from typing import Any, Dict, Generator, List, Optional
-
-import torch
 
 from src.application.runtime.accelerator import AcceleratorCoordinator
 from src.application.training.contracts import (
     TrainingPlan,
     TrainingPreparationAborted,
 )
-from src.application.training.events import TrainingEventHub
 from src.application.training.service import TrainingApplicationService
 from src.core.config import EngineConfig
 from src.core.logging import get_logger
-from src.training.trainer import Trainer, TrainingTerminationReason
+from src.training.api import (
+    BackgroundExecution,
+    BackgroundTask,
+    TrainingControl,
+    TrainingEventHub,
+    TrainingTerminationReason,
+)
 
 logger = get_logger("TrainingService")
 
@@ -49,6 +51,7 @@ class TrainingService:
         self,
         accelerator_coordinator: Optional[AcceleratorCoordinator] = None,
         training_application: Optional[TrainingApplicationService] = None,
+        execution: Optional[BackgroundExecution] = None,
     ) -> None:
         self.status: str = "IDLE"  # IDLE, STARTING, RUNNING, STOPPING, STOPPED, COMPLETED, ERROR
         self.current_step: int = 0
@@ -61,10 +64,11 @@ class TrainingService:
         self.termination_reason: Optional[str] = None
         self.run_id: int = 0
         self.sequence: int = 0
-        self.trainer: Optional[Trainer] = None
-        self._thread: Optional[threading.Thread] = None
-        self._lock = threading.Lock()
-        self._abort_requested = threading.Event()
+        self.trainer: Optional[TrainingControl] = None
+        self._execution = execution or BackgroundExecution()
+        self._thread: Optional[BackgroundTask] = None
+        self._lock = self._execution.create_lock()
+        self._abort_requested = self._execution.create_cancellation_signal()
         self._accelerator_coordinator = accelerator_coordinator
         self._training_application = training_application or TrainingApplicationService()
 
@@ -180,14 +184,14 @@ class TrainingService:
 
     def clear_state(self) -> None:
         """Erase the terminal run only after the worker has fully cleaned up."""
-        cleanup_thread: Optional[threading.Thread] = None
+        cleanup_thread: Optional[BackgroundTask] = None
         with self._lock:
             if self.status in ("RUNNING", "STARTING"):
                 raise RuntimeError("Không thể làm mới khi tiến trình huấn luyện đang chạy.")
             if self._thread and self._thread.is_alive():
                 cleanup_thread = self._thread
 
-        if cleanup_thread is threading.current_thread():
+        if cleanup_thread is not None and self._execution.is_current_task(cleanup_thread):
             raise RuntimeError("Không thể clear trạng thái từ chính worker huấn luyện đang chạy.")
         if cleanup_thread is not None:
             cleanup_thread.join(timeout=3.5)
@@ -233,7 +237,7 @@ class TrainingService:
         admission_reserved: bool = False,
     ) -> None:
         """Start one exclusive background run from an already-resolved application plan."""
-        old_thread: Optional[threading.Thread] = None
+        old_thread: Optional[BackgroundTask] = None
         with self._lock:
             if self.status in ("RUNNING", "STARTING"):
                 raise RuntimeError(
@@ -378,18 +382,14 @@ class TrainingService:
                     self.broadcast(cleanup_event)
                 if reserved_accelerator and self._accelerator_coordinator is not None:
                     self._accelerator_coordinator.release_training(admission_device)
-                if torch.cuda.is_available():
-                    try:
-                        torch.cuda.empty_cache()
-                    except Exception:
-                        pass
+                self._execution.cleanup_accelerator_cache()
                 logger.info(
                     "Luồng huấn luyện nền đã hoàn tất dọn dẹp. Trạng thái cuối: %s",
                     final_status,
                 )
 
         with self._lock:
-            self._thread = threading.Thread(target=train_worker, daemon=True)
+            self._thread = self._execution.create_task(train_worker)
             thread = self._thread
         try:
             thread.start()
@@ -415,7 +415,7 @@ class TrainingService:
     def stop_training(self) -> None:
         """Request a safe stop without erasing terminal run metrics."""
         event: Optional[Dict[str, Any]] = None
-        trainer: Optional[Trainer] = None
+        trainer: Optional[TrainingControl] = None
         with self._lock:
             if self.status == "STOPPING":
                 logger.info("Yêu cầu dừng khi đang ở trạng thái STOPPING (đã nhận lệnh trước đó).")

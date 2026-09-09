@@ -1,30 +1,15 @@
-"""
-Inference Service: Quản lý nạp mô hình, hoán đổi checkpoint và điều phối sinh văn bản theo luồng (Streaming).
+"""Inference application use cases.
+
+Application owns preferences, admission and cross-capability ownership policy.
+Concrete checkpoint/model/generation mechanics are delegated to ``src.inference.api``.
 """
 
-import os
+from __future__ import annotations
+
 import threading
 from typing import Any, Dict, Generator, List, Optional
 
-import torch
-
 from src.application.config import ConfigurationService
-from src.application.inference.checkpoint_catalog import (
-    checkpoint_identity as catalog_checkpoint_identity,
-)
-from src.application.inference.checkpoint_catalog import (
-    delete_checkpoint as catalog_delete_checkpoint,
-)
-from src.application.inference.checkpoint_catalog import (
-    identity_from_stat as catalog_identity_from_stat,
-)
-from src.application.inference.checkpoint_catalog import (
-    list_checkpoints as catalog_list_checkpoints,
-)
-from src.application.inference.checkpoint_catalog import (
-    resolve_checkpoint_path as catalog_resolve_checkpoint_path,
-)
-from src.application.inference.checkpoint_loader import load_checkpoint_artifacts
 from src.application.inference.contracts import (
     GenerationCommand,
     GenerationOverrides,
@@ -32,27 +17,22 @@ from src.application.inference.contracts import (
 )
 from src.application.inference.generation_admission import GenerationAdmissionManager
 from src.application.inference.preferences import InferencePreferences
-from src.application.inference.session import GenerationSession
 from src.application.runtime.accelerator import (
     AcceleratorCoordinator,
     same_accelerator_family,
 )
 from src.core.config import EngineConfig, GenerationConfig
 from src.core.logging import get_logger
-from src.data.tokenizers import BaseTokenizer, load_tokenizer
-from src.generation import (
-    BaseGenerator,
-    GeneratorRegistry,
+from src.inference.api import GenerationSession, InferenceRuntime
+from src.inference.api import (
+    load_generator_from_checkpoint as runtime_load_generator_from_checkpoint,
 )
-from src.models.base import BaseModel
-from src.models.registry import ModelRegistry
-from src.utils.device import resolve_device
 
 logger = get_logger("InferenceService")
 
 
 class InferenceService:
-    """Service singleton phục vụ suy luận văn bản và quản lý checkpoints cho Web UI."""
+    """Coordinate inference use cases without owning runtime implementation mechanics."""
 
     def __init__(
         self,
@@ -67,6 +47,7 @@ class InferenceService:
         accelerator_coordinator: Optional[AcceleratorCoordinator] = None,
         config_service: Optional[ConfigurationService] = None,
         engine_config: Optional[EngineConfig] = None,
+        runtime: Optional[InferenceRuntime] = None,
     ) -> None:
         if max_generation_sessions <= 0:
             raise ValueError("max_generation_sessions phải > 0")
@@ -91,43 +72,29 @@ class InferenceService:
                     generation=canonical_generation,
                 )
             )
-        self._preferences = InferencePreferences(
-            initial_config,
-            config_service=config_service,
-        )
-
-        self.current_checkpoint_path: Optional[str] = None
-        self._current_checkpoint_identity: Optional[tuple[int, int, int, int]] = None
-        self.device_str = resolve_device(self.configured_device)
-        self.current_backend: str = backend
+        self._preferences = InferencePreferences(initial_config, config_service=config_service)
+        self._runtime = runtime or InferenceRuntime(device=self.configured_device, backend=backend)
         self._accelerator_coordinator = accelerator_coordinator
         self._residency_device: Optional[str] = None
-        self.tokenizer: Optional[BaseTokenizer] = None
-        self.model: Optional[BaseModel] = None
-        self.generator: Optional[BaseGenerator] = None
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self._generation_admission = GenerationAdmissionManager(
             max_sessions=max_generation_sessions,
             accelerator_coordinator=accelerator_coordinator,
         )
-        # Model instances own mutable KV-cache state, so workers execute one at a time.
-        self._generation_lock = threading.Lock()
 
         if default_checkpoint is None:
             default_checkpoint = self.configured_checkpoint_path
 
-        # Nạp mặc định nếu checkpoint và từ vựng tồn tại
-        if os.path.exists(self.vocab_path):
-            try:
-                self.tokenizer = load_tokenizer(self.vocab_path)
-            except Exception as e:
-                logger.warning(f"Chưa thể nạp tokenizer từ {self.vocab_path}: {e}")
+        try:
+            self._runtime.load_tokenizer_if_present(self.vocab_path)
+        except Exception as exc:
+            logger.warning("Chưa thể nạp tokenizer từ %s: %s", self.vocab_path, exc)
 
-        if os.path.exists(default_checkpoint):
+        if self._runtime.path_exists(default_checkpoint):
             try:
                 self.load_checkpoint(default_checkpoint)
-            except Exception as e:
-                logger.warning(f"Chưa thể nạp checkpoint mặc định {default_checkpoint}: {e}")
+            except Exception as exc:
+                logger.warning("Chưa thể nạp checkpoint mặc định %s: %s", default_checkpoint, exc)
 
     @classmethod
     def from_engine_config(
@@ -139,10 +106,10 @@ class InferenceService:
         accelerator_coordinator: Optional[AcceleratorCoordinator] = None,
         config_service: Optional[ConfigurationService] = None,
     ) -> "InferenceService":
-        """Build inference preferences from the same canonical EngineConfig used by training."""
         return cls(
-            default_checkpoint=os.path.join(
-                config.training.checkpoint_dir, config.training.checkpoint_name
+            default_checkpoint=InferenceRuntime.join_path(
+                config.training.checkpoint_dir,
+                config.training.checkpoint_name,
             ),
             backend=backend,
             max_generation_sessions=max_generation_sessions,
@@ -191,29 +158,95 @@ class InferenceService:
     def default_generation_config(self, value: GenerationConfig) -> None:
         self._preferences.default_generation_config = value
 
+    # Compatibility/public observation properties. State ownership remains in InferenceRuntime.
+    @property
+    def current_checkpoint_path(self) -> Optional[str]:
+        return self._runtime.current_checkpoint_path
+
+    @current_checkpoint_path.setter
+    def current_checkpoint_path(self, value: Optional[str]) -> None:
+        self._runtime.current_checkpoint_path = value
+
+    @property
+    def _current_checkpoint_identity(self) -> Optional[tuple[int, int, int, int]]:
+        return self._runtime.current_checkpoint_identity
+
+    @_current_checkpoint_identity.setter
+    def _current_checkpoint_identity(self, value: Optional[tuple[int, int, int, int]]) -> None:
+        self._runtime.current_checkpoint_identity = value
+
+    @property
+    def device_str(self) -> str:
+        return self._runtime.device
+
+    @device_str.setter
+    def device_str(self, value: str) -> None:
+        self._runtime.device = value
+
+    @property
+    def current_backend(self) -> str:
+        return self._runtime.backend
+
+    @current_backend.setter
+    def current_backend(self, value: str) -> None:
+        self._runtime.backend = value
+
+    @property
+    def tokenizer(self) -> Any:
+        return self._runtime.tokenizer
+
+    @tokenizer.setter
+    def tokenizer(self, value: Any) -> None:
+        self._runtime.tokenizer = value
+
+    @property
+    def model(self) -> Any:
+        return self._runtime.model
+
+    @model.setter
+    def model(self, value: Any) -> None:
+        self._runtime.model = value
+
+    @property
+    def generator(self) -> Any:
+        return self._runtime.generator
+
+    @generator.setter
+    def generator(self, value: Any) -> None:
+        self._runtime.generator = value
+
+    @property
+    def _generation_lock(self):
+        return self._runtime._generation_lock
+
     def apply_engine_config(self, config: EngineConfig) -> None:
-        """Activate canonical preferences without mutating loaded runtime artifacts."""
         self._preferences.apply_engine_config(config)
 
     def get_engine_config(self) -> EngineConfig:
         return self._preferences.snapshot()
 
     @staticmethod
-    def _identity_from_stat(stat_result: os.stat_result) -> tuple[int, int, int, int]:
-        return catalog_identity_from_stat(stat_result)
+    def _identity_from_stat(stat_result: Any) -> tuple[int, int, int, int]:
+        return InferenceRuntime.identity_from_stat(stat_result)
 
     @staticmethod
     def _checkpoint_identity(path: str) -> tuple[int, int, int, int]:
-        return catalog_checkpoint_identity(path)
+        return InferenceRuntime.checkpoint_identity(path)
 
     @staticmethod
     def _resolve_checkpoint_path_for_dir(
-        checkpoint_dir: str, path: str, *, filename_only: bool = False
+        checkpoint_dir: str,
+        path: str,
+        *,
+        filename_only: bool = False,
     ) -> str:
-        return catalog_resolve_checkpoint_path(checkpoint_dir, path, filename_only=filename_only)
+        return InferenceRuntime.resolve_checkpoint_path_for_dir(
+            checkpoint_dir,
+            path,
+            filename_only=filename_only,
+        )
 
     def get_runtime_state(self) -> Dict[str, Any]:
-        """Return authoritative inference preferences and the loaded artifact revision."""
         with self._lock:
             active_path = self.current_checkpoint_path
             active_identity = self._current_checkpoint_identity
@@ -232,59 +265,38 @@ class InferenceService:
             }
 
     def set_checkpoint_dir(self, checkpoint_dir: str) -> None:
-        """Update the canonical checkpoint directory used by future inference operations."""
         self.checkpoint_dir = checkpoint_dir
 
     def set_vocab_path(self, vocab_path: str) -> None:
-        """Update the canonical vocab source without disturbing the active model."""
         self.vocab_path = vocab_path
 
     @property
     def configured_checkpoint_path(self) -> str:
-        """Return the canonical configured checkpoint artifact path."""
-        return os.path.join(self.checkpoint_dir, self.checkpoint_name)
+        return InferenceRuntime.join_path(self.checkpoint_dir, self.checkpoint_name)
 
     def resolve_checkpoint_path(self, path: str, *, filename_only: bool = False) -> str:
-        """Resolve a managed checkpoint path without allowing traversal or symlink escape."""
         with self._lock:
             checkpoint_dir = self.checkpoint_dir
-        return self._resolve_checkpoint_path_for_dir(
-            checkpoint_dir, path, filename_only=filename_only
+        return self._runtime.resolve_checkpoint_path_for_dir(
+            checkpoint_dir,
+            path,
+            filename_only=filename_only,
         )
 
     def list_checkpoints(self) -> List[Dict[str, Any]]:
-        """Return checkpoint metadata from one coherent runtime/config snapshot."""
         with self._lock:
-            return catalog_list_checkpoints(
-                checkpoint_dir=self.checkpoint_dir,
-                checkpoint_name=self.checkpoint_name,
-                active_path=self.current_checkpoint_path,
-                active_identity=self._current_checkpoint_identity,
-            )
+            checkpoint_dir = self.checkpoint_dir
+            checkpoint_name = self.checkpoint_name
+        return self._runtime.list_checkpoints(
+            checkpoint_dir=checkpoint_dir,
+            checkpoint_name=checkpoint_name,
+        )
 
     def list_generators(self) -> List[str]:
-        """Danh sách tất cả các generator backend đã đăng ký trong GeneratorRegistry."""
-        return GeneratorRegistry.list_generators()
-
-    @staticmethod
-    def _empty_accelerator_cache(device: str) -> None:
-        """Best-effort allocator cleanup after moving inference models off an accelerator."""
-        if device.startswith("cuda") and torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            return
-        if device.startswith("mps"):
-            mps = getattr(torch, "mps", None)
-            empty_cache = getattr(mps, "empty_cache", None)
-            if callable(empty_cache):
-                empty_cache()
+        return self._runtime.list_generators()
 
     def prepare_for_training(self, target_device: str) -> InferenceTrainingHandoff:
-        """Create a reversible inference-to-training runtime handoff.
-
-        When inference owns the same coordinated accelerator, residency is converted to
-        training ownership atomically while this service lock is held. The caller may
-        roll the handoff back until background training accepts ownership.
-        """
+        """Coordinate a reversible inference-residency to training-ownership handoff."""
         with self._lock:
             if not same_accelerator_family(self.device_str, target_device):
                 return InferenceTrainingHandoff()
@@ -292,40 +304,23 @@ class InferenceService:
             if self.model is None or self.tokenizer is None:
                 return InferenceTrainingHandoff()
 
-            previous_device = self.device_str
-            previous_generator = self.generator
-            model = self.model
-            tokenizer = self.tokenizer
-            backend = self.current_backend
             residency_device = self._residency_device
+            runtime_handoff = self._runtime.prepare_training_handoff()
+            if runtime_handoff is None:
+                return InferenceTrainingHandoff()
+            previous_device = runtime_handoff.previous_device
             admission_transferred = False
-
-            if isinstance(model, torch.nn.Module):
-                model.to("cpu")
-            self._empty_accelerator_cache(previous_device)
             try:
-                cpu_generator = GeneratorRegistry.create_for_inference(
-                    backend, model=model, tokenizer=tokenizer, device="cpu"
-                )
                 if residency_device is not None and self._accelerator_coordinator is not None:
                     self._accelerator_coordinator.transfer_inference_to_training(residency_device)
                     admission_transferred = True
             except Exception:
-                try:
-                    if isinstance(model, torch.nn.Module):
-                        model.to(previous_device)
-                finally:
-                    self.generator = previous_generator
+                runtime_handoff.rollback()
                 raise
-
-            self.generator = cpu_generator
-            self.device_str = "cpu"
             self._residency_device = None
 
             def rollback() -> None:
                 with self._lock:
-                    if self.model is not model or self.device_str != "cpu":
-                        return
                     restored_residency = False
                     if admission_transferred and self._accelerator_coordinator is not None:
                         self._accelerator_coordinator.transfer_training_to_inference(
@@ -333,16 +328,13 @@ class InferenceService:
                         )
                         restored_residency = True
                     try:
-                        if isinstance(model, torch.nn.Module):
-                            model.to(previous_device)
+                        runtime_handoff.rollback()
                     except Exception:
                         if restored_residency and self._accelerator_coordinator is not None:
                             self._accelerator_coordinator.release_inference_residency(
                                 previous_device
                             )
                         raise
-                    self.generator = previous_generator
-                    self.device_str = previous_device
                     self._residency_device = residency_device if restored_residency else None
 
             return InferenceTrainingHandoff(
@@ -351,27 +343,13 @@ class InferenceService:
             )
 
     def set_backend(self, backend: str) -> None:
-        """Chuyển đổi generator backend sang một backend khác trong GeneratorRegistry."""
         with self._lock:
             self._generation_admission.ensure_idle(operation="set_backend")
-            backend_clean = backend.lower().strip()
-            # Luôn xác thực tên backend, kể cả khi model/tokenizer chưa được nạp.
-            # Nếu không, UI có thể lưu một backend không tồn tại và chỉ lỗi muộn
-            # ở lần load checkpoint/generate tiếp theo.
-            GeneratorRegistry.get(backend_clean)
-            if self.model is not None and self.tokenizer is not None:
-                self.generator = GeneratorRegistry.create_for_inference(
-                    backend_clean,
-                    model=self.model,
-                    tokenizer=self.tokenizer,
-                    device=self.device_str,
-                )
-            self.current_backend = backend_clean
-            logger.info(f"Đã chuyển đổi Generator backend sang: '{backend_clean}'")
+            cleaned = self._runtime.set_backend(backend)
+        logger.info("Đã chuyển đổi Generator backend sang: '%s'", cleaned)
 
     def list_models(self) -> List[str]:
-        """Return registered model architectures through the application boundary."""
-        return ModelRegistry.list_models()
+        return self._runtime.list_models()
 
     def resolve_generation_config(self, overrides: GenerationOverrides) -> GenerationConfig:
         defaults = self.default_generation_config
@@ -414,89 +392,42 @@ class InferenceService:
         *,
         require_managed: bool = False,
     ) -> None:
-        """Load a checkpoint and atomically publish it only after validation succeeds."""
+        """Coordinate ownership around one atomic capability checkpoint swap."""
         with self._lock:
             if require_managed:
-                checkpoint_path = self._resolve_checkpoint_path_for_dir(
-                    self.checkpoint_dir, checkpoint_path
+                checkpoint_path = self._runtime.resolve_checkpoint_path_for_dir(
+                    self.checkpoint_dir,
+                    checkpoint_path,
                 )
             self._generation_admission.ensure_idle(operation="load_checkpoint")
-            target_backend = self.current_backend
-            if backend:
-                target_backend = backend.lower().strip()
-            GeneratorRegistry.get(target_backend)
+            target_backend = self.current_backend if backend is None else backend.lower().strip()
+            target_backend = self._runtime.validate_backend(target_backend)
+            target_device = self._runtime.resolve_device_name(self.configured_device)
+            previous_residency_device = self._residency_device
 
-            if not os.path.exists(checkpoint_path):
-                raise FileNotFoundError(f"Không tìm thấy file checkpoint: {checkpoint_path}")
-
-            target_device = resolve_device(self.configured_device)
-            reserved_accelerator = False
+            reserved_operation = False
             new_residency_acquired: Optional[str] = None
             residency_committed = False
-            previous_residency_device = self._residency_device
             if self._accelerator_coordinator is not None:
                 self._accelerator_coordinator.reserve_generation(
-                    target_device, operation="checkpoint_load"
+                    target_device,
+                    operation="checkpoint_load",
                 )
-                reserved_accelerator = True
+                reserved_operation = True
 
             try:
-                # Materialize and validate CPU artifacts before touching the active runtime.
-                artifacts = load_checkpoint_artifacts(
+                self._runtime.load_checkpoint(
                     checkpoint_path,
                     vocab_path=self.vocab_path,
-                    fallback_tokenizer=self.tokenizer,
+                    configured_device=self.configured_device,
+                    backend=target_backend,
                 )
-                loaded_checkpoint_identity = artifacts.identity
-                tokenizer = artifacts.tokenizer
-                model = artifacts.model
-
-                previous_model = self.model
-                previous_model_to_restore: Optional[BaseModel] = None
-                previous_device = self.device_str
-                previous_was_accelerator_resident = same_accelerator_family(
-                    previous_device, previous_device
-                )
-                if previous_was_accelerator_resident and previous_model is not None:
-                    previous_model.to("cpu")
-                    previous_model_to_restore = previous_model
-                    self._empty_accelerator_cache(previous_device)
-
-                try:
-                    if isinstance(model, torch.nn.Module):
-                        model.to(target_device)
-                        model.eval()
-
-                    generator = GeneratorRegistry.create_for_inference(
-                        target_backend,
-                        model=model,
-                        tokenizer=tokenizer,
-                        device=target_device,
-                    )
-                except Exception:
-                    if previous_model_to_restore is not None:
-                        if isinstance(model, torch.nn.Module):
-                            try:
-                                model.to("cpu")
-                            except Exception as cleanup_exc:
-                                logger.warning(
-                                    "Không thể offload model mới sau khi checkpoint swap lỗi: %s",
-                                    cleanup_exc,
-                                )
-                        self._empty_accelerator_cache(target_device)
-                        try:
-                            previous_model_to_restore.to(previous_device)
-                        except Exception as restore_exc:
-                            raise RuntimeError(
-                                "Checkpoint swap thất bại và không thể khôi phục model trước đó "
-                                "lên inference device."
-                            ) from restore_exc
-                    raise
 
                 next_residency_device: Optional[str] = None
                 if same_accelerator_family(target_device, target_device):
                     if previous_residency_device is not None and same_accelerator_family(
-                        previous_residency_device, target_device
+                        previous_residency_device,
+                        target_device,
                     ):
                         next_residency_device = previous_residency_device
                     elif self._accelerator_coordinator is not None:
@@ -504,14 +435,6 @@ class InferenceService:
                         new_residency_acquired = target_device
                         next_residency_device = target_device
 
-                # Atomic state commit: failed validation/load above must leave the active service untouched.
-                self.tokenizer = tokenizer
-                self.model = model
-                self.generator = generator
-                self.current_backend = target_backend
-                self.current_checkpoint_path = checkpoint_path
-                self._current_checkpoint_identity = loaded_checkpoint_identity
-                self.device_str = target_device
                 self._residency_device = next_residency_device
                 if (
                     previous_residency_device is not None
@@ -523,7 +446,10 @@ class InferenceService:
                     )
                 residency_committed = True
                 logger.info(
-                    f"Đã nạp checkpoint thành công: {checkpoint_path} trên {self.device_str} (Backend: '{self.current_backend}')"
+                    "Đã nạp checkpoint thành công: %s trên %s (Backend: '%s')",
+                    checkpoint_path,
+                    self.device_str,
+                    self.current_backend,
                 )
             finally:
                 if (
@@ -534,20 +460,18 @@ class InferenceService:
                     self._accelerator_coordinator.release_inference_residency(
                         new_residency_acquired
                     )
-                if reserved_accelerator and self._accelerator_coordinator is not None:
+                if reserved_operation and self._accelerator_coordinator is not None:
                     self._accelerator_coordinator.release_generation(target_device)
 
     def delete_checkpoint(self, filename: str) -> bool:
-        """Delete one managed checkpoint while protecting configured/active artifacts."""
         with self._lock:
-            safe_filename = catalog_delete_checkpoint(
+            safe_filename = self._runtime.delete_checkpoint(
                 checkpoint_dir=self.checkpoint_dir,
                 checkpoint_name=self.checkpoint_name,
                 filename=filename,
-                active_path=self.current_checkpoint_path,
             )
-            logger.info(f"🗑️ Đã xóa checkpoint: {safe_filename}")
-            return True
+        logger.info("🗑️ Đã xóa checkpoint: %s", safe_filename)
+        return True
 
     def begin_generation(
         self,
@@ -556,22 +480,30 @@ class InferenceService:
         backend: Optional[str] = None,
         stop_words: Optional[List[str]] = None,
     ) -> GenerationSession:
-        """Freeze one runtime snapshot and delegate bounded session admission."""
         with self._lock:
-            current_backend = self.current_backend
-            requested_backend = backend.lower().strip() if backend else current_backend
-            return self._generation_admission.begin(
+            requested_backend = backend.lower().strip() if backend else self.current_backend
+            requested_backend = self._runtime.validate_backend(requested_backend)
+            if self.generator is None or self.tokenizer is None:
+                # Preserve admission semantics: not-ready requests never consume a slot.
+                from src.core.exceptions import GenerationNotReadyError
+
+                raise GenerationNotReadyError()
+            release = self._generation_admission.acquire(
                 prompt=prompt,
                 config=config,
-                requested_backend=requested_backend,
-                current_backend=current_backend,
-                generator=self.generator,
-                tokenizer=self.tokenizer,
-                model=self.model,
                 device=self.device_str,
-                execution_lock=self._generation_lock,
-                stop_words=stop_words,
             )
+            try:
+                return self._runtime.begin_generation(
+                    prompt=prompt,
+                    config=config,
+                    requested_backend=requested_backend,
+                    stop_words=stop_words,
+                    release_admission=release,
+                )
+            except Exception:
+                release()
+                raise
 
     def stream_generate(
         self,
@@ -580,7 +512,6 @@ class InferenceService:
         backend: Optional[str] = None,
         stop_words: Optional[List[str]] = None,
     ) -> Generator[dict[str, object], None, None]:
-        """Compatibility event generator around the explicit GenerationSession lifecycle."""
         session = self.begin_generation(prompt, config, backend=backend, stop_words=stop_words)
         try:
             yield from session.iter_events()
@@ -594,16 +525,10 @@ def load_generator_from_checkpoint(
     device: str = "auto",
     backend: str = "local",
 ):
-    """Compatibility/use-case facade backed by the same checkpoint loader as Web inference."""
-    checkpoint_dir = os.path.dirname(os.path.abspath(checkpoint_path)) or "."
-    service = InferenceService(
-        checkpoint_dir=checkpoint_dir,
-        default_checkpoint=os.path.join(checkpoint_dir, "__no_auto_load__.pt"),
-        vocab_path=vocab_path,
+    """Application compatibility facade over the stable inference capability API."""
+    return runtime_load_generator_from_checkpoint(
+        checkpoint_path,
+        vocab_path,
         device=device,
         backend=backend,
     )
-    service.load_checkpoint(checkpoint_path, backend=backend)
-    if service.generator is None:
-        raise RuntimeError("Checkpoint đã nạp nhưng không tạo được generator.")
-    return service.generator

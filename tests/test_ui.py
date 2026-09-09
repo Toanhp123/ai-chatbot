@@ -1276,7 +1276,7 @@ def test_explorer_dataset_sample_serializes_paths_with_stable_forward_slashes(
     )
     try:
         service.apply_engine_config(cfg)
-        monkeypatch.setattr("src.application.explorer.service.os.path.isfile", lambda _path: False)
+        monkeypatch.setattr("src.data.api.os.path.isfile", lambda _path: False)
         res = client.get("/api/explorer/dataset-sample")
         assert res.status_code == 200
         data = res.json()

@@ -1,4 +1,3 @@
-import threading
 from typing import Any, Literal, Optional, Union, overload
 
 import pytest
@@ -83,31 +82,20 @@ def test_generation_admission_manager_owns_session_limit_and_release():
     from src.application.inference.generation_admission import GenerationAdmissionManager
 
     manager = GenerationAdmissionManager(max_sessions=1)
-    session = manager.begin(
+    release = manager.acquire(
         prompt="hello",
         config=GenerationConfig(max_new_tokens=1),
-        requested_backend="local",
-        current_backend="local",
-        generator=_Generator(),
-        tokenizer=_Tokenizer(),
-        model=None,
         device="cpu",
-        execution_lock=threading.Lock(),
     )
 
     assert manager.active_sessions == 1
     with pytest.raises(GenerationBusyError):
-        manager.begin(
+        manager.acquire(
             prompt="second",
             config=GenerationConfig(max_new_tokens=1),
-            requested_backend="local",
-            current_backend="local",
-            generator=_Generator(),
-            tokenizer=_Tokenizer(),
-            model=None,
             device="cpu",
-            execution_lock=threading.Lock(),
         )
 
-    session.close()
+    release()
+    release()
     assert manager.active_sessions == 0

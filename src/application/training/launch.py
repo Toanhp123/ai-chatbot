@@ -3,13 +3,12 @@
 from __future__ import annotations
 
 import logging
-import os
-import stat
 from dataclasses import replace
 from typing import Callable, Optional, Protocol
 
 from src.application.inference import InferenceTrainingHandoff
 from src.core.config import EngineConfig
+from src.training.api import capture_checkpoint_identity
 
 from .contracts import TrainingCommand, TrainingPlan
 
@@ -51,17 +50,8 @@ class TrainingLaunchApplicationService:
 
     @staticmethod
     def _capture_checkpoint_identity(path: str) -> tuple[int, int, int, int]:
-        """Pin the exact regular-file revision that will be resumed later by the worker."""
-        with open(path, "rb") as checkpoint_file:
-            file_stat = os.fstat(checkpoint_file.fileno())
-            if not stat.S_ISREG(file_stat.st_mode):
-                raise OSError(f"Checkpoint resume không phải file thường: {path}")
-            return (
-                int(file_stat.st_dev),
-                int(file_stat.st_ino),
-                int(file_stat.st_size),
-                int(file_stat.st_mtime_ns),
-            )
+        """Delegate revision pinning to the training capability filesystem boundary."""
+        return capture_checkpoint_identity(path)
 
     def start_command(
         self,

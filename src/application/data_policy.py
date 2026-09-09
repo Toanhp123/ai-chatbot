@@ -1,7 +1,7 @@
 """Application-owned data preparation policy.
 
-Capability modules report failures and execute mechanics; Application selects
-cleaner/tokenizer implementations and explicit fallback behavior.
+Application selects explicit fallback/use-case policy while concrete cleaner,
+tokenizer and dataset mechanics stay behind ``src.data.api``.
 """
 
 from __future__ import annotations
@@ -11,24 +11,23 @@ from typing import Any, Optional
 from src.core.config import DataConfig
 from src.core.exceptions import DataPipelineError
 from src.core.logging import get_logger
-from src.data.cleaners import BaseTextPreprocessor, GeminiTextCleaner, TextCleaner, get_cleaner
-from src.data.pipeline import DataPipeline
-from src.data.tokenizers import BaseTokenizer, get_tokenizer
+from src.data.api import (
+    create_cleaner,
+    create_standard_cleaner,
+    create_tokenizer,
+    prepare_dataset,
+)
 
 logger = get_logger("ApplicationDataPolicy")
 
 
-class FallbackCleaner(BaseTextPreprocessor):
+class FallbackCleaner:
     """Apply an explicit Application-selected fallback for recoverable cleaner failures."""
 
-    def __init__(
-        self,
-        primary: BaseTextPreprocessor,
-        fallback: BaseTextPreprocessor,
-    ) -> None:
-        super().__init__(name=f"{primary.name}WithApplicationFallback")
+    def __init__(self, primary: Any, fallback: Any) -> None:
         self.primary = primary
         self.fallback = fallback
+        self.name = f"{getattr(primary, 'name', type(primary).__name__)}WithApplicationFallback"
 
     def process(self, text: str) -> str:
         try:
@@ -36,35 +35,32 @@ class FallbackCleaner(BaseTextPreprocessor):
         except DataPipelineError as exc:
             logger.warning(
                 "Cleaner '%s' unavailable (%s); Application selected '%s' fallback.",
-                self.primary.name,
+                getattr(self.primary, "name", type(self.primary).__name__),
                 exc.message,
-                self.fallback.name,
+                getattr(self.fallback, "name", type(self.fallback).__name__),
             )
             return self.fallback(text)
 
+    def __call__(self, text: str) -> str:
+        return self.process(text)
 
-def build_application_cleaner(cleaner_type: str, **kwargs: Any) -> BaseTextPreprocessor:
+
+def build_application_cleaner(cleaner_type: str, **kwargs: Any) -> Any:
     """Resolve the configured cleaner and apply the app's explicit fallback policy."""
-
-    primary = get_cleaner(cleaner_type=cleaner_type, **kwargs)
-    if not isinstance(primary, GeminiTextCleaner):
+    primary = create_cleaner(cleaner_type, **kwargs)
+    if cleaner_type.strip().lower() != "gemini":
         return primary
-
-    fallback = TextCleaner(
-        clean_line_numbers=bool(kwargs.get("clean_line_numbers", True)),
-        normalize_ws=True,
-        normalize_uni=True,
-        normalize_punct=True,
+    fallback = create_standard_cleaner(
+        clean_line_numbers=bool(kwargs.get("clean_line_numbers", True))
     )
     return FallbackCleaner(primary=primary, fallback=fallback)
 
 
-def build_application_tokenizer(config: DataConfig, text: str) -> BaseTokenizer:
-    """Select the tokenizer from canonical config; DataPipeline only executes it."""
-
+def build_application_tokenizer(config: DataConfig, text: str) -> Any:
+    """Select a tokenizer from canonical config; the data capability constructs it."""
     tokenizer_kwargs = dict(config.tokenizer_kwargs)
     tokenizer_kwargs.setdefault("text", text)
-    return get_tokenizer(config.tokenizer_type, **tokenizer_kwargs)
+    return create_tokenizer(config.tokenizer_type, **tokenizer_kwargs)
 
 
 def prepare_application_dataset(
@@ -74,12 +70,11 @@ def prepare_application_dataset(
     fallback_text: Optional[str] = None,
     persist_fallback: bool = False,
 ):
-    """Apply application policy, then delegate dataset mechanics to DataPipeline."""
-
+    """Apply use-case policy and delegate dataset mechanics through the data facade."""
     cleaner_kwargs = dict(config.cleaner_kwargs)
     cleaner_kwargs.setdefault("clean_line_numbers", config.clean_line_numbers)
     cleaner = build_application_cleaner(config.cleaner_type, **cleaner_kwargs)
-    return DataPipeline.setup_data(
+    return prepare_dataset(
         config,
         cleaner=cleaner,
         tokenizer_factory=lambda text: build_application_tokenizer(config, text),

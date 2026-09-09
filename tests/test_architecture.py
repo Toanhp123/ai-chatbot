@@ -152,7 +152,7 @@ def test_training_composition_roots_do_not_mutate_nested_config_in_place() -> No
 
     paths = [
         Path("main.py"),
-        Path("src/ui/services/training_service.py"),
+        Path("src/application/training/service.py"),
         Path("src/ui/routes/diagnostics.py"),
     ]
     domains = {"system", "data", "model", "training", "generation"}
@@ -189,7 +189,7 @@ def test_training_composition_roots_use_runtime_plan_for_training_device() -> No
     from pathlib import Path
 
     main_source = Path("main.py").read_text(encoding="utf-8")
-    service_source = Path("src/ui/services/training_service.py").read_text(encoding="utf-8")
+    service_source = Path("src/application/training/service.py").read_text(encoding="utf-8")
 
     assert "resolve_device(config.system.device)" not in main_source
     assert "resolve_device(config.system.device)" not in service_source

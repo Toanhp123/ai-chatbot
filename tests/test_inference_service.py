@@ -1,7 +1,7 @@
 import pytest
 
+from src.application.inference import InferenceService
 from src.core.exceptions import AIEngineError
-from src.ui.services.inference_service import InferenceService
 
 
 def _service_without_assets(tmp_path) -> InferenceService:
@@ -71,7 +71,7 @@ def test_checkpoint_listing_uses_safe_weights_only_loading(tmp_path, monkeypatch
         calls.append(kwargs.copy())
         return real_load(*args, **kwargs)
 
-    monkeypatch.setattr("src.ui.services.inference_service.torch.load", recording_load)
+    monkeypatch.setattr("src.inference.checkpoint_loader.torch.load", recording_load)
     checkpoints = service.list_checkpoints()
 
     assert [item["filename"] for item in checkpoints] == ["safe.pt"]
@@ -480,9 +480,9 @@ def test_configured_best_checkpoint_is_marked_and_protected_from_delete(tmp_path
 def test_generation_rejected_while_training_owns_same_accelerator(tmp_path):
     from unittest.mock import Mock
 
+    from src.application.runtime import AcceleratorCoordinator
     from src.core.config import GenerationConfig
     from src.core.exceptions import AcceleratorBusyError
-    from src.ui.services.accelerator_coordinator import AcceleratorCoordinator
 
     coordinator = AcceleratorCoordinator()
     coordinator.reserve_training("cuda")
@@ -513,8 +513,8 @@ def test_set_backend_rebuilds_generator_on_current_active_device(tmp_path, monke
     observed = {}
 
     monkeypatch.setattr(
-        "src.ui.services.inference_service.GeneratorRegistry.get",
-        lambda backend: object(),
+        "src.inference.runtime.validate_generator_backend",
+        lambda backend: backend.lower().strip(),
     )
 
     def create_for_inference(backend, *, model, tokenizer, device):
@@ -523,7 +523,7 @@ def test_set_backend_rebuilds_generator_on_current_active_device(tmp_path, monke
         return object()
 
     monkeypatch.setattr(
-        "src.ui.services.inference_service.GeneratorRegistry.create_for_inference",
+        "src.inference.runtime.create_generator_for_inference",
         create_for_inference,
     )
 
@@ -553,11 +553,11 @@ def test_checkpoint_load_builds_generator_for_resolved_target_device(tmp_path, m
             return self
 
     monkeypatch.setattr(
-        "src.ui.services.inference_service.ModelRegistry.create",
+        "src.inference.checkpoint_loader.create_model",
         lambda *args, **kwargs: FakeModel(),
     )
     monkeypatch.setattr(
-        "src.ui.services.inference_service.resolve_device",
+        "src.inference.runtime.resolve_device",
         lambda requested: "cuda",
     )
 
@@ -566,7 +566,7 @@ def test_checkpoint_load_builds_generator_for_resolved_target_device(tmp_path, m
         return object()
 
     monkeypatch.setattr(
-        "src.ui.services.inference_service.GeneratorRegistry.create_for_inference",
+        "src.inference.runtime.create_generator_for_inference",
         create_for_inference,
     )
 
@@ -577,8 +577,8 @@ def test_checkpoint_load_builds_generator_for_resolved_target_device(tmp_path, m
 
 
 def test_checkpoint_load_reserves_accelerator_before_deserializing(tmp_path, monkeypatch):
+    from src.application.runtime import AcceleratorCoordinator
     from src.core.exceptions import AcceleratorBusyError
-    from src.ui.services.accelerator_coordinator import AcceleratorCoordinator
 
     checkpoint_path = tmp_path / "model.pt"
     checkpoint_path.write_bytes(b"not-read")
@@ -592,11 +592,11 @@ def test_checkpoint_load_reserves_accelerator_before_deserializing(tmp_path, mon
         accelerator_coordinator=coordinator,
     )
     monkeypatch.setattr(
-        "src.ui.services.inference_service.resolve_device",
+        "src.inference.runtime.resolve_device",
         lambda requested: "cuda",
     )
     monkeypatch.setattr(
-        "src.ui.services.inference_service.torch.load",
+        "src.inference.checkpoint_loader.torch.load",
         lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("checkpoint was read")),
     )
 
@@ -632,7 +632,7 @@ def test_checkpoint_load_binds_active_revision_to_exact_loaded_inode(tmp_path, m
         return tokenizer
 
     monkeypatch.setattr(
-        "src.application.inference.checkpoint_loader.load_tokenizer_state",
+        "src.inference.checkpoint_loader.load_tokenizer_state",
         replace_after_payload_was_loaded,
     )
 
@@ -671,9 +671,7 @@ def test_checkpoint_listing_uses_one_checkpoint_directory_snapshot(tmp_path, mon
             service.set_checkpoint_dir(str(second))
         return real_listdir(path)
 
-    monkeypatch.setattr(
-        "src.ui.services.inference_service.os.listdir", switch_directory_during_scan
-    )
+    monkeypatch.setattr("src.inference.checkpoint_catalog.os.listdir", switch_directory_during_scan)
 
     checkpoints = service.list_checkpoints()
 
@@ -686,7 +684,7 @@ def test_prepare_for_training_offloads_idle_inference_model_from_shared_accelera
 ):
     import torch
 
-    from src.ui.services.inference_service import InferenceService
+    from src.application.inference import InferenceService
 
     class DummyTokenizer:
         pass
@@ -715,7 +713,7 @@ def test_prepare_for_training_offloads_idle_inference_model_from_shared_accelera
         return DummyGenerator()
 
     monkeypatch.setattr(
-        "src.ui.services.inference_service.GeneratorRegistry.create_for_inference",
+        "src.inference.runtime.create_generator_for_inference",
         create_for_inference,
     )
 
@@ -730,8 +728,8 @@ def test_prepare_for_training_offloads_idle_inference_model_from_shared_accelera
 def test_prepare_for_training_refuses_to_move_model_during_active_generation(tmp_path):
     from unittest.mock import Mock
 
+    from src.application.inference import InferenceService
     from src.core.exceptions import GenerationBusyError
-    from src.ui.services.inference_service import InferenceService
 
     service = InferenceService(
         checkpoint_dir=str(tmp_path / "checkpoints"),
@@ -757,8 +755,8 @@ def test_prepare_for_training_refuses_to_move_model_during_active_generation(tmp
 def test_checkpoint_loaded_on_accelerator_holds_residency_until_offloaded(tmp_path, monkeypatch):
     import torch
 
+    from src.application.runtime import AcceleratorCoordinator
     from src.core.exceptions import AcceleratorBusyError
-    from src.ui.services.accelerator_coordinator import AcceleratorCoordinator
 
     checkpoint_path = tmp_path / "model.pt"
     _write_portable_checkpoint(checkpoint_path)
@@ -782,15 +780,15 @@ def test_checkpoint_loaded_on_accelerator_holds_residency_until_offloaded(tmp_pa
             return self
 
     monkeypatch.setattr(
-        "src.ui.services.inference_service.ModelRegistry.create",
+        "src.inference.checkpoint_loader.create_model",
         lambda *args, **kwargs: FakeModel(),
     )
     monkeypatch.setattr(
-        "src.ui.services.inference_service.resolve_device",
+        "src.inference.runtime.resolve_device",
         lambda requested: "cuda",
     )
     monkeypatch.setattr(
-        "src.ui.services.inference_service.GeneratorRegistry.create_for_inference",
+        "src.inference.runtime.create_generator_for_inference",
         lambda *args, **kwargs: object(),
     )
 
@@ -826,7 +824,7 @@ def test_checkpoint_swap_to_cpu_offloads_previous_accelerator_model_before_relea
 ):
     import torch
 
-    from src.ui.services.accelerator_coordinator import AcceleratorCoordinator
+    from src.application.runtime import AcceleratorCoordinator
 
     checkpoint_path = tmp_path / "cpu.pt"
     _write_portable_checkpoint(checkpoint_path)
@@ -865,15 +863,15 @@ def test_checkpoint_swap_to_cpu_offloads_previous_accelerator_model_before_relea
     coordinator.reserve_inference_residency("cuda")
 
     monkeypatch.setattr(
-        "src.ui.services.inference_service.ModelRegistry.create",
+        "src.inference.checkpoint_loader.create_model",
         lambda *args, **kwargs: NewModel(),
     )
     monkeypatch.setattr(
-        "src.ui.services.inference_service.resolve_device",
+        "src.inference.runtime.resolve_device",
         lambda requested: "cpu",
     )
     monkeypatch.setattr(
-        "src.ui.services.inference_service.GeneratorRegistry.create_for_inference",
+        "src.inference.runtime.create_generator_for_inference",
         lambda *args, **kwargs: object(),
     )
 
@@ -889,7 +887,7 @@ def test_checkpoint_swap_to_cpu_offloads_previous_accelerator_model_before_relea
 def test_training_handoff_rollback_restores_inference_residency_and_runtime(tmp_path, monkeypatch):
     import torch
 
-    from src.ui.services.accelerator_coordinator import AcceleratorCoordinator
+    from src.application.runtime import AcceleratorCoordinator
 
     coordinator = AcceleratorCoordinator()
     service = InferenceService(
@@ -918,7 +916,7 @@ def test_training_handoff_rollback_restores_inference_residency_and_runtime(tmp_
     service._residency_device = "cuda"
     coordinator.reserve_inference_residency("cuda")
     monkeypatch.setattr(
-        "src.ui.services.inference_service.GeneratorRegistry.create_for_inference",
+        "src.inference.runtime.create_generator_for_inference",
         lambda *args, **kwargs: object(),
     )
 

@@ -9,7 +9,7 @@ from typing import Optional
 import yaml
 
 from src.application.config.contracts import DEFAULT_CONFIG_PATH, ConfigRequest
-from src.core.config import EngineConfig
+from src.core.config import EngineConfig, apply_overrides
 from src.core.exceptions import ConfigurationError
 
 
@@ -24,13 +24,16 @@ class YamlConfigProvider:
     def _path(self, source: Optional[str]) -> str:
         return source or self._default_path
 
+    def is_default_path(self, path: str) -> bool:
+        return os.path.realpath(os.path.abspath(path)) == os.path.realpath(
+            os.path.abspath(self._default_path)
+        )
+
     def load(self, request: ConfigRequest) -> EngineConfig:
         path = self._path(request.source)
         if request.source is None and not os.path.isfile(path):
             config = EngineConfig()
             if request.overrides:
-                from src.core.config.engine import apply_overrides
-
                 config = EngineConfig.from_dict(
                     apply_overrides(config.to_dict(), request.overrides)
                 )

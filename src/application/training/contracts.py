@@ -1,13 +1,22 @@
-"""Transport-neutral training use-case contracts."""
+"""Transport-neutral training use-case contracts.
+
+Capability-owned runtime/control contracts are imported only through
+``src.training.api`` so Application does not bind to trainer implementation.
+"""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional, Protocol
+from typing import Optional
 
 from src.core.config import EngineConfig
 from src.core.runtime import ResolvedTrainingPlan
-from src.training.trainer import Trainer
+from src.training.api import (
+    NullTrainingObserver,
+    PreparedTrainingRun,
+    TrainingObserver,
+    TrainingPreparationAborted,
+)
 
 
 @dataclass(frozen=True)
@@ -37,31 +46,12 @@ class TrainingPlan:
     resume_checkpoint_identity: Optional[tuple[int, int, int, int]] = None
 
 
-@dataclass
-class PreparedTrainingRun:
-    config: EngineConfig
-    runtime_plan: ResolvedTrainingPlan
-    trainer: Trainer
-
-
-class TrainingObserver(Protocol):
-    def on_step(self, *, step: int, loss: float, lr: float, elapsed: float, emit: bool) -> None: ...
-
-    def on_eval(self, *, step: int, train_loss: float, val_loss: float, lr: float) -> None: ...
-
-    def on_sample(self, *, step: int, text: str) -> None: ...
-
-
-class NullTrainingObserver:
-    def on_step(self, **kwargs) -> None:
-        del kwargs
-
-    def on_eval(self, **kwargs) -> None:
-        del kwargs
-
-    def on_sample(self, **kwargs) -> None:
-        del kwargs
-
-
-class TrainingPreparationAborted(RuntimeError):
-    """Internal control signal when a caller cancels preparation safely."""
+__all__ = [
+    "NullTrainingObserver",
+    "PreparedTrainingRun",
+    "TrainingCommand",
+    "TrainingFeasibility",
+    "TrainingObserver",
+    "TrainingPlan",
+    "TrainingPreparationAborted",
+]

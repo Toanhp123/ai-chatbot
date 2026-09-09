@@ -2,8 +2,8 @@ import pytest
 
 
 def test_accelerator_coordinator_blocks_training_while_generation_is_reserved():
+    from src.application.runtime import AcceleratorCoordinator
     from src.core.exceptions import AcceleratorBusyError
-    from src.ui.services.accelerator_coordinator import AcceleratorCoordinator
 
     coordinator = AcceleratorCoordinator()
     coordinator.reserve_generation("cuda")
@@ -18,8 +18,8 @@ def test_accelerator_coordinator_blocks_training_while_generation_is_reserved():
 
 
 def test_accelerator_coordinator_blocks_generation_while_training_is_reserved():
+    from src.application.runtime import AcceleratorCoordinator
     from src.core.exceptions import AcceleratorBusyError
-    from src.ui.services.accelerator_coordinator import AcceleratorCoordinator
 
     coordinator = AcceleratorCoordinator()
     coordinator.reserve_training("mps")
@@ -34,7 +34,7 @@ def test_accelerator_coordinator_blocks_generation_while_training_is_reserved():
 
 
 def test_cpu_reservations_do_not_conflict_or_require_release():
-    from src.ui.services.accelerator_coordinator import AcceleratorCoordinator
+    from src.application.runtime import AcceleratorCoordinator
 
     coordinator = AcceleratorCoordinator()
     coordinator.reserve_training("cpu")
@@ -44,10 +44,10 @@ def test_cpu_reservations_do_not_conflict_or_require_release():
 
 
 def test_inference_service_uses_shared_coordinator_for_generation(tmp_path):
+    from src.application.inference import InferenceService
+    from src.application.runtime import AcceleratorCoordinator
     from src.core.config import GenerationConfig
     from src.core.exceptions import AcceleratorBusyError
-    from src.ui.services.accelerator_coordinator import AcceleratorCoordinator
-    from src.ui.services.inference_service import InferenceService
 
     class DummyTokenizer:
         def encode(self, text):
@@ -76,10 +76,10 @@ def test_inference_service_uses_shared_coordinator_for_generation(tmp_path):
 
 
 def test_generation_session_holds_shared_reservation_until_close(tmp_path):
+    from src.application.inference import InferenceService
+    from src.application.runtime import AcceleratorCoordinator
     from src.core.config import GenerationConfig
     from src.core.exceptions import AcceleratorBusyError
-    from src.ui.services.accelerator_coordinator import AcceleratorCoordinator
-    from src.ui.services.inference_service import InferenceService
 
     class DummyTokenizer:
         def encode(self, text):
@@ -108,12 +108,12 @@ def test_generation_session_holds_shared_reservation_until_close(tmp_path):
 
 
 def test_training_start_reserves_shared_accelerator_before_entering_starting_state():
+    from src.application.runtime import AcceleratorCoordinator
+    from src.application.training import TrainingService
     from src.application.training.contracts import TrainingFeasibility, TrainingPlan
     from src.core.config import EngineConfig
     from src.core.exceptions import AcceleratorBusyError
     from src.core.runtime import ResolvedTrainingPlan
-    from src.ui.services.accelerator_coordinator import AcceleratorCoordinator
-    from src.ui.services.training_service import TrainingService
 
     coordinator = AcceleratorCoordinator()
     coordinator.reserve_generation("cuda")
@@ -148,8 +148,8 @@ def test_training_start_reserves_shared_accelerator_before_entering_starting_sta
 
 
 def test_idle_inference_residency_blocks_training_until_released():
+    from src.application.runtime import AcceleratorCoordinator
     from src.core.exceptions import AcceleratorBusyError
-    from src.ui.services.accelerator_coordinator import AcceleratorCoordinator
 
     coordinator = AcceleratorCoordinator()
     coordinator.reserve_inference_residency("cuda:0")
@@ -164,8 +164,8 @@ def test_idle_inference_residency_blocks_training_until_released():
 
 
 def test_training_blocks_new_inference_residency():
+    from src.application.runtime import AcceleratorCoordinator
     from src.core.exceptions import AcceleratorBusyError
-    from src.ui.services.accelerator_coordinator import AcceleratorCoordinator
 
     coordinator = AcceleratorCoordinator()
     coordinator.reserve_training("mps")
@@ -200,10 +200,10 @@ def test_accelerator_coordinator_atomically_transfers_inference_residency_to_tra
 
 def test_training_start_does_not_leak_admission_when_state_changes_before_commit(monkeypatch):
     from src.application.runtime.accelerator import AcceleratorCoordinator
+    from src.application.training import TrainingService
     from src.application.training.contracts import TrainingFeasibility, TrainingPlan
     from src.core.config import EngineConfig
     from src.core.runtime import RuntimeCapabilities, resolve_training_plan
-    from src.ui.services.training_service import TrainingService
 
     coordinator = AcceleratorCoordinator()
     config = EngineConfig().copy(system=EngineConfig().system.copy(device="cuda"))

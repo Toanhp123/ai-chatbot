@@ -5,7 +5,7 @@ from typing import Any, Iterable, Iterator, Mapping
 
 from fastapi.responses import StreamingResponse
 
-from src.ui.services.generation_session import GenerationSession
+from src.application.inference import GenerationSession
 
 
 def iter_sse_events(events: Iterable[Mapping[str, object]]) -> Iterator[str]:

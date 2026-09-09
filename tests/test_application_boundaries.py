@@ -78,9 +78,9 @@ def test_main_cli_does_not_import_inner_modules_directly():
 def test_generation_session_exposes_transport_neutral_events():
     import threading
 
-    from src.application.inference.session import GenerationSession
     from src.core.config import GenerationConfig
     from src.generation.base import BaseGenerator, GenerationOutput
+    from src.inference.api import GenerationSession
 
     class FakeGenerator:
         def generate(self, prompt, config, streamer, return_output, **kwargs):
@@ -132,7 +132,7 @@ def test_cli_diagnostics_adapter_owns_vram_rendering(tmp_path, monkeypatch):
         lambda **kwargs: scenarios,
     )
     monkeypatch.setattr(
-        "src.adapters.cli.diagnostics.print_vram_scenarios_table",
+        "src.adapters.cli.diagnostics._render_vram_scenarios",
         lambda value: captured.setdefault("value", value),
     )
 
@@ -511,18 +511,18 @@ def test_cli_runtime_adapter_configures_logging_without_application_wrapper(monk
 
     captured = {}
 
-    def fake_configure(system_config, name="ai-train", **kwargs):
-        captured["system_config"] = system_config
+    def fake_configure(config, *, name="ai-train"):
+        captured["config"] = config
         captured["name"] = name
         return object()
 
-    monkeypatch.setattr("src.adapters.cli.runtime.configure_logging_from_system", fake_configure)
+    monkeypatch.setattr("src.adapters.cli.runtime._configure_process_logging", fake_configure)
     from src.adapters.cli.runtime import configure_cli_logging
 
     config = EngineConfig()
     configure_cli_logging(config, name="cli")
 
-    assert captured == {"system_config": config.system, "name": "cli"}
+    assert captured == {"config": config, "name": "cli"}
 
 
 def test_diagnostics_application_exposes_data_not_cli_rendering():
@@ -566,6 +566,113 @@ def test_diagnostics_application_does_not_own_outer_tooling_or_log_file_io():
     assert "def logs" not in source
 
 
+def test_diagnostics_application_uses_model_public_facade_only():
+    source = Path("src/application/diagnostics/service.py").read_text(encoding="utf-8")
+
+    assert "from src.models.api import" in source
+    assert "src.models.registry" not in source
+
+
+def test_diagnostics_application_delegates_model_inspection_mechanics():
+    source = Path("src/application/diagnostics/service.py").read_text(encoding="utf-8")
+
+    assert "inspect_model" in source
+    assert ".named_parameters(" not in source
+    assert ".numel(" not in source
+    assert ".element_size(" not in source
+
+
+def test_application_diagnostics_uses_core_diagnostics_public_facade():
+    source = Path("src/application/diagnostics/service.py").read_text(encoding="utf-8")
+
+    assert "from src.core.diagnostics import" in source
+    assert "from src.core.diagnostics." not in source
+
+
+def test_application_uses_core_diagnostics_package_facade_only():
+    offenders = []
+    for path in Path("src/application").rglob("*.py"):
+        source = path.read_text(encoding="utf-8")
+        if "from src.core.diagnostics." in source:
+            offenders.append(str(path))
+
+    assert offenders == []
+
+
+def test_cli_diagnostics_adapter_does_not_bypass_application_or_import_inner_renderers():
+    source = Path("src/adapters/cli/diagnostics.py").read_text(encoding="utf-8")
+
+    assert "src.core.diagnostics" not in source
+    assert "src.utils.tensor_inspector" not in source
+    assert "DiagnosticsApplicationService" in source
+
+
+def test_cli_runtime_owns_logging_mechanics_without_importing_core_logging():
+    source = Path("src/adapters/cli/runtime.py").read_text(encoding="utf-8")
+
+    assert "src.core.logging" not in source
+    assert "RotatingFileHandler" in source
+
+
+def test_config_adapter_uses_core_config_public_facade_only():
+    source = Path("src/adapters/config/yaml_provider.py").read_text(encoding="utf-8")
+
+    assert "src.core.config.engine" not in source
+    assert "from src.core.config import" in source
+
+
+def test_configuration_application_delegates_path_identity_to_provider():
+    source = Path("src/application/config/service.py").read_text(encoding="utf-8")
+
+    assert "import os" not in source
+    assert "os.path." not in source
+    assert ".is_default_path(" in source
+
+
+def test_training_launch_delegates_checkpoint_revision_io_to_training_capability():
+    source = Path("src/application/training/launch.py").read_text(encoding="utf-8")
+
+    assert "from src.training.api import" in source
+    assert "open(" not in source
+    assert "os.fstat" not in source
+    assert "stat.S_ISREG" not in source
+
+
+def test_stale_ui_service_compatibility_aliases_are_removed():
+    services_dir = Path("src/ui/services")
+    stale = {
+        "accelerator_coordinator.py",
+        "generation_session.py",
+        "inference_service.py",
+        "training_service.py",
+    }
+
+    assert not any((services_dir / name).exists() for name in stale)
+
+
+def test_application_layer_contains_no_direct_io_or_framework_runtime_mechanics():
+    forbidden = (
+        "import os",
+        "from pathlib import",
+        "open(",
+        "import torch",
+        "torch.",
+        "threading.Thread",
+        "subprocess.",
+        "requests.",
+        "httpx.",
+        "RotatingFileHandler",
+    )
+    offenders = []
+    for path in Path("src/application").rglob("*.py"):
+        source = path.read_text(encoding="utf-8")
+        hits = [token for token in forbidden if token in source]
+        if hits:
+            offenders.append((str(path), hits))
+
+    assert offenders == []
+
+
 def test_application_error_facade_exports_only_outer_contract_without_wildcard():
     source = Path("src/application/errors.py").read_text(encoding="utf-8")
 
@@ -573,3 +680,240 @@ def test_application_error_facade_exports_only_outer_contract_without_wildcard()
     from src.application import errors
 
     assert set(errors.__all__) == {"AIEngineError", "ConfigurationError", "ErrorCode"}
+
+
+def _write_package_tree(root: Path, modules: dict[str, str]) -> Path:
+    """Create a minimal src package tree for architecture-guardian regression tests."""
+    src = root / "src"
+    src.mkdir(parents=True, exist_ok=True)
+    (src / "__init__.py").write_text("", encoding="utf-8")
+    for module, source in modules.items():
+        parts = module.split(".")
+        assert parts[0] == "src"
+        package = src
+        for part in parts[1:-1]:
+            package /= part
+            package.mkdir(exist_ok=True)
+            (package / "__init__.py").write_text("", encoding="utf-8")
+        (package / f"{parts[-1]}.py").write_text(source, encoding="utf-8")
+    return src
+
+
+def test_architecture_guardian_blocks_inner_reverse_dependencies(tmp_path):
+    src = _write_package_tree(
+        tmp_path,
+        {
+            "src.models.bad": "from src.adapters.config import YamlConfigProvider\n",
+            "src.data.bad": "from src.application.config import ConfigurationService\n",
+            "src.generation.bad": "from src.adapters.cli import runtime\n",
+            "src.training.bad": "from src.application.training import TrainingApplicationService\n",
+        },
+    )
+
+    violations = check_architecture_boundaries(str(src))
+    pairs = {(v["rule_scope"], v["forbidden_rule"]) for v in violations}
+
+    assert ("src.models", "src.adapters") in pairs
+    assert ("src.data", "src.application") in pairs
+    assert ("src.generation", "src.adapters") in pairs
+    assert ("src.training", "src.application") in pairs
+
+
+def test_architecture_guardian_requires_application_capability_facades(tmp_path):
+    src = _write_package_tree(
+        tmp_path,
+        {
+            "src.application.bad_data": "from src.data.pipeline import DataPipeline\n",
+            "src.application.bad_models": "from src.models.registry import ModelRegistry\n",
+            "src.application.bad_training": "from src.training.trainer import Trainer\n",
+            "src.application.bad_inference": "from src.inference.runtime import InferenceRuntime\n",
+            "src.application.good_data": "from src.data.api import prepare_dataset\n",
+            "src.application.good_training": "from src.training.api import TrainingRuntime\n",
+            "src.application.good_inference": "from src.inference.api import InferenceRuntime\n",
+        },
+    )
+
+    violations = check_architecture_boundaries(str(src))
+    offending = {v["source_module"] for v in violations}
+
+    assert "src.application.bad_data" in offending
+    assert "src.application.bad_models" in offending
+    assert "src.application.bad_training" in offending
+    assert "src.application.bad_inference" in offending
+    assert "src.application.good_data" not in offending
+    assert "src.application.good_training" not in offending
+    assert "src.application.good_inference" not in offending
+
+
+def test_architecture_guardian_blocks_adapter_inner_bypass_except_domain_contracts(tmp_path):
+    src = _write_package_tree(
+        tmp_path,
+        {
+            "src.adapters.bad_diagnostics": "from src.core.diagnostics import DiagnosticsRunner\n",
+            "src.adapters.bad_model": "from src.models.registry import ModelRegistry\n",
+            "src.adapters.bad_data": "from src.data.pipeline import DataPipeline\n",
+            "src.adapters.good_config": "from src.core.config import EngineConfig\n",
+            "src.adapters.good_error": "from src.core.exceptions import ConfigurationError\n",
+            "src.adapters.good_app": "from src.application.config import ConfigurationService\n",
+        },
+    )
+
+    violations = check_architecture_boundaries(str(src))
+    offending = {v["source_module"] for v in violations}
+
+    assert "src.adapters.bad_diagnostics" in offending
+    assert "src.adapters.bad_model" in offending
+    assert "src.adapters.bad_data" in offending
+    assert "src.adapters.good_config" not in offending
+    assert "src.adapters.good_error" not in offending
+    assert "src.adapters.good_app" not in offending
+
+
+def test_application_inference_contains_no_runtime_mechanics_or_concrete_capability_imports():
+    application_dir = Path("src/application/inference")
+    forbidden_imports = (
+        "import torch",
+        "from src.data",
+        "from src.models",
+        "from src.generation",
+        "from src.utils",
+    )
+    forbidden_mechanics = (
+        "os.path.exists",
+        "os.listdir",
+        "os.remove",
+        "torch.load",
+        "torch.cuda",
+        "threading.Thread",
+    )
+    violations = []
+    for path in application_dir.glob("*.py"):
+        source = path.read_text(encoding="utf-8")
+        if any(token in source for token in forbidden_imports + forbidden_mechanics):
+            violations.append(str(path))
+
+    assert violations == []
+    assert not (application_dir / "checkpoint_loader.py").exists()
+    assert not (application_dir / "checkpoint_catalog.py").exists()
+    assert not (application_dir / "session.py").exists()
+
+
+def test_inference_capability_is_exposed_only_through_public_api_to_application():
+    source = Path("src/application/inference/service.py").read_text(encoding="utf-8")
+    assert "from src.inference.api import" in source
+    assert "from src.inference.runtime import" not in source
+    assert "from src.inference.checkpoint" not in source
+
+
+def test_explorer_token_display_translation_is_owned_by_http_adapter():
+    data_source = Path("src/data/api.py").read_text(encoding="utf-8")
+    adapter_source = Path("src/ui/routes/explorer.py").read_text(encoding="utf-8")
+
+    assert "␣" not in data_source
+    assert "⏎" not in data_source
+    assert "_present_tokenize_result" in adapter_source
+
+
+def test_application_data_and_explorer_use_only_data_public_api_and_no_filesystem_io():
+    paths = [
+        Path("src/application/data_policy.py"),
+        Path("src/application/explorer/service.py"),
+    ]
+    forbidden = (
+        "from src.data.cleaners",
+        "from src.data.pipeline",
+        "from src.data.tokenizers",
+        "from src.data.constants",
+        "import os",
+        "open(",
+        "os.path.",
+    )
+    for path in paths:
+        source = path.read_text(encoding="utf-8")
+        assert "from src.data.api import" in source, str(path)
+        assert not any(token in source for token in forbidden), str(path)
+
+
+def test_application_training_has_no_trainer_thread_or_torch_mechanics():
+    application_dir = Path("src/application/training")
+    forbidden = (
+        "import torch",
+        "from src.training.trainer",
+        "from src.training.callbacks",
+        "threading.Thread",
+        "torch.cuda",
+        "Trainer(",
+    )
+    violations = []
+    for path in application_dir.glob("*.py"):
+        source = path.read_text(encoding="utf-8")
+        if any(token in source for token in forbidden):
+            violations.append(str(path))
+    assert violations == []
+    assert not (application_dir / "run.py").exists()
+    for path in application_dir.glob("*.py"):
+        source = path.read_text(encoding="utf-8")
+        if "from src.training" in source:
+            assert "from src.training.api import" in source, str(path)
+
+
+def test_application_training_has_no_concurrency_transport_mechanics():
+    application_dir = Path("src/application/training")
+    forbidden = ("import threading", "import queue", "threading.", "queue.Queue")
+    violations = []
+    for path in application_dir.glob("*.py"):
+        source = path.read_text(encoding="utf-8")
+        for token in forbidden:
+            if token in source:
+                violations.append(f"{path.name}: {token}")
+    assert violations == []
+    assert not (application_dir / "events.py").exists()
+
+
+def test_architecture_guardian_requires_inner_cross_capability_facades(tmp_path):
+    src = _write_package_tree(
+        tmp_path,
+        {
+            "src.inference.bad_model": "from src.models.registry import ModelRegistry\n",
+            "src.inference.bad_data": "from src.data.tokenizers import load_tokenizer\n",
+            "src.inference.bad_generation": "from src.generation.registry import GeneratorRegistry\n",
+            "src.inference.good_model": "from src.models.api import create_model\n",
+            "src.training.bad_model": "from src.models.base import BaseModel\n",
+            "src.training.bad_data": "from src.data.batch_provider import BaseBatchProvider\n",
+            "src.training.good_data": "from src.data.api import BaseBatchProvider\n",
+        },
+    )
+
+    violations = check_architecture_boundaries(str(src))
+    offending = {v["source_module"] for v in violations}
+
+    assert "src.inference.bad_model" in offending
+    assert "src.inference.bad_data" in offending
+    assert "src.inference.bad_generation" in offending
+    assert "src.inference.good_model" not in offending
+    assert "src.training.bad_model" in offending
+    assert "src.training.bad_data" in offending
+    assert "src.training.good_data" not in offending
+
+
+def test_inner_runtime_capabilities_use_only_cross_capability_public_facades():
+    roots = (Path("src/inference"), Path("src/training"))
+    capability_roots = ("src.data", "src.models", "src.generation")
+    violations = []
+
+    for root in roots:
+        for path in root.rglob("*.py"):
+            source = path.read_text(encoding="utf-8")
+            for capability in capability_roots:
+                for line in source.splitlines():
+                    stripped = line.strip()
+                    if stripped.startswith(f"from {capability}") and not stripped.startswith(
+                        f"from {capability}.api import"
+                    ):
+                        violations.append(f"{path}: {stripped}")
+                    if stripped.startswith(f"import {capability}.") and not stripped.startswith(
+                        f"import {capability}.api"
+                    ):
+                        violations.append(f"{path}: {stripped}")
+
+    assert violations == []

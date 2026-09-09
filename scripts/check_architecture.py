@@ -43,27 +43,39 @@ FORBIDDEN_DEPENDENCIES: Dict[str, List[str]] = {
         "src.data",
         "src.training",
         "src.generation",
+        "src.inference",
         "src.ui",
+        "src.application",
+        "src.adapters",
     ],
     # Tầng Data: Chỉ phụ thuộc Core & Utils, không phụ thuộc Models, Training hay UI
     "src.data": [
         "src.models",
         "src.training",
         "src.generation",
+        "src.inference",
         "src.ui",
+        "src.application",
+        "src.adapters",
     ],
     # Tầng Generation: Phụ thuộc Core & Utils, không phụ thuộc Training, Data hay UI
     "src.generation": [
         "src.training",
         "src.data",
+        "src.models",
+        "src.inference",
         "src.ui",
+        "src.application",
+        "src.adapters",
     ],
     # Tầng Training: Tuân thủ Dependency Inversion, không import trực tiếp concrete DataPipeline, Generator hay UI
     "src.training": [
         "src.data.dataset.DataPipeline",
         "src.data.pipeline",
-        "src.generation",
+        "src.inference",
         "src.ui",
+        "src.application",
+        "src.adapters",
     ],
     # Tầng Utils: Tiện ích thuần túy, không phụ thuộc các domain nghiệp vụ hay UI
     "src.utils": [
@@ -71,6 +83,14 @@ FORBIDDEN_DEPENDENCIES: Dict[str, List[str]] = {
         "src.models",
         "src.training",
         "src.generation",
+        "src.ui",
+        "src.application",
+        "src.adapters",
+        "src.inference",
+    ],
+    # Inference is an inner runtime capability assembled from data/model/generation modules.
+    "src.inference": [
+        "src.training",
         "src.ui",
         "src.application",
         "src.adapters",
@@ -85,8 +105,42 @@ FORBIDDEN_DEPENDENCIES: Dict[str, List[str]] = {
         "src.training",
         "src.generation",
         "src.utils",
+        "src.inference",
     ],
-    # Adapters must not be imported by inner modules; adapter-specific rules live on concrete trees.
+    # Adapters are outer I/O implementations. Capability bypasses are forbidden below.
+    "src.adapters": [
+        "src.data",
+        "src.models",
+        "src.training",
+        "src.generation",
+        "src.inference",
+        "src.utils",
+    ],
+}
+
+# Application can depend on capability contracts only through these stable public facades.
+FACADE_ONLY_DEPENDENCIES: Dict[str, Dict[str, Tuple[str, ...]]] = {
+    "src.training": {
+        "src.data": ("src.data.api",),
+        "src.models": ("src.models.api",),
+        "src.generation": ("src.generation.api",),
+    },
+    "src.inference": {
+        "src.data": ("src.data.api",),
+        "src.models": ("src.models.api",),
+        "src.generation": ("src.generation.api",),
+    },
+    "src.application": {
+        "src.data": ("src.data.api",),
+        "src.models": ("src.models.api",),
+        "src.training": ("src.training.api",),
+        "src.generation": ("src.generation.api",),
+        "src.inference": ("src.inference.api",),
+    },
+    # Adapters may use stable domain/config error contracts, but no core mechanics.
+    "src.adapters": {
+        "src.core": ("src.core.config", "src.core.exceptions"),
+    },
 }
 
 
@@ -215,6 +269,37 @@ def check_architecture_boundaries(
                                 "reason": f"Module '{matched_rule_source}' không được phép phụ thuộc vào '{forbidden}' (Vi phạm Dependency Inversion / Clean Architecture).",
                             }
                         )
+
+                facade_rules = FACADE_ONLY_DEPENDENCIES.get(matched_rule_source, {})
+                for capability_root, allowed_prefixes in facade_rules.items():
+                    if not (
+                        target_module == capability_root
+                        or target_module.startswith(capability_root + ".")
+                    ):
+                        continue
+                    if any(
+                        target_module == allowed or target_module.startswith(allowed + ".")
+                        for allowed in allowed_prefixes
+                    ):
+                        continue
+                    violation_key = (lineno, f"{capability_root}.* via public facade")
+                    if violation_key in seen_violations:
+                        continue
+                    seen_violations.add(violation_key)
+                    violations.append(
+                        {
+                            "filepath": filepath,
+                            "lineno": lineno,
+                            "source_module": source_module,
+                            "rule_scope": matched_rule_source,
+                            "target_module": target_module,
+                            "forbidden_rule": capability_root,
+                            "reason": (
+                                f"Module '{matched_rule_source}' chỉ được phép phụ thuộc vào "
+                                f"public facade {allowed_prefixes} của '{capability_root}', không phải implementation nội bộ."
+                            ),
+                        }
+                    )
 
     return violations
 

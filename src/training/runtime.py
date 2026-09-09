@@ -1,22 +1,15 @@
-"""Canonical training run assembly.
-
-This is the one place that converts an effective EngineConfig into concrete data,
-model, generator, callbacks and Trainer objects. CLI and Web lifecycle services
-must call this factory instead of re-creating the graph.
-"""
+"""Capability-owned training graph assembly and execution mechanics."""
 
 from __future__ import annotations
 
 import time
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 
-from src.application.data_policy import prepare_application_dataset
 from src.core.config import EngineConfig
 from src.core.runtime import ResolvedTrainingPlan, validate_training_plan
-from src.data.batch_provider import get_batch_provider
-from src.data.constants import FALLBACK_CORPUS
-from src.generation import get_generator
-from src.models.registry import ModelRegistry
+from src.data.api import create_batch_provider
+from src.generation.api import create_generator
+from src.models.api import create_model
 from src.training.callbacks import (
     BaseCallback,
     EarlyStoppingCallback,
@@ -24,18 +17,19 @@ from src.training.callbacks import (
     SampleGenerationCallback,
     TrainerProtocol,
 )
-from src.training.trainer import Trainer
-from src.utils.seed import set_seed
-
-from .contracts import (
+from src.training.contracts import (
     NullTrainingObserver,
     PreparedTrainingRun,
     TrainingObserver,
     TrainingPreparationAborted,
 )
+from src.training.trainer import Trainer, TrainOutput
+from src.utils.seed import set_seed
 
 
 class ObserverCallback(BaseCallback):
+    """Translate trainer callback mechanics into the stable observer contract."""
+
     def __init__(self, observer: TrainingObserver, log_interval: int = 10) -> None:
         self.observer = observer
         self.log_interval = log_interval
@@ -64,7 +58,7 @@ class ObserverCallback(BaseCallback):
 
 
 class TrainingRunFactory:
-    """Build exactly one Trainer graph from an immutable effective config snapshot."""
+    """Build one trainer graph from already-prepared data and an immutable config."""
 
     @staticmethod
     def _check_abort(abort_check: Optional[Callable[[], bool]]) -> None:
@@ -76,6 +70,9 @@ class TrainingRunFactory:
         *,
         config: EngineConfig,
         runtime_plan: ResolvedTrainingPlan,
+        train_data: Any,
+        val_data: Any,
+        tokenizer: Any,
         observer: Optional[TrainingObserver] = None,
         abort_check: Optional[Callable[[], bool]] = None,
         log_interval: int = 10,
@@ -84,17 +81,7 @@ class TrainingRunFactory:
         set_seed(effective.system.seed)
         self._check_abort(abort_check)
 
-        self._check_abort(abort_check)
-
-        train_data, val_data, tokenizer = prepare_application_dataset(
-            effective.data,
-            block_size=effective.model.block_size,
-            fallback_text=FALLBACK_CORPUS,
-            persist_fallback=True,
-        )
-        self._check_abort(abort_check)
-
-        batch_provider = get_batch_provider(
+        batch_provider = create_batch_provider(
             provider_type=effective.data.batch_provider_type,
             train_data=train_data,
             val_data=val_data,
@@ -105,12 +92,11 @@ class TrainingRunFactory:
         effective = effective.copy(model=effective.model.copy(vocab_size=tokenizer.vocab_size))
         self._check_abort(abort_check)
 
-        model = ModelRegistry.create(effective.model.name, effective.model)
+        model = create_model(effective.model.name, effective.model)
         self._check_abort(abort_check)
-
         validate_training_plan(effective, runtime_plan)
 
-        sample_generator = get_generator(
+        sample_generator = create_generator(
             "local",
             model=model,
             tokenizer=tokenizer,
@@ -120,7 +106,12 @@ class TrainingRunFactory:
         sink = observer or NullTrainingObserver()
 
         def sample_fn(step: int) -> str:
-            text = sample_generator.generate("Trăm năm", config=sample_config)
+            output = sample_generator.generate(
+                "Trăm năm",
+                config=sample_config,
+                return_output=True,
+            )
+            text = output.text
             sink.on_sample(step=step, text=text)
             return text
 
@@ -151,3 +142,20 @@ class TrainingRunFactory:
             runtime_plan=runtime_plan,
         )
         return PreparedTrainingRun(config=effective, runtime_plan=runtime_plan, trainer=trainer)
+
+    @staticmethod
+    def execute(
+        prepared: PreparedTrainingRun,
+        *,
+        resume_checkpoint: Optional[str] = None,
+        resume_checkpoint_identity: Optional[tuple[int, int, int, int]] = None,
+    ) -> TrainOutput:
+        if resume_checkpoint_identity is None:
+            return prepared.trainer.train(resume_checkpoint=resume_checkpoint)
+        return prepared.trainer.train(
+            resume_checkpoint=resume_checkpoint,
+            resume_checkpoint_identity=resume_checkpoint_identity,
+        )
+
+
+__all__ = ["ObserverCallback", "TrainingRunFactory"]
