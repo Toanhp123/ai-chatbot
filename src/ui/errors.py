@@ -6,7 +6,7 @@ from typing import Dict
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
-from src.core.exceptions import AIEngineError, ErrorCode
+from src.application.errors import AIEngineError, ErrorCode
 
 logger = logging.getLogger("UIErrors")
 

@@ -1,21 +1,34 @@
+"""CLI adapter for the AI Training Engine application layer.
+
+The CLI owns argument parsing, terminal input/output and process exit codes only.
+Use-case orchestration lives under ``src.application``; domain/module construction
+must not be recreated here.
 """
-CLI Điều Phối Hệ Thống AI Training Engine.
-Composition Root: Khởi tạo toàn bộ linh kiện từ Cấu hình (Config-Driven) và tiêm phụ thuộc.
-Hỗ trợ các lệnh:
-  - check    : Chẩn đoán toàn diện phần cứng, GPU, VRAM, môi trường
-  - estimate : Phân tích ngân sách VRAM theo các kịch bản
-  - train    : Bắt đầu huấn luyện mô hình theo file cấu hình
-  - generate : Sáng tác văn bản từ checkpoint đã huấn luyện
-  - inspect  : Phân tích kiến trúc và cấu trúc tham số mô hình
-  - gate     : Kiểm toán toàn diện chất lượng (Quality Gates)
-"""
+
+from __future__ import annotations
 
 import argparse
 import logging
-import os
 import sys
 
-import torch
+from src.adapters.cli import ConsoleTrainingObserver
+from src.adapters.config import YamlConfigProvider
+from src.application.config import ConfigRequest, ConfigurationService
+from src.application.diagnostics import DiagnosticsApplicationService
+from src.application.errors import AIEngineError
+from src.application.inference import (
+    GenerationCommand,
+    GenerationOverrides,
+    InferenceService,
+)
+from src.application.inference import (
+    load_generator_from_checkpoint as _load_generator_from_checkpoint,
+)
+from src.application.runtime import ApplicationRuntimeService
+from src.application.training import TrainingApplicationService, TrainingCommand
+
+logger = logging.getLogger("ai-train")
+
 
 if sys.platform == "win32":
     try:
@@ -28,170 +41,78 @@ if sys.platform == "win32":
     except Exception:
         pass
 
-from src.core.config import EngineConfig, GenerationConfig, ModelConfig
-from src.core.diagnostics import print_diagnostic_report
-from src.core.exceptions import AIEngineError
-from src.core.logging import configure_logging_from_system, setup_logger
-from src.core.runtime import resolve_training_plan
-from src.data.batch_provider import get_batch_provider
-from src.data.cleaners import get_cleaner
-from src.data.pipeline import DataPipeline
-from src.data.tokenizers import load_tokenizer, load_tokenizer_state
-from src.data.tokenizers.base import get_tokenizer_identity
-from src.generation import BaseGenerator, ConsoleStreamer, get_generator
-from src.models.registry import ModelRegistry
-from src.training.callbacks import (
-    ConsoleProgressCallback,
-    EarlyStoppingCallback,
-    ModelCheckpointCallback,
-    SampleGenerationCallback,
-)
-from src.training.trainer import Trainer
-from src.utils.device import resolve_device
-from src.utils.seed import set_seed
-from src.utils.tensor_inspector import print_model_summary
 
-logger = logging.getLogger("ai-train")
+def _config_service() -> ConfigurationService:
+    return ConfigurationService(YamlConfigProvider())
+
+
+def _config_request(args: argparse.Namespace) -> ConfigRequest:
+    return ConfigRequest.from_values(
+        getattr(args, "config", None),
+        getattr(args, "override", None),
+    )
+
+
+def _configure_from_request(
+    config_service: ConfigurationService,
+    args: argparse.Namespace,
+):
+    config = config_service.resolve(_config_request(args))
+    ApplicationRuntimeService.configure_logging(config, name="ai-train")
+    return config
 
 
 def cmd_check(args: argparse.Namespace) -> None:
-    setup_logger()
-    print_diagnostic_report()
+    config_service = _config_service()
+    _configure_from_request(config_service, args)
+    DiagnosticsApplicationService(config_service).print_system_report()
 
 
 def cmd_estimate(args: argparse.Namespace) -> None:
-    from src.core.diagnostics import analyze_vram_scenarios, print_vram_scenarios_table
-
-    logger.info(f"Phân tích ngân sách VRAM cho cấu hình: {args.config}")
-    overrides = getattr(args, "override", None)
-    config = EngineConfig.from_yaml(args.config, overrides=overrides)
-    configure_logging_from_system(config.system, name="ai-train")
-    scenarios = analyze_vram_scenarios(
-        model_config=config.model,
-        training_config=config.training,
-        system_config=config.system,
+    config_service = _config_service()
+    config = _configure_from_request(config_service, args)
+    config_service.activate(config)
+    logger.info(
+        "Phân tích ngân sách VRAM cho cấu hình: %s", args.config or config_service.default_path
     )
-    print_vram_scenarios_table(scenarios)
+    DiagnosticsApplicationService(config_service).print_scenarios_from_config(
+        None,
+        (),
+    )
 
 
 def cmd_inspect(args: argparse.Namespace) -> None:
-    overrides = getattr(args, "override", None)
-    config = EngineConfig.from_yaml(args.config, overrides=overrides)
-    configure_logging_from_system(config.system, name="ai-train")
-    model = ModelRegistry.create(config.model.name, config.model)
-    print_model_summary(model)
+    config_service = _config_service()
+    config = _configure_from_request(config_service, args)
+    config_service.activate(config)
+    DiagnosticsApplicationService(config_service).print_inspect(None, ())
 
 
 def cmd_train(args: argparse.Namespace) -> None:
-    logger.info(f"Nạp cấu hình từ: {args.config}")
-    overrides = getattr(args, "override", None)
-    config = EngineConfig.from_yaml(args.config, overrides=overrides)
-    configure_logging_from_system(config.system, name="ai-train")
-
-    # Pre-flight Memory Check
-    from src.core.diagnostics import check_memory_feasibility
-
-    runtime_plan = resolve_training_plan(config)
-
-    feasible, mem_msg, _ = check_memory_feasibility(
-        model_config=config.model,
-        training_config=config.training,
-        runtime_plan=runtime_plan,
-    )
-    if not feasible:
-        logger.warning(f"⚠️ {mem_msg}")
-    else:
-        logger.info(f"✅ [Pre-flight Memory Check]: {mem_msg}")
-
-    # Tùy chọn kiểm tra nhanh (quick check)
-    if args.quick_check:
-        config = config.copy(
-            training=config.training.copy(
-                max_iters=50,
-                eval_interval=25,
-                eval_iters=10,
-            )
+    config_service = _config_service()
+    application = TrainingApplicationService(config_service)
+    plan = application.plan(
+        TrainingCommand(
+            config_path=getattr(args, "config", None),
+            overrides=tuple(getattr(args, "override", None) or ()),
+            quick_check=bool(getattr(args, "quick_check", False)),
         )
+    )
+    ApplicationRuntimeService.configure_logging(plan.requested_config, name="ai-train")
+    logger.info("Nạp cấu hình từ: %s", args.config or config_service.default_path)
+    if plan.feasibility.feasible:
+        logger.info("✅ [Pre-flight Memory Check]: %s", plan.feasibility.message)
+    else:
+        logger.warning("⚠️ %s", plan.feasibility.message)
+    if getattr(args, "quick_check", False):
         logger.info("⚡ Chế độ Quick Check: Huấn luyện nhanh 50 bước kiểm tra hệ thống.")
 
-    set_seed(config.system.seed)
-
-    # 1. Khởi tạo linh kiện Làm sạch (Cleaner) từ Config
-    cleaner_kwargs = dict(config.data.cleaner_kwargs)
-    cleaner_kwargs.setdefault("clean_line_numbers", config.data.clean_line_numbers)
-    cleaner = get_cleaner(
-        cleaner_type=config.data.cleaner_type,
-        **cleaner_kwargs,
+    prepared = application.prepare(
+        plan,
+        observer=ConsoleTrainingObserver(),
+        log_interval=10 if getattr(args, "quick_check", False) else 100,
     )
-
-    # 2. Chuẩn bị Dữ liệu qua DataPipeline (tiêm cleaner vào pipeline)
-    train_data, val_data, tokenizer = DataPipeline.setup_data(
-        config=config.data,
-        cleaner=cleaner,
-        block_size=config.model.block_size,
-    )
-
-    # 3. Khởi tạo Batch Provider từ Config (tensor hoặc dataloader)
-    batch_provider = get_batch_provider(
-        provider_type=config.data.batch_provider_type,
-        train_data=train_data,
-        val_data=val_data,
-        block_size=config.model.block_size,
-        num_workers=config.data.num_workers,
-        pin_memory=config.data.pin_memory,
-    )
-
-    # Cập nhật kích thước từ vựng thực tế vào model config
-    config = config.copy(model=config.model.copy(vocab_size=tokenizer.vocab_size))
-
-    # 4. Khởi tạo mô hình qua ModelRegistry
-    model = ModelRegistry.create(config.model.name, config.model)
-    logger.info(f"Khởi tạo mô hình '{config.model.name}' với {model.get_num_params():,} tham số.")
-
-    # 5. Thiết lập Callbacks (Dependency Injection: sample_fn được truyền vào từ Composition Root)
-    sample_generator: BaseGenerator = get_generator(
-        "local", model=model, tokenizer=tokenizer, device=runtime_plan.device
-    )
-    sample_gen_config = GenerationConfig(
-        max_new_tokens=50 if args.quick_check else 100,
-        temperature=0.8,
-        top_k=40,
-        use_cache=True,
-    )
-
-    def sample_fn(step: int) -> str:
-        return sample_generator.generate("Trăm năm", config=sample_gen_config)
-
-    callbacks = [
-        ConsoleProgressCallback(log_interval=100 if not args.quick_check else 10),
-        SampleGenerationCallback(sample_fn=sample_fn),
-        EarlyStoppingCallback(
-            monitor="val_loss",
-            mode="min",
-            patience=config.training.early_stopping_patience,
-        ),
-        # Checkpoint last: runtime snapshot sees the state changes of prior callbacks.
-        ModelCheckpointCallback(
-            save_dir=config.training.checkpoint_dir,
-            filename=config.training.checkpoint_name,
-            monitor="val_loss",
-            mode="min",
-            save_top_k=config.training.save_top_k,
-            save_last=config.training.save_last,
-            run_name=config.training.run_name,
-        ),
-    ]
-
-    # 6. Khởi chạy Trainer
-    trainer = Trainer(
-        model=model,
-        batch_provider=batch_provider,
-        config=config,
-        callbacks=callbacks,
-        tokenizer=tokenizer,
-        runtime_plan=runtime_plan,
-    )
-    trainer.train()
+    application.execute(prepared, plan)
 
 
 def load_generator_from_checkpoint(
@@ -199,108 +120,109 @@ def load_generator_from_checkpoint(
     vocab_path: str,
     device: str = "auto",
     backend: str = "local",
-) -> BaseGenerator:
-    if not os.path.exists(checkpoint_path):
-        raise AIEngineError(f"Không tìm thấy file checkpoint tại: {checkpoint_path}")
-    target_device = resolve_device(device)
-    checkpoint = torch.load(checkpoint_path, map_location=target_device, weights_only=True)
-    checkpoint_identity = checkpoint.get("tokenizer_identity")
-    if not isinstance(checkpoint_identity, dict):
-        raise AIEngineError(
-            "Checkpoint legacy không có tokenizer identity; từ chối nạp để tránh ánh xạ token sai."
-        )
-    checkpoint_version = int(checkpoint.get("checkpoint_version", 1))
-    embedded_state = checkpoint.get("tokenizer_state")
-    if checkpoint_version >= 3 and not isinstance(embedded_state, dict):
-        raise AIEngineError("Checkpoint v3 thiếu tokenizer state bắt buộc.")
-    if isinstance(embedded_state, dict):
-        tokenizer = load_tokenizer_state(embedded_state)
-    else:
-        if not os.path.exists(vocab_path):
-            raise AIEngineError(f"Không tìm thấy file từ vựng tại: {vocab_path}")
-        tokenizer = load_tokenizer(vocab_path)
+):
+    """Compatibility facade over the canonical application checkpoint loader."""
+    return _load_generator_from_checkpoint(
+        checkpoint_path,
+        vocab_path,
+        device=device,
+        backend=backend,
+    )
 
-    if checkpoint_identity.get("fingerprint") != get_tokenizer_identity(tokenizer).get(
-        "fingerprint"
-    ):
-        raise AIEngineError("Tokenizer/từ vựng không khớp checkpoint.")
-    cfg_dict = checkpoint["config"]["model"]
-    model_config = ModelConfig.from_kwargs_safe(cfg_dict, ignore_unknown=True)
-    model = ModelRegistry.create(model_config.name, model_config)
 
-    if isinstance(model, torch.nn.Module):
-        model.load_state_dict(checkpoint["model_state_dict"])
-    return get_generator(backend, model=model, tokenizer=tokenizer, device=target_device)
+def _generation_overrides(args: argparse.Namespace) -> GenerationOverrides:
+    no_cache = getattr(args, "no_cache", None)
+    return GenerationOverrides(
+        max_new_tokens=getattr(args, "tokens", None),
+        temperature=getattr(args, "temp", None),
+        top_k=getattr(args, "top_k", None),
+        top_p=getattr(args, "top_p", None),
+        min_p=getattr(args, "min_p", None),
+        repetition_penalty=getattr(args, "repetition_penalty", None),
+        greedy=getattr(args, "greedy", None),
+        use_cache=None if no_cache is None else not no_cache,
+    )
+
+
+def _render_generation(
+    inference: InferenceService,
+    *,
+    prompt: str,
+    overrides: GenerationOverrides,
+    backend: str,
+) -> None:
+    session = inference.begin_generation_command(
+        GenerationCommand.create(prompt=prompt, overrides=overrides, backend=backend)
+    )
+    for event in session.iter_events():
+        event_type = event.get("type")
+        if event_type == "token":
+            print(str(event.get("token", "")), end="", flush=True)
+        elif event_type == "error":
+            message = event.get("message") or event.get("detail") or "Lỗi sinh văn bản."
+            raise AIEngineError(str(message))
+    print()
 
 
 def cmd_generate(args: argparse.Namespace) -> None:
-    setup_logger()
-    checkpoint_path = args.checkpoint
-    vocab_path = args.vocab
-    backend = getattr(args, "backend", "local")
-
-    logger.info(f"Tải Generator ({backend}) từ checkpoint: {checkpoint_path}")
-    generator = load_generator_from_checkpoint(
-        checkpoint_path, vocab_path, device="auto", backend=backend
-    )
-
-    is_greedy = getattr(args, "greedy", False)
-    gen_config = GenerationConfig(
-        max_new_tokens=args.tokens,
-        temperature=0.0 if is_greedy else args.temp,
-        top_k=args.top_k,
-        top_p=args.top_p,
-        min_p=getattr(args, "min_p", None),
-        repetition_penalty=getattr(args, "repetition_penalty", 1.0),
-        do_sample=not is_greedy,
-        use_cache=not getattr(args, "no_cache", False),
-    )
-
-    streamer = ConsoleStreamer(delay=0.01)
+    config_service = _config_service()
+    config = _configure_from_request(config_service, args)
+    config_service.activate(config)
+    inference = InferenceService.from_engine_config(config, config_service=config_service)
+    backend = getattr(args, "backend", None) or inference.current_backend
+    if getattr(args, "vocab", None):
+        inference.set_vocab_path(args.vocab)
+    checkpoint = getattr(args, "checkpoint", None) or inference.configured_checkpoint_path
+    logger.info("Tải Generator (%s) từ checkpoint: %s", backend, checkpoint)
+    inference.load_checkpoint(checkpoint, backend=backend)
+    overrides = _generation_overrides(args)
 
     if args.prompt:
         print("\n📝 [KẾT QUẢ SINH]:")
-        generator.generate(args.prompt, config=gen_config, streamer=streamer)
+        _render_generation(inference, prompt=args.prompt, overrides=overrides, backend=backend)
         return
 
-    # Chế độ tương tác
     print("=" * 60)
     print("🤖 GIAO DIỆN SÁNG TÁC TƯƠNG TÁC MINI-GPT")
     print("Gõ câu mồi bất kỳ (hoặc 'q' để thoát):\n")
     while True:
         try:
             user_prompt = input("👉 Nhập câu mồi: ").strip()
-            if user_prompt.lower() in ["q", "exit", "quit"]:
+            if user_prompt.lower() in {"q", "exit", "quit"}:
                 break
             if not user_prompt:
                 user_prompt = "Trăm năm trong cõi người ta,"
             print("\n📝 [AI đang sáng tác...]:")
-            generator.generate(user_prompt, config=gen_config, streamer=streamer)
+            _render_generation(
+                inference,
+                prompt=user_prompt,
+                overrides=overrides,
+                backend=backend,
+            )
         except (KeyboardInterrupt, EOFError):
             print("\nĐã thoát.")
             break
 
 
 def cmd_gate(args: argparse.Namespace) -> None:
-    setup_logger()
-    from scripts.check_all import main as run_quality_gates
-
-    sys.exit(run_quality_gates())
+    del args
+    raise SystemExit(DiagnosticsApplicationService.run_quality_gates_cli())
 
 
 def cmd_ui(args: argparse.Namespace) -> None:
-    setup_logger()
+    config_service = _config_service()
+    config = config_service.resolve()
+    ApplicationRuntimeService.configure_logging(config, name="ai-train")
     try:
         import uvicorn
     except ImportError:
         logger.error("Chưa cài đặt uvicorn. Chạy: pip install uvicorn fastapi")
-        sys.exit(1)
+        raise SystemExit(1)
 
     host = getattr(args, "host", "127.0.0.1")
     port = getattr(args, "port", 8000)
     reload = getattr(args, "reload", False)
-
-    logger.info(f"🚀 Khởi chạy AI Studio Web Dashboard tại: http://{host}:{port}")
+    logger.info("🚀 Khởi chạy AI Studio Web Dashboard tại: http://%s:%s", host, port)
     uvicorn_kwargs = {
         "factory": True,
         "host": host,
@@ -321,117 +243,88 @@ def cmd_ui(args: argparse.Namespace) -> None:
     uvicorn.run("src.ui.app:create_app", **uvicorn_kwargs)
 
 
-def main() -> None:
+def _add_config_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--config",
+        default=None,
+        help="Đường dẫn file cấu hình; bỏ trống để dùng ConfigProvider mặc định",
+    )
+    parser.add_argument(
+        "--override",
+        nargs="*",
+        default=[],
+        help="Ghi đè cấu hình động (vd: training.batch_size=32 model.dropout=0.2)",
+    )
+
+
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="AI Training Engine - Modular AI Pipeline Architecture"
     )
     subparsers = parser.add_subparsers(dest="command", help="Lệnh thực thi")
 
-    # check
     p_check = subparsers.add_parser("check", help="Kiểm tra chẩn đoán hệ thống và phần cứng")
     p_check.set_defaults(func=cmd_check)
 
-    # estimate
     p_est = subparsers.add_parser(
         "estimate", help="Dự toán ngân sách VRAM và phân tích các kịch bản huấn luyện"
     )
-    p_est.add_argument(
-        "--config", default="configs/truyen_kieu.yaml", help="Đường dẫn file cấu hình"
-    )
-    p_est.add_argument(
-        "--override",
-        nargs="*",
-        default=[],
-        help="Ghi đè tham số cấu hình động (vd: training.batch_size=32 model.dropout=0.2)",
-    )
+    _add_config_arguments(p_est)
     p_est.set_defaults(func=cmd_estimate)
 
-    # inspect
     p_inspect = subparsers.add_parser("inspect", help="Phân tích kiến trúc mô hình")
-    p_inspect.add_argument(
-        "--config", default="configs/truyen_kieu.yaml", help="Đường dẫn file cấu hình"
-    )
-    p_inspect.add_argument(
-        "--override",
-        nargs="*",
-        default=[],
-        help="Ghi đè tham số cấu hình động (vd: training.batch_size=32 model.dropout=0.2)",
-    )
+    _add_config_arguments(p_inspect)
     p_inspect.set_defaults(func=cmd_inspect)
 
-    # train
     p_train = subparsers.add_parser("train", help="Huấn luyện mô hình")
-    p_train.add_argument(
-        "--config", default="configs/truyen_kieu.yaml", help="Đường dẫn file cấu hình"
-    )
-    p_train.add_argument(
-        "--override",
-        nargs="*",
-        default=[],
-        help="Ghi đè tham số cấu hình động (vd: training.batch_size=32 model.dropout=0.2)",
-    )
+    _add_config_arguments(p_train)
     p_train.add_argument(
         "--quick-check", action="store_true", help="Chạy thử 50 bước kiểm tra pipeline"
     )
     p_train.set_defaults(func=cmd_train)
 
-    # generate
     p_gen = subparsers.add_parser("generate", help="Sinh văn bản từ checkpoint đã huấn luyện")
+    _add_config_arguments(p_gen)
     p_gen.add_argument(
-        "--checkpoint", default="checkpoints/best_model.pt", help="File checkpoint mô hình"
+        "--checkpoint", default=None, help="File checkpoint; bỏ trống để dùng cấu hình canonical"
     )
-    p_gen.add_argument("--vocab", default="data/vocab.json", help="File từ điển vocab.json")
+    p_gen.add_argument(
+        "--vocab", default=None, help="File vocab; bỏ trống để dùng cấu hình canonical"
+    )
     p_gen.add_argument("--prompt", default=None, help="Câu mồi bắt đầu")
-    p_gen.add_argument("--tokens", type=int, default=200, help="Số ký tự sinh")
-    p_gen.add_argument("--temp", type=float, default=0.75, help="Nhiệt độ sáng tạo (0.5 - 1.0)")
-    p_gen.add_argument("--top_k", type=int, default=40, help="Top-K sampling")
-    p_gen.add_argument("--top_p", type=float, default=0.9, help="Top-P nucleus sampling")
+    p_gen.add_argument("--tokens", type=int, default=None, help="Ghi đè max_new_tokens")
+    p_gen.add_argument("--temp", type=float, default=None, help="Ghi đè temperature")
+    p_gen.add_argument("--top_k", type=int, default=None, help="Ghi đè Top-K sampling")
+    p_gen.add_argument("--top_p", type=float, default=None, help="Ghi đè Top-P sampling")
+    p_gen.add_argument("--min_p", type=float, default=None, help="Ghi đè Min-P sampling")
     p_gen.add_argument(
-        "--min_p",
-        type=float,
-        default=None,
-        help="Min-P truncation sampling (0.0 - 1.0, vd: 0.05)",
+        "--repetition_penalty", type=float, default=None, help="Ghi đè hệ số phạt lặp"
     )
     p_gen.add_argument(
-        "--repetition_penalty",
-        type=float,
-        default=1.0,
-        help="Hệ số phạt lặp từ (>= 1.0, vd: 1.15)",
+        "--greedy", action="store_true", default=None, help="Bật Greedy Search xác định"
     )
+    p_gen.add_argument("--no_cache", action="store_true", default=None, help="Vô hiệu hóa KV-Cache")
     p_gen.add_argument(
-        "--greedy",
-        action="store_true",
-        help="Chế độ Greedy Search xác định (tương đương temperature=0, do_sample=False)",
-    )
-    p_gen.add_argument(
-        "--no_cache",
-        action="store_true",
-        help="Vô hiệu hóa KV-Cache (chạy chế độ không cache O(T^2))",
-    )
-    p_gen.add_argument(
-        "--backend",
-        default="local",
-        help="Backend suy luận trong GeneratorRegistry (mặc định: 'local')",
+        "--backend", default=None, help="Backend suy luận; bỏ trống để dùng application default"
     )
     p_gen.set_defaults(func=cmd_generate)
 
-    # gate (Quality Gates & Architecture check)
     p_gate = subparsers.add_parser(
         "gate", help="Kiểm toán toàn diện chất lượng (Format, Lint, Architecture, Tests)"
     )
     p_gate.set_defaults(func=cmd_gate)
 
-    # ui (Web Dashboard)
-    p_ui = subparsers.add_parser("ui", help="Khởi chạy giao diện Web AI Studio Dashboard hiện đại")
-    p_ui.add_argument(
-        "--host", default="127.0.0.1", help="Địa chỉ host máy chủ (mặc định: 127.0.0.1)"
-    )
-    p_ui.add_argument("--port", type=int, default=8000, help="Cổng dịch vụ (mặc định: 8000)")
-    p_ui.add_argument("--reload", action="store_true", help="Tự động nạp lại mã nguồn khi sửa đổi")
+    p_ui = subparsers.add_parser("ui", help="Khởi chạy giao diện Web AI Studio Dashboard")
+    p_ui.add_argument("--host", default="127.0.0.1", help="Địa chỉ host máy chủ")
+    p_ui.add_argument("--port", type=int, default=8000, help="Cổng dịch vụ")
+    p_ui.add_argument("--reload", action="store_true", help="Tự động nạp lại mã nguồn")
     p_ui.set_defaults(func=cmd_ui)
+    return parser
 
+
+def main() -> None:
+    parser = build_parser()
     args = parser.parse_args()
-
     if not args.command:
         parser.print_help()
         return
@@ -440,13 +333,13 @@ def main() -> None:
         args.func(args)
     except KeyboardInterrupt:
         logger.info("\n🛑 Đã nhận tín hiệu ngắt (Ctrl+C). Đang thoát chương trình an toàn...")
-        sys.exit(0)
-    except AIEngineError as e:
-        logger.error(f"❌ [Lỗi Hệ Thống]: {e}")
-        sys.exit(1)
-    except Exception as e:
-        logger.exception(f"❌ [Lỗi Không Mong Muốn]: {e}")
-        sys.exit(1)
+        raise SystemExit(0)
+    except AIEngineError as exc:
+        logger.error("❌ [Lỗi Hệ Thống]: %s", exc)
+        raise SystemExit(1)
+    except Exception as exc:
+        logger.exception("❌ [Lỗi Không Mong Muốn]: %s", exc)
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":

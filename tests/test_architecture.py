@@ -210,3 +210,24 @@ def test_frontend_vram_budget_type_uses_backend_runtime_field_names() -> None:
     assert "effective_precision: string;" in source
     assert "effective_optimizer: string;" in source
     assert "fallback_reasons: string[];" in source
+
+
+def test_architecture_guardian_keeps_ui_adapters_out_of_inner_modules(tmp_path):
+    src_dir = tmp_path / "src"
+    ui_dir = src_dir / "ui"
+    core_dir = src_dir / "core"
+    ui_dir.mkdir(parents=True)
+    core_dir.mkdir(parents=True)
+    for folder in (src_dir, ui_dir, core_dir):
+        (folder / "__init__.py").write_text("", encoding="utf-8")
+    (ui_dir / "bad.py").write_text(
+        "from src.core.config import EngineConfig\n",
+        encoding="utf-8",
+    )
+
+    violations = check_architecture_boundaries(str(src_dir))
+
+    assert any(
+        violation["rule_scope"] == "src.ui" and violation["forbidden_rule"] == "src.core"
+        for violation in violations
+    )

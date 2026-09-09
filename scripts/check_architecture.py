@@ -35,6 +35,8 @@ FORBIDDEN_DEPENDENCIES: Dict[str, List[str]] = {
         "src.generation",
         "src.utils",
         "src.ui",
+        "src.application",
+        "src.adapters",
     ],
     # Tầng Models: Chỉ phụ thuộc Core & Utils, không biết gì về Data hay Training/Generation/UI
     "src.models": [
@@ -70,7 +72,21 @@ FORBIDDEN_DEPENDENCIES: Dict[str, List[str]] = {
         "src.training",
         "src.generation",
         "src.ui",
+        "src.application",
+        "src.adapters",
     ],
+    # Application orchestrates inner capabilities but never knows transport/UI adapters.
+    "src.application": ["src.ui", "src.adapters"],
+    # UI is an outer adapter: it may depend on application/adapters, never inner capabilities.
+    "src.ui": [
+        "src.core",
+        "src.data",
+        "src.models",
+        "src.training",
+        "src.generation",
+        "src.utils",
+    ],
+    # Adapters must not be imported by inner modules; adapter-specific rules live on concrete trees.
 }
 
 
@@ -166,10 +182,13 @@ def check_architecture_boundaries(
 
             # Tìm xem source_module thuộc nhóm quy tắc nào
             matched_rule_source = None
-            for rule_src in FORBIDDEN_DEPENDENCIES.keys():
-                if source_module == rule_src or source_module.startswith(rule_src + "."):
-                    matched_rule_source = rule_src
-                    break
+            matching_rules = [
+                rule_src
+                for rule_src in FORBIDDEN_DEPENDENCIES
+                if source_module == rule_src or source_module.startswith(rule_src + ".")
+            ]
+            if matching_rules:
+                matched_rule_source = max(matching_rules, key=len)
 
             if not matched_rule_source:
                 continue

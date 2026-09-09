@@ -197,7 +197,7 @@ export const TrainingConfigFormWidget: React.FC<
 						onChange={(e) =>
 							updateField(
 								"learning_rate",
-								parseFloat(e.target.value) || 0.0003,
+								parseFloat(e.target.value) || form.learning_rate,
 							)
 						}
 					/>
@@ -209,7 +209,7 @@ export const TrainingConfigFormWidget: React.FC<
 						onChange={(e) =>
 							updateField(
 								"max_iters",
-								parseInt(e.target.value, 10) || 3000,
+								parseInt(e.target.value, 10) || form.max_iters,
 							)
 						}
 					/>

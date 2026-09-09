@@ -24,7 +24,6 @@ export {
 	applyResumeToTrainingForm,
 	applyTrainingScenarioOverrides,
 	applyTrainingScenarioUpdate,
-	DEFAULT_TRAINING_CONFIG_PATH,
 	resolvedConfigToTrainingForm,
 	shouldApplyTrainingScenario,
 	buildTrainingOverrides,

@@ -115,9 +115,7 @@ function AIStudioContent() {
 					onTabChange={(tab) => setActiveTab(tab)}
 					isTraining={isTraining}
 					activeCheckpoint={activeCheckpoint}
-					onOpenConfig={() =>
-						configEditor.openConfig("configs/truyen_kieu.yaml")
-					}
+					onOpenConfig={() => configEditor.openConfig()}
 					onNewSession={handleNewSession}
 					isCollapsed={isSidebarCollapsed}
 					onToggleCollapse={() =>

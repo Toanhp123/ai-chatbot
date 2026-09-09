@@ -326,18 +326,21 @@ def test_training_start_reuses_preflight_runtime_plan_for_worker() -> None:
     app.state.training_service.start_training = start_training_mock
 
     with (
-        patch("src.core.config.EngineConfig.from_yaml", return_value=config),
-        patch("src.core.runtime.resolve_training_plan", return_value=runtime_plan) as resolve_mock,
+        patch(
+            "src.application.training.service.resolve_training_plan", return_value=runtime_plan
+        ) as resolve_mock,
         TestClient(app) as local_client,
     ):
         response = local_client.post(
             "/api/training/start",
-            json={"config_path": "configs/unused.yaml", "run_name": "runtime_plan_test"},
+            json={"run_name": "runtime_plan_test"},
         )
 
     assert response.status_code == 200
-    resolve_mock.assert_called_once_with(config)
-    assert start_training_mock.call_args.kwargs["runtime_plan"] is runtime_plan
+    resolve_mock.assert_called_once()
+    started_plan = start_training_mock.call_args.kwargs["plan"]
+    assert started_plan.runtime_plan is runtime_plan
+    assert started_plan.requested_config.training.run_name == "runtime_plan_test"
 
 
 def test_ui_check_feasibility(client: TestClient):
@@ -842,14 +845,12 @@ def test_training_start_accepts_canonical_dotted_overrides_without_schema_copy()
     app.state.training_service.start_training = start_mock
 
     with (
-        patch("src.core.config.EngineConfig.from_yaml", return_value=config) as config_mock,
-        patch("src.core.runtime.resolve_training_plan", return_value=runtime_plan),
+        patch("src.application.training.service.resolve_training_plan", return_value=runtime_plan),
         TestClient(app) as local_client,
     ):
         response = local_client.post(
             "/api/training/start",
             json={
-                "config_path": "configs/unused.yaml",
                 "overrides": {
                     "training.optimizer_type": "sgd",
                     "training.batch_size": 7,
@@ -860,13 +861,12 @@ def test_training_start_accepts_canonical_dotted_overrides_without_schema_copy()
         )
 
     assert response.status_code == 200
-    passed_overrides = start_mock.call_args.kwargs["overrides"]
-    assert "training.optimizer_type=sgd" in passed_overrides
-    assert "training.batch_size=7" in passed_overrides
-    assert "model.n_layer=3" in passed_overrides
-    # Legacy top-level fields are translated by the same compatibility table.
-    assert "training.run_name=compat_name" in passed_overrides
-    assert config_mock.call_args.kwargs["overrides"] == passed_overrides
+    started_plan = start_mock.call_args.kwargs["plan"]
+    assert started_plan.requested_config.training.optimizer_type == "sgd"
+    assert started_plan.requested_config.training.batch_size == 7
+    assert started_plan.requested_config.model.n_layer == 3
+    # Legacy top-level fields are normalized before the application boundary.
+    assert started_plan.requested_config.training.run_name == "compat_name"
 
 
 def test_training_start_rejects_unknown_canonical_override_key_before_worker_start():
@@ -1058,12 +1058,8 @@ def test_training_start_preserves_run_name_from_resolved_yaml(tmp_path, monkeypa
         )
 
     assert response.status_code == 200
-    snapshot = start_mock.call_args.kwargs["config_snapshot"]
-    assert snapshot.training.run_name == "yaml_run"
-    assert not any(
-        override.startswith("training.run_name=")
-        for override in (start_mock.call_args.kwargs.get("overrides") or [])
-    )
+    started_plan = start_mock.call_args.kwargs["plan"]
+    assert started_plan.requested_config.training.run_name == "yaml_run"
 
 
 def test_create_app_bootstraps_inference_from_canonical_engine_config(tmp_path, monkeypatch):
@@ -1259,7 +1255,7 @@ def test_explorer_dataset_sample_serializes_paths_with_stable_forward_slashes(
     )
     try:
         service.apply_engine_config(cfg)
-        monkeypatch.setattr("src.ui.routes.explorer.os.path.isfile", lambda _path: False)
+        monkeypatch.setattr("src.application.explorer.service.os.path.isfile", lambda _path: False)
         res = client.get("/api/explorer/dataset-sample")
         assert res.status_code == 200
         data = res.json()
@@ -1532,7 +1528,7 @@ def test_vram_scenarios_use_requested_canonical_device(client: TestClient, monke
         }
 
     monkeypatch.setattr(
-        "src.core.diagnostics.estimator.analyze_vram_scenarios",
+        "src.application.diagnostics.service.analyze_vram_scenarios",
         fake_analyze_vram_scenarios,
     )
 
@@ -1543,10 +1539,10 @@ def test_vram_scenarios_use_requested_canonical_device(client: TestClient, monke
 
 
 def test_auto_training_run_names_are_collision_resistant():
-    from src.ui.routes.training import _generate_run_name
+    from src.application.training import generate_run_name
 
-    first = _generate_run_name()
-    second = _generate_run_name()
+    first = generate_run_name()
+    second = generate_run_name()
 
     assert first.startswith("kieu_")
     assert second.startswith("kieu_")
@@ -1578,9 +1574,11 @@ def test_ui_training_start_prepares_inference_residency_before_gpu_training(
         effective_batch_size=1,
         gradient_checkpointing=False,
     )
-    monkeypatch.setattr("src.core.runtime.resolve_training_plan", lambda config: plan)
     monkeypatch.setattr(
-        "src.core.diagnostics.estimator.check_memory_feasibility",
+        "src.application.training.service.resolve_training_plan", lambda config: plan
+    )
+    monkeypatch.setattr(
+        "src.application.training.service.check_memory_feasibility",
         lambda **kwargs: (True, "ok", {"total_estimated_gb": 0.1, "total_estimated_mb": 100}),
     )
     monkeypatch.setattr(
@@ -1592,7 +1590,7 @@ def test_ui_training_start_prepares_inference_residency_before_gpu_training(
     monkeypatch.setattr(
         training_service,
         "start_training",
-        lambda *args, **kwargs: calls.append(("start", kwargs["runtime_plan"].device)),
+        lambda *args, **kwargs: calls.append(("start", kwargs["plan"].runtime_plan.device)),
     )
     monkeypatch.setattr(inference_service, "apply_engine_config", lambda config: None)
 
@@ -1633,9 +1631,11 @@ def test_ui_training_start_pins_resume_checkpoint_revision(
         effective_batch_size=1,
         gradient_checkpointing=False,
     )
-    monkeypatch.setattr("src.core.runtime.resolve_training_plan", lambda config: plan)
     monkeypatch.setattr(
-        "src.core.diagnostics.estimator.check_memory_feasibility",
+        "src.application.training.service.resolve_training_plan", lambda config: plan
+    )
+    monkeypatch.setattr(
+        "src.application.training.service.check_memory_feasibility",
         lambda **kwargs: (True, "ok", {"total_estimated_gb": 0.1, "total_estimated_mb": 100}),
     )
     monkeypatch.setattr(inference_service, "prepare_for_training", lambda device: False)
@@ -1655,7 +1655,7 @@ def test_ui_training_start_pins_resume_checkpoint_revision(
     )
 
     assert response.status_code == 200
-    assert captured["resume_checkpoint_identity"] == expected
+    assert captured["plan"].resume_checkpoint_identity == expected
 
 
 def test_ui_training_start_reports_resume_disappeared_during_revision_pin(

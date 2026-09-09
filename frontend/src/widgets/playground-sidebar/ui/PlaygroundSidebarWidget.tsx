@@ -143,11 +143,7 @@ export const PlaygroundSidebarWidget: React.FC<
 						step={0.05}
 						value={params.temperature}
 						onChange={(val) => updateParam("temperature", val)}
-						valueDisplay={
-							typeof params.temperature === "number"
-								? params.temperature.toFixed(2)
-								: "0.80"
-						}
+						valueDisplay={params.temperature.toFixed(2)}
 					/>
 
 					{/* Top-P Slider */}
@@ -158,11 +154,7 @@ export const PlaygroundSidebarWidget: React.FC<
 						step={0.05}
 						value={params.topP}
 						onChange={(val) => updateParam("topP", val)}
-						valueDisplay={
-							typeof params.topP === "number"
-								? params.topP.toFixed(2)
-								: "0.90"
-						}
+						valueDisplay={params.topP.toFixed(2)}
 					/>
 
 					{/* Min-P Slider */}
@@ -173,11 +165,7 @@ export const PlaygroundSidebarWidget: React.FC<
 						step={0.01}
 						value={params.minP}
 						onChange={(val) => updateParam("minP", val)}
-						valueDisplay={
-							typeof params.minP === "number"
-								? params.minP.toFixed(2)
-								: "0.05"
-						}
+						valueDisplay={params.minP.toFixed(2)}
 					/>
 
 					{/* Top-K Slider */}
@@ -200,11 +188,7 @@ export const PlaygroundSidebarWidget: React.FC<
 						onChange={(val) =>
 							updateParam("repetitionPenalty", val)
 						}
-						valueDisplay={
-							typeof params.repetitionPenalty === "number"
-								? params.repetitionPenalty.toFixed(2)
-								: "1.10"
-						}
+						valueDisplay={params.repetitionPenalty.toFixed(2)}
 					/>
 
 					{/* Max New Tokens Slider */}

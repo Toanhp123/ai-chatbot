@@ -11,14 +11,14 @@ export interface SaveConfigResponse {
 }
 
 export const configApi = {
-	getRawConfig: (path: string) =>
+	getRawConfig: (path?: string) =>
 		request<RawConfigResponse>(
-			`/api/configs/raw?path=${encodeURIComponent(path)}`,
+			path ? `/api/configs/raw?path=${encodeURIComponent(path)}` : "/api/configs/raw",
 		),
 
-	saveRawConfig: (path: string, content: string) =>
+	saveRawConfig: (path: string | undefined, content: string) =>
 		request<SaveConfigResponse>("/api/configs/save", {
 			method: "POST",
-			body: JSON.stringify({ path, content }),
+			body: JSON.stringify({ path: path || undefined, content }),
 		}),
 };

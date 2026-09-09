@@ -27,7 +27,7 @@ test("resolved config hydrates visible training form from canonical server value
   const form = resolvedConfigToTrainingForm(resolved, "checkpoints/resume.pt");
 
   assert.deepEqual(form, {
-    config_path: "configs/truyen_kieu.yaml",
+    config_path: "",
     model_name: "llama_nano",
     batch_size: 17,
     learning_rate: 0.00012,
@@ -161,4 +161,18 @@ test("model inspector hydrates canonical model on config revisions before user o
 	assert.equal(widget.includes("configRevision?: number"), true);
 	assert.equal(page.includes("<ModelInspectorWidget configRevision={configRevision}"), true);
 	assert.equal(api.includes("modelName?: string"), true);
+});
+
+test("training UI has no fabricated canonical form before hydration", async () => {
+  const { readFile } = await import("node:fs/promises");
+  const hook = await readFile(trainingDashboardHookUrl, "utf8");
+  const widget = await readFile(
+    new URL("../src/widgets/training-config-form/ui/TrainingConfigFormWidget.tsx", import.meta.url),
+    "utf8",
+  );
+
+  assert.equal(hook.includes("FALLBACK_FORM"), false);
+  assert.equal(hook.includes("useState<TrainingConfigForm | null>(null)"), true);
+  assert.equal(widget.includes("|| 0.0003"), false);
+  assert.equal(widget.includes("|| 3000"), false);
 });

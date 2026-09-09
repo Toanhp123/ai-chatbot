@@ -61,3 +61,24 @@ test("unhydrated playground never leaks visual fallback sampling defaults into b
     use_cache: true,
   });
 });
+
+test("playground has no fabricated sampling or backend defaults before canonical hydration", async () => {
+  const { readFile } = await import("node:fs/promises");
+  const hook = await readFile(
+    new URL("../src/pages/playground/model/usePlayground.ts", import.meta.url),
+    "utf8",
+  );
+  const sidebar = await readFile(
+    new URL("../src/widgets/playground-sidebar/ui/PlaygroundSidebarWidget.tsx", import.meta.url),
+    "utf8",
+  );
+
+  assert.equal(hook.includes("useState<SamplingHyperparams | null>(null)"), true);
+  assert.equal(hook.includes("temperature: 0.8"), false);
+  assert.equal(hook.includes("maxNewTokens: 128"), false);
+  assert.equal(hook.includes('["default", "local", "pytorch"]'), false);
+  assert.equal(sidebar.includes('"0.80"'), false);
+  assert.equal(sidebar.includes('"0.90"'), false);
+  assert.equal(sidebar.includes('"0.05"'), false);
+  assert.equal(sidebar.includes('"1.10"'), false);
+});

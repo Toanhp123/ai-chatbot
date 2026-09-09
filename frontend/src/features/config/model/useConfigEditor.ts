@@ -3,18 +3,19 @@ import { configApi } from "../api/configApi";
 
 export function useConfigEditor() {
 	const [isOpen, setIsOpen] = useState(false);
-	const [path, setPath] = useState("configs/truyen_kieu.yaml");
+	const [path, setPath] = useState("");
 	const [content, setContent] = useState("");
 	const [isLoading, setIsLoading] = useState(false);
 	const [isSaving, setIsSaving] = useState(false);
 
-	const openConfig = useCallback(async (configPath: string) => {
-		setPath(configPath);
+	const openConfig = useCallback(async (configPath?: string) => {
+		setPath(configPath ?? "");
 		setIsOpen(true);
 		setIsLoading(true);
 		const startTime = Date.now();
 		try {
 			const data = await configApi.getRawConfig(configPath);
+			setPath(data.path);
 			setContent(data.content);
 		} catch (err: unknown) {
 			const error = err as Error;

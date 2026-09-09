@@ -71,19 +71,25 @@ export const PlaygroundPage: React.FC<PlaygroundPageProps> = ({
 				title="Cài Đặt Siêu Tham Số Sinh Từ"
 				subtitle="Tùy chỉnh nhiệt độ, nhân suy luận và bộ kiểm soát lặp từ"
 			>
-				<PlaygroundSidebarWidget
-					checkpoints={checkpoints}
-					selectedCheckpoint={selectedCheckpoint}
-					onSelectCheckpoint={setSelectedCheckpoint}
-					onLoadCheckpoint={handleLoadCheckpoint}
-					isLoadingCheckpoint={isLoadingCp}
-					generators={generators}
-					selectedGenerator={selectedGenerator}
-					onSelectGenerator={handleSelectGenerator}
-					params={params}
-					onParamsChange={setParams}
-					isGenerating={isGenerating}
-				/>
+				{params ? (
+					<PlaygroundSidebarWidget
+						checkpoints={checkpoints}
+						selectedCheckpoint={selectedCheckpoint}
+						onSelectCheckpoint={setSelectedCheckpoint}
+						onLoadCheckpoint={handleLoadCheckpoint}
+						isLoadingCheckpoint={isLoadingCp}
+						generators={generators}
+						selectedGenerator={selectedGenerator}
+						onSelectGenerator={handleSelectGenerator}
+						params={params}
+						onParamsChange={setParams}
+						isGenerating={isGenerating}
+					/>
+				) : (
+					<div className="py-10 text-center text-sm text-stone-500">
+						Đang nạp cấu hình generation canonical...
+					</div>
+				)}
 			</Drawer>
 		</div>
 	);

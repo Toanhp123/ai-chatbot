@@ -28,23 +28,23 @@ def test_abort_before_trainer_creation_does_not_deadlock():
             return_value=config,
         ),
         patch(
-            "src.ui.services.training_service.DataPipeline.setup_data",
+            "src.application.training.run.DataPipeline.setup_data",
             return_value=(torch.arange(64), torch.arange(32), tokenizer),
         ),
         patch(
-            "src.ui.services.training_service.get_batch_provider",
+            "src.application.training.run.get_batch_provider",
             return_value=batch_provider,
         ),
         patch(
-            "src.ui.services.training_service.ModelRegistry.create",
+            "src.application.training.run.ModelRegistry.create",
             side_effect=create_model_and_request_abort,
         ),
         patch(
-            "src.ui.services.training_service.get_generator",
+            "src.application.training.run.get_generator",
             return_value=sample_generator,
         ),
     ):
-        service.start_training(config_path="unused.yaml")
+        service.start_training(config_snapshot=config)
         assert service._thread is not None
         service._thread.join(timeout=1.0)
 
@@ -112,23 +112,23 @@ def test_training_worker_shares_one_runtime_plan_with_generator_and_trainer():
             return_value=config,
         ),
         patch(
-            "src.ui.services.training_service.DataPipeline.setup_data",
+            "src.application.training.run.DataPipeline.setup_data",
             return_value=(torch.arange(64), torch.arange(32), tokenizer),
         ),
         patch(
-            "src.ui.services.training_service.get_batch_provider",
+            "src.application.training.run.get_batch_provider",
             return_value=batch_provider,
         ),
         patch(
-            "src.ui.services.training_service.ModelRegistry.create",
+            "src.application.training.run.ModelRegistry.create",
             return_value=model,
         ),
         patch(
-            "src.ui.services.training_service.get_generator",
+            "src.application.training.run.get_generator",
             return_value=sample_generator,
         ) as get_generator_mock,
         patch(
-            "src.ui.services.training_service.resolve_training_plan",
+            "src.application.training.service.resolve_training_plan",
             return_value=runtime_plan,
             create=True,
         ) as resolve_plan_mock,
@@ -137,9 +137,9 @@ def test_training_worker_shares_one_runtime_plan_with_generator_and_trainer():
             return_value="legacy-device",
             create=True,
         ),
-        patch("src.ui.services.training_service.Trainer", FakeTrainer),
+        patch("src.application.training.run.Trainer", FakeTrainer),
     ):
-        service.start_training(config_path="unused.yaml")
+        service.start_training(config_snapshot=config)
         assert service._thread is not None
         service._thread.join(timeout=1.0)
 
@@ -199,28 +199,28 @@ def _run_fake_training_service(service, termination_reason, before_return=None):
             return_value=config,
         ),
         patch(
-            "src.ui.services.training_service.DataPipeline.setup_data",
+            "src.application.training.run.DataPipeline.setup_data",
             return_value=(torch.arange(64), torch.arange(32), tokenizer),
         ),
         patch(
-            "src.ui.services.training_service.get_batch_provider",
+            "src.application.training.run.get_batch_provider",
             return_value=batch_provider,
         ),
         patch(
-            "src.ui.services.training_service.ModelRegistry.create",
+            "src.application.training.run.ModelRegistry.create",
             return_value=model,
         ),
         patch(
-            "src.ui.services.training_service.get_generator",
+            "src.application.training.run.get_generator",
             return_value=sample_generator,
         ),
         patch(
-            "src.ui.services.training_service.resolve_training_plan",
+            "src.application.training.service.resolve_training_plan",
             return_value=runtime_plan,
         ),
-        patch("src.ui.services.training_service.Trainer", FakeTrainer),
+        patch("src.application.training.run.Trainer", FakeTrainer),
     ):
-        service.start_training(config_path="unused.yaml")
+        service.start_training(config_snapshot=config, runtime_plan=runtime_plan)
         assert service._thread is not None
         service._thread.join(timeout=1.0)
         assert not service._thread.is_alive()
@@ -381,13 +381,13 @@ def test_training_worker_uses_resolved_config_snapshot_without_rereading_yaml():
             side_effect=AssertionError("worker must not re-read mutable YAML"),
         ),
         patch(
-            "src.ui.services.training_service.DataPipeline.setup_data",
+            "src.application.training.run.DataPipeline.setup_data",
             return_value=(torch.arange(64), torch.arange(32), tokenizer),
         ),
-        patch("src.ui.services.training_service.get_batch_provider", return_value=Mock()),
-        patch("src.ui.services.training_service.ModelRegistry.create", return_value=model),
-        patch("src.ui.services.training_service.get_generator", return_value=Mock()),
-        patch("src.ui.services.training_service.Trainer", FakeTrainer),
+        patch("src.application.training.run.get_batch_provider", return_value=Mock()),
+        patch("src.application.training.run.ModelRegistry.create", return_value=model),
+        patch("src.application.training.run.get_generator", return_value=Mock()),
+        patch("src.application.training.run.Trainer", FakeTrainer),
     ):
         service.start_training(config_snapshot=config, runtime_plan=runtime_plan)
         assert service._thread is not None
@@ -430,11 +430,11 @@ def test_training_service_defensively_copies_config_snapshot_before_worker_runs(
             )
 
     with (
-        patch("src.ui.services.training_service.DataPipeline.setup_data", side_effect=setup_data),
-        patch("src.ui.services.training_service.get_batch_provider", return_value=Mock()),
-        patch("src.ui.services.training_service.ModelRegistry.create", return_value=Mock()),
-        patch("src.ui.services.training_service.get_generator", return_value=Mock()),
-        patch("src.ui.services.training_service.Trainer", FakeTrainer),
+        patch("src.application.training.run.DataPipeline.setup_data", side_effect=setup_data),
+        patch("src.application.training.run.get_batch_provider", return_value=Mock()),
+        patch("src.application.training.run.ModelRegistry.create", return_value=Mock()),
+        patch("src.application.training.run.get_generator", return_value=Mock()),
+        patch("src.application.training.run.Trainer", FakeTrainer),
     ):
         service.start_training(config_snapshot=config, runtime_plan=runtime_plan)
         # Mutation after submission must not affect the worker snapshot.
@@ -516,7 +516,7 @@ def test_training_releases_accelerator_after_worker_failure():
     config = EngineConfig().copy(system=EngineConfig().system.copy(device="cuda"))
 
     with patch(
-        "src.ui.services.training_service.DataPipeline.setup_data",
+        "src.application.training.run.DataPipeline.setup_data",
         side_effect=RuntimeError("synthetic startup failure"),
     ):
         service.start_training(config_snapshot=config, runtime_plan=_cuda_plan_for_test())
@@ -600,22 +600,22 @@ def test_training_sample_generation_uses_canonical_generation_config():
 
     with (
         patch(
-            "src.ui.services.training_service.DataPipeline.setup_data",
+            "src.application.training.run.DataPipeline.setup_data",
             return_value=(torch.arange(64), torch.arange(32), tokenizer),
         ),
         patch(
-            "src.ui.services.training_service.get_batch_provider",
+            "src.application.training.run.get_batch_provider",
             return_value=batch_provider,
         ),
         patch(
-            "src.ui.services.training_service.ModelRegistry.create",
+            "src.application.training.run.ModelRegistry.create",
             return_value=model,
         ),
         patch(
-            "src.ui.services.training_service.get_generator",
+            "src.application.training.run.get_generator",
             return_value=sample_generator,
         ),
-        patch("src.ui.services.training_service.Trainer", FakeTrainer),
+        patch("src.application.training.run.Trainer", FakeTrainer),
     ):
         service.start_training(config_snapshot=config, runtime_plan=runtime_plan)
         assert service._thread is not None
@@ -654,13 +654,13 @@ def test_training_service_forwards_pinned_resume_identity_to_trainer():
 
     with (
         patch(
-            "src.ui.services.training_service.DataPipeline.setup_data",
+            "src.application.training.run.DataPipeline.setup_data",
             return_value=(torch.arange(64), torch.arange(32), Mock(vocab_size=32)),
         ),
-        patch("src.ui.services.training_service.get_batch_provider", return_value=Mock()),
-        patch("src.ui.services.training_service.ModelRegistry.create", return_value=Mock()),
-        patch("src.ui.services.training_service.get_generator", return_value=Mock()),
-        patch("src.ui.services.training_service.Trainer", FakeTrainer),
+        patch("src.application.training.run.get_batch_provider", return_value=Mock()),
+        patch("src.application.training.run.ModelRegistry.create", return_value=Mock()),
+        patch("src.application.training.run.get_generator", return_value=Mock()),
+        patch("src.application.training.run.Trainer", FakeTrainer),
     ):
         service.start_training(
             config_snapshot=config,

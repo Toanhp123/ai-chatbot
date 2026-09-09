@@ -13,9 +13,9 @@ export const trainingApi = {
 			skipCache: true,
 		}),
 
-	getResolvedConfig: (path: string) =>
+	getResolvedConfig: (path?: string) =>
 		request<ResolvedTrainingConfig>(
-			`/api/training/config?path=${encodeURIComponent(path)}`,
+			path ? `/api/training/config?path=${encodeURIComponent(path)}` : "/api/training/config",
 			{ skipCache: true },
 		),
 

@@ -3,7 +3,6 @@ import {
 	applyResumeToTrainingForm,
 	applyTrainingScenarioUpdate,
 	isLatestRequest,
-	DEFAULT_TRAINING_CONFIG_PATH,
 	resolvedConfigToTrainingForm,
 	shouldApplyTrainingScenario,
 	trainingApi,
@@ -15,19 +14,6 @@ import type {
 	TrainingScenarioUpdate,
 } from "@/entities/training";
 import type { Checkpoint } from "@/entities/checkpoint";
-
-const FALLBACK_FORM: TrainingConfigForm = {
-	config_path: DEFAULT_TRAINING_CONFIG_PATH,
-	model_name: "minigpt",
-	batch_size: 64,
-	learning_rate: 0.0003,
-	max_iters: 3000,
-	precision: "float32",
-	optimizer_type: "adamw",
-	gradient_accumulation_steps: 1,
-	gradient_checkpointing: false,
-	resume_checkpoint: "",
-};
 
 export function useTrainingDashboard(
 	configRevision = 0,
@@ -53,7 +39,7 @@ export function useTrainingDashboard(
 		clearTraining,
 	} = useTrainingControls();
 
-	const [form, setForm] = useState<TrainingConfigForm>(FALLBACK_FORM);
+	const [form, setForm] = useState<TrainingConfigForm | null>(null);
 	const [dirtyFields, setDirtyFields] = useState<Set<TrainingOverrideField>>(
 		new Set(),
 	);
@@ -63,7 +49,7 @@ export function useTrainingDashboard(
 	}>({ revision: -1, error: null });
 	const [resumeTarget, setResumeTarget] = useState<Checkpoint | null>(null);
 	const resumeTargetRef = useRef<Checkpoint | null>(null);
-	const formRef = useRef<TrainingConfigForm>(form);
+	const formRef = useRef<TrainingConfigForm | null>(form);
 	const dirtyFieldsRef = useRef<Set<TrainingOverrideField>>(dirtyFields);
 	formRef.current = form;
 	dirtyFieldsRef.current = dirtyFields;
@@ -79,9 +65,7 @@ export function useTrainingDashboard(
 	const loadCanonicalConfig = useCallback(async () => {
 		const requestId = ++configLoadRequestRef.current;
 		try {
-			const config = await trainingApi.getResolvedConfig(
-				DEFAULT_TRAINING_CONFIG_PATH,
-			);
+			const config = await trainingApi.getResolvedConfig();
 			if (!isLatestRequest(requestId, configLoadRequestRef.current))
 				return;
 
@@ -138,8 +122,10 @@ export function useTrainingDashboard(
 			configLoadState.error !== null
 		)
 			return;
+		const currentForm = formRef.current;
+		if (!currentForm) return;
 		const applied = applyTrainingScenarioUpdate(
-			formRef.current,
+			currentForm,
 			externalScenario,
 			appliedScenarioRevisionRef.current,
 		);
@@ -202,13 +188,18 @@ export function useTrainingDashboard(
 			if (!cp || !cp.path) {
 				resumeTargetRef.current = null;
 				setResumeTarget(null);
-				setForm((prev) => ({ ...prev, resume_checkpoint: "" }));
+				setForm((prev) =>
+				prev ? { ...prev, resume_checkpoint: "" } : prev,
+			);
 				return;
 			}
 
 			resumeTargetRef.current = cp;
 			setResumeTarget(cp);
-			const effective = applyResumeToTrainingForm(form, cp.path, cp.step);
+			const currentForm = formRef.current;
+			if (!currentForm) return;
+			const effective = applyResumeToTrainingForm(currentForm, cp.path, cp.step);
+			formRef.current = effective.form;
 			setForm(effective.form);
 			if (effective.overrideFields.length > 0) {
 				setDirtyFields((fields) => {
@@ -219,18 +210,23 @@ export function useTrainingDashboard(
 				});
 			}
 		},
-		[form],
+		[],
 	);
 
 	const handleCancelResume = useCallback(() => {
 		resumeTargetRef.current = null;
 		setResumeTarget(null);
-		setForm((prev) => ({ ...prev, resume_checkpoint: "" }));
+		setForm((prev) => {
+			const next = prev ? { ...prev, resume_checkpoint: "" } : prev;
+			formRef.current = next;
+			return next;
+		});
 	}, []);
 
 	const handleStart = async () => {
 		if (
 			!isConfigReady ||
+			!form ||
 			isConfigLoading ||
 			isStarting ||
 			isStopping ||
@@ -287,7 +283,9 @@ export function useTrainingDashboard(
 			await clearTraining();
 			resumeTargetRef.current = null;
 			setResumeTarget(null);
-			setForm((prev) => ({ ...prev, resume_checkpoint: "" }));
+			setForm((prev) =>
+				prev ? { ...prev, resume_checkpoint: "" } : prev,
+			);
 		} catch (err: unknown) {
 			const error = err as Error;
 			alert(`Lỗi làm mới trạng thái huấn luyện: ${error.message}`);

@@ -7,8 +7,6 @@ import type {
 	TrainingScenarioUpdate,
 } from "./types";
 
-export const DEFAULT_TRAINING_CONFIG_PATH = "configs/truyen_kieu.yaml";
-
 const OVERRIDE_PATHS: Record<TrainingOverrideField, string> = {
 	model_name: "model.name",
 	batch_size: "training.batch_size",
@@ -25,7 +23,7 @@ export function resolvedConfigToTrainingForm(
 	resumeCheckpoint = "",
 ): TrainingConfigForm {
 	return {
-		config_path: DEFAULT_TRAINING_CONFIG_PATH,
+		config_path: "",
 		model_name: config.model.name,
 		batch_size: config.training.batch_size,
 		learning_rate: config.training.learning_rate,

@@ -9,18 +9,22 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 
-from src.core.config import EngineConfig
-from src.core.logging import get_logger
+from src.adapters.config import YamlConfigProvider
+from src.application.config import ConfigurationService
+from src.application.diagnostics import DiagnosticsApplicationService
+from src.application.explorer import ExplorerApplicationService
+from src.application.inference import InferenceService
+from src.application.runtime import AcceleratorCoordinator
+from src.application.training import (
+    TrainingApplicationService,
+    TrainingLaunchApplicationService,
+    TrainingService,
+)
 from src.ui.errors import register_ai_engine_error_handlers
 from src.ui.routes.diagnostics import router as diagnostics_router
 from src.ui.routes.explorer import router as explorer_router
 from src.ui.routes.inference import router as inference_router
 from src.ui.routes.training import router as training_router
-from src.ui.services.accelerator_coordinator import AcceleratorCoordinator
-from src.ui.services.inference_service import InferenceService
-from src.ui.services.training_service import TrainingService
-
-logger = get_logger("UIApp")
 
 
 def create_app() -> FastAPI:
@@ -41,19 +45,30 @@ def create_app() -> FastAPI:
         allow_headers=["*"],
     )
 
-    # Bootstrap services from the same canonical EngineConfig used by the UI/trainer.
-    config_path = os.path.realpath(os.path.abspath("configs/truyen_kieu.yaml"))
-    boot_config = (
-        EngineConfig.from_yaml(config_path) if os.path.isfile(config_path) else EngineConfig()
-    )
-    app.state.config_path = config_path
+    # One composition root: adapters provide config I/O, application services own use cases.
+    config_provider = YamlConfigProvider()
+    config_service = ConfigurationService(config_provider)
+    boot_config = config_service.activate(config_service.resolve())
+    app.state.configuration_service = config_service
+    app.state.config_path = os.path.realpath(os.path.abspath(config_service.default_path))
     app.state.accelerator_coordinator = AcceleratorCoordinator()
     app.state.inference_service = InferenceService.from_engine_config(
-        boot_config, accelerator_coordinator=app.state.accelerator_coordinator
+        boot_config,
+        accelerator_coordinator=app.state.accelerator_coordinator,
+        config_service=config_service,
     )
+    app.state.training_application = TrainingApplicationService(config_service)
     app.state.training_service = TrainingService(
-        accelerator_coordinator=app.state.accelerator_coordinator
+        accelerator_coordinator=app.state.accelerator_coordinator,
+        training_application=app.state.training_application,
     )
+    app.state.training_launch_service = TrainingLaunchApplicationService(
+        training_service=app.state.training_service,
+        inference_service=app.state.inference_service,
+        config_service=config_service,
+    )
+    app.state.diagnostics_service = DiagnosticsApplicationService(config_service)
+    app.state.explorer_service = ExplorerApplicationService(config_service)
 
     # Đăng ký các Route API
     app.include_router(inference_router)

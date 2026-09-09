@@ -25,32 +25,20 @@ export function usePlayground({
 	const [selectedCheckpoint, setSelectedCheckpoint] = useState<string>(
 		activeCheckpoint || "",
 	);
-	const [generators, setGenerators] = useState<string[]>([
-		"default",
-		"local",
-		"pytorch",
-	]);
-	const [selectedGenerator, setSelectedGenerator] =
-		useState<string>("default");
+	const [generators, setGenerators] = useState<string[]>([]);
+	const [selectedGenerator, setSelectedGenerator] = useState<string>("");
 	const [isLoadingCp, setIsLoadingCp] = useState<boolean>(false);
-	const [samplingHydratedRevision, setSamplingHydratedRevision] = useState(-1);
+	const [samplingHydratedRevision, setSamplingHydratedRevision] =
+		useState(-1);
 	const [backendAuthoritative, setBackendAuthoritative] = useState(false);
-	const samplingDirtyFieldsRef = useRef<Set<keyof SamplingHyperparams>>(new Set());
+	const samplingDirtyFieldsRef = useRef<Set<keyof SamplingHyperparams>>(
+		new Set(),
+	);
 	const inferenceStateRequestRef = useRef(0);
 	const checkpointListRequestRef = useRef(0);
 	const backendMutationVersionRef = useRef(0);
 
-	const [params, setParams] = useState<SamplingHyperparams>({
-		temperature: 0.8,
-		topK: 40,
-		topP: 0.9,
-		minP: 0.05,
-		repetitionPenalty: 1.1,
-		maxNewTokens: 128,
-		doSample: true,
-		useCache: true,
-		stopWords: "",
-	});
+	const [params, setParams] = useState<SamplingHyperparams | null>(null);
 
 	const { isGenerating, generatedText, stats, generate, stop, clear } =
 		useGenerateStream();
@@ -68,17 +56,28 @@ export function usePlayground({
 		checkpointApi
 			.getInferenceState()
 			.then((state) => {
-				if (!isMounted || requestId !== inferenceStateRequestRef.current) return;
-				const canonicalParams = generationConfigToSamplingParams(state.generation);
+				if (
+					!isMounted ||
+					requestId !== inferenceStateRequestRef.current
+				)
+					return;
+				const canonicalParams = generationConfigToSamplingParams(
+					state.generation,
+				);
 				setParams((current) => {
+					if (current === null) return canonicalParams;
+
 					const merged = { ...canonicalParams };
 					for (const field of samplingDirtyFieldsRef.current) {
-						(merged as unknown as Record<string, unknown>)[field] = current[field];
+						(merged as unknown as Record<string, unknown>)[field] =
+							current[field];
 					}
 					return merged;
 				});
 				setSamplingHydratedRevision(configRevision);
-				if (backendMutationVersionRef.current === backendVersionAtStart) {
+				if (
+					backendMutationVersionRef.current === backendVersionAtStart
+				) {
 					setSelectedGenerator(state.current_backend);
 					setBackendAuthoritative(true);
 				}
@@ -98,11 +97,18 @@ export function usePlayground({
 		checkpointApi
 			.getCheckpoints()
 			.then((data) => {
-				if (!isMounted || requestId !== checkpointListRequestRef.current) return;
+				if (
+					!isMounted ||
+					requestId !== checkpointListRequestRef.current
+				)
+					return;
 				const list = data.checkpoints || [];
 				setCheckpoints(list);
 				setSelectedCheckpoint((current) => {
-					if (current && list.some((checkpoint) => checkpoint.path === current)) {
+					if (
+						current &&
+						list.some((checkpoint) => checkpoint.path === current)
+					) {
 						return current;
 					}
 					return list[0]?.path ?? "";
@@ -180,8 +186,11 @@ export function usePlayground({
 
 	const handleParamsChange = useCallback((next: SamplingHyperparams) => {
 		setParams((current) => {
+			if (!current) return next;
 			const dirty = new Set(samplingDirtyFieldsRef.current);
-			for (const field of Object.keys(current) as (keyof SamplingHyperparams)[]) {
+			for (const field of Object.keys(
+				current,
+			) as (keyof SamplingHyperparams)[]) {
 				if (current[field] !== next[field]) dirty.add(field);
 			}
 			samplingDirtyFieldsRef.current = dirty;
@@ -195,7 +204,7 @@ export function usePlayground({
 				overridePrompt ??
 				(prompt.trim() || submittedPrompt)
 			).trim();
-			if (!targetPrompt) return;
+			if (!targetPrompt || !params) return;
 
 			if (isGenerating) {
 				stop();
@@ -219,7 +228,9 @@ export function usePlayground({
 				{
 					prompt: targetPrompt,
 					...samplingOverrides,
-					backend: backendAuthoritative ? selectedGenerator : undefined,
+					backend: backendAuthoritative
+						? selectedGenerator
+						: undefined,
 					stop_words: stops.length > 0 ? stops : undefined,
 				},
 				(err) => alert(err),

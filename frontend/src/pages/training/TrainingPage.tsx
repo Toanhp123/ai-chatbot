@@ -106,12 +106,18 @@ export const TrainingPage: React.FC<TrainingPageProps> = ({
 
 				{/* Right Column (5 Cols): Training Config Form */}
 				<div className="lg:col-span-5 flex flex-col">
-					<TrainingConfigFormWidget
-						form={form}
-						onFormChange={setForm}
-						onCheckFeasibility={checkFeasibility}
-						preflightInfo={preflightInfo}
-					/>
+					{form ? (
+						<TrainingConfigFormWidget
+							form={form}
+							onFormChange={setForm}
+							onCheckFeasibility={checkFeasibility}
+							preflightInfo={preflightInfo}
+						/>
+					) : (
+						<div className="h-full min-h-64 rounded-xl border border-stone-300/80 bg-[#faf8f5] flex items-center justify-center text-sm text-stone-500">
+							Đang nạp cấu hình training canonical...
+						</div>
+					)}
 				</div>
 			</div>
 

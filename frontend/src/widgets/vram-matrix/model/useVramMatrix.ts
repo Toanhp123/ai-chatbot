@@ -5,10 +5,7 @@ import type {
 	VramScenariosResponse,
 	VramScenarioItem,
 } from "@/entities/hardware";
-import {
-	DEFAULT_TRAINING_CONFIG_PATH,
-	trainingApi,
-} from "@/entities/training";
+import { trainingApi } from "@/entities/training";
 import type { TrainingScenarioOverrides } from "@/entities/training";
 import { resolvedConfigToVramParams } from "./scenarioMapping";
 
@@ -36,9 +33,7 @@ export function useVramMatrix({
 		setLoading(true);
 		setError(null);
 		try {
-			const config = await trainingApi.getResolvedConfig(
-				DEFAULT_TRAINING_CONFIG_PATH,
-			);
+			const config = await trainingApi.getResolvedConfig();
 			if (requestId !== requestRef.current) return;
 			const canonicalParams = resolvedConfigToVramParams(config);
 			const res = await hardwareApi.getVramScenarios(canonicalParams);
