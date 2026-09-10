@@ -4,7 +4,12 @@ from __future__ import annotations
 
 from typing import Optional
 
-from .contracts import GenerationCommand, GenerationStream
+from .contracts import (
+    GenerationCommand,
+    GenerationStream,
+    InferencePreparationCommand,
+    InferencePreparationResult,
+)
 from .service import InferenceService
 
 
@@ -24,6 +29,9 @@ class InferenceGateway:
 
     def set_vocab_path(self, vocab_path: str) -> None:
         self._service.set_vocab_path(vocab_path)
+
+    def prepare(self, command: InferencePreparationCommand) -> InferencePreparationResult:
+        return self._service.prepare(command)
 
     def get_runtime_state(self) -> dict[str, object]:
         return self._service.get_runtime_state()

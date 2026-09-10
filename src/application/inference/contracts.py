@@ -7,9 +7,10 @@ inference capability.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Callable, Iterator, Mapping, Optional, Protocol, Sequence
 
+from src.application.config.contracts import ConfigRequest
 from src.core.config import GenerationConfig
 
 
@@ -152,11 +153,38 @@ class InferenceTrainingHandoff:
 
 InferenceState = Mapping[str, object]
 
+@dataclass(frozen=True)
+class InferencePreparationCommand:
+    """Adapter-safe command for explicit inference preparation."""
+
+    config_request: ConfigRequest = field(default_factory=ConfigRequest)
+    checkpoint_path: Optional[str] = None
+    vocab_path: Optional[str] = None
+    backend: Optional[str] = None
+    requested_device: Optional[str] = None
+    require_managed_checkpoint: bool = False
+    strict: bool = True
+
+
+@dataclass(frozen=True)
+class InferencePreparationResult:
+    """Result of an explicit inference preparation transaction."""
+
+    ready: bool
+    checkpoint_path: Optional[str]
+    backend: str
+    configured_device: str
+    active_device: str
+    warning: Optional[str] = None
+
+
 __all__ = [
     "GenerationAdmissionPort",
     "GenerationCommand",
     "GenerationOverrides",
     "GenerationStream",
+    "InferencePreparationCommand",
+    "InferencePreparationResult",
     "InferenceRuntimePort",
     "InferenceState",
     "InferenceTrainingHandoff",

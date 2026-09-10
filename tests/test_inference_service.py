@@ -1,8 +1,16 @@
 import pytest
 
 from src.application.inference.service import InferenceService
+from src.core.config import EngineConfig
 from src.core.exceptions import AIEngineError
-from tests.application_support import concrete_inference_runtime, make_inference_service
+from tests.application_support import (
+    FakeAccelerator,
+    FakeAdmission,
+    FakeSynchronization,
+    SpyInferenceRuntime,
+    concrete_inference_runtime,
+    make_inference_service,
+)
 
 
 def _service_without_assets(tmp_path) -> InferenceService:
@@ -14,20 +22,145 @@ def _service_without_assets(tmp_path) -> InferenceService:
     )
 
 
-def test_inference_service_loads_existing_configured_vocab_on_startup(tmp_path):
-    from src.data.tokenizers import CharTokenizer
-
-    vocab_path = tmp_path / "vocab.json"
-    CharTokenizer(vocab=list("abcd")).save_vocab(str(vocab_path))
-
-    service = make_inference_service(
-        checkpoint_dir=str(tmp_path / "checkpoints"),
-        default_checkpoint=str(tmp_path / "missing_default.pt"),
-        vocab_path=str(vocab_path),
+def test_inference_service_constructor_is_inert():
+    runtime = SpyInferenceRuntime()
+    admission = FakeAdmission()
+    accelerator = FakeAccelerator()
+    service = InferenceService(
+        runtime=runtime,
+        admission=admission,
+        synchronization=FakeSynchronization(),
+        accelerator=accelerator,
+        engine_config=EngineConfig(),
     )
 
-    assert concrete_inference_runtime(service).tokenizer is not None
-    assert concrete_inference_runtime(service).tokenizer.vocab_size == 4
+    assert service.get_runtime_state()["current_checkpoint"] is None
+    assert runtime.calls == []
+    assert admission.calls == []
+    assert accelerator.calls == []
+
+
+def test_inference_prepare_strict_missing_checkpoint_raises():
+    from src.application.inference.contracts import InferencePreparationCommand
+    from src.application.inference.gateway import InferenceGateway
+
+    runtime = SpyInferenceRuntime()
+    service = InferenceService(
+        runtime=runtime,
+        admission=FakeAdmission(),
+        synchronization=FakeSynchronization(),
+        accelerator=FakeAccelerator(),
+        engine_config=EngineConfig(),
+    )
+    gateway = InferenceGateway(service)
+
+    with pytest.raises(FileNotFoundError):
+        gateway.prepare(InferencePreparationCommand(checkpoint_path="missing.pt", strict=True))
+
+
+def test_inference_prepare_best_effort_missing_checkpoint_returns_not_ready():
+    from src.application.inference.contracts import InferencePreparationCommand
+    from src.application.inference.gateway import InferenceGateway
+
+    runtime = SpyInferenceRuntime()
+    service = InferenceService(
+        runtime=runtime,
+        admission=FakeAdmission(),
+        synchronization=FakeSynchronization(),
+        accelerator=FakeAccelerator(),
+        engine_config=EngineConfig(),
+    )
+    gateway = InferenceGateway(service)
+
+    result = gateway.prepare(
+        InferencePreparationCommand(checkpoint_path="missing.pt", strict=False)
+    )
+    assert result.ready is False
+    assert result.warning
+
+
+def test_inference_prepare_resolves_and_activates_config_once():
+    from src.application.config.contracts import ConfigRequest
+    from src.application.config.service import ConfigurationService
+    from src.application.inference.contracts import InferencePreparationCommand
+    from src.application.inference.gateway import InferenceGateway
+
+    class CountingProvider:
+        def __init__(self, mapping: dict):
+            self.mapping = mapping
+            self.read_count = 0
+            self.default_path = "default.yaml"
+
+        def load_mapping(self, path=None):
+            self.read_count += 1
+            return dict(self.mapping)
+
+    class CountingConfigurationService(ConfigurationService):
+        def __init__(self, provider):
+            super().__init__(provider)
+            self.resolve_count = 0
+            self.activate_count = 0
+
+        def resolve(self, request=None):
+            self.resolve_count += 1
+            return super().resolve(request)
+
+        def activate(self, config):
+            self.activate_count += 1
+            return super().activate(config)
+
+    base_mapping = {
+        "system": {"device": "cpu"},
+        "training": {"checkpoint_dir": "chk", "checkpoint_name": "base.pt"},
+        "data": {"vocab_file": "base_vocab.json"},
+    }
+    provider = CountingProvider(base_mapping)
+    config_service = CountingConfigurationService(provider)
+
+    runtime = SpyInferenceRuntime()
+    loaded_calls: list[dict[str, object]] = []
+
+    def fake_load_checkpoint(checkpoint_path, *, vocab_path, configured_device, backend):
+        loaded_calls.append(
+            {
+                "checkpoint_path": checkpoint_path,
+                "vocab_path": vocab_path,
+                "configured_device": configured_device,
+                "backend": backend,
+            }
+        )
+        return (1, 1, 1, 1)
+
+    runtime.load_checkpoint = fake_load_checkpoint  # type: ignore[method-assign]
+
+    service = InferenceService(
+        runtime=runtime,
+        admission=FakeAdmission(),
+        synchronization=FakeSynchronization(),
+        accelerator=FakeAccelerator(),
+        config_service=config_service,
+    )
+    gateway = InferenceGateway(service)
+
+    cmd = InferencePreparationCommand(
+        config_request=ConfigRequest(overrides=("training.checkpoint_name=custom.pt",)),
+        vocab_path="custom_vocab.json",
+        backend="local",
+        strict=True,
+    )
+    result = gateway.prepare(cmd)
+
+    assert result.ready is True
+    assert config_service.resolve_count == 1
+    assert provider.read_count == 1
+    assert config_service.activate_count == 1
+    assert len(loaded_calls) == 1
+    assert loaded_calls[0]["checkpoint_path"] == "custom.pt"
+    assert loaded_calls[0]["vocab_path"] == "custom_vocab.json"
+    assert loaded_calls[0]["backend"] == "local"
+    assert provider.read_count == 1
+
+
 
 
 def test_failed_checkpoint_load_does_not_mutate_backend(tmp_path):

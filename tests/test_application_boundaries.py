@@ -1095,8 +1095,18 @@ def test_inference_public_package_exposes_gateway_and_commands_not_internal_serv
 
     assert "InferenceGateway" in inference.__all__
     assert "GenerationCommand" in inference.__all__
+    assert "InferencePreparationCommand" in inference.__all__
+    assert "InferencePreparationResult" in inference.__all__
     assert "InferenceService" not in inference.__all__
     assert "InferenceTrainingHandoff" not in inference.__all__
+
+
+def test_inference_prepare_gateway_exposes_preparation_transaction():
+    from src.application.inference import InferenceGateway
+
+    assert hasattr(InferenceGateway, "prepare")
+    assert callable(getattr(InferenceGateway, "prepare"))
+
 
 
 def test_composition_public_package_exposes_only_complete_application_graph_builder():

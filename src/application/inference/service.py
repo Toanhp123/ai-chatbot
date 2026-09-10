@@ -16,6 +16,8 @@ from src.application.inference.contracts import (
     GenerationCommand,
     GenerationOverrides,
     GenerationStream,
+    InferencePreparationCommand,
+    InferencePreparationResult,
     InferenceRuntimePort,
     InferenceTrainingHandoff,
 )
@@ -49,18 +51,9 @@ class InferenceService:
         self._synchronization = synchronization
         self._accelerator = accelerator
         self._residency_device: Optional[str] = None
-
-        checkpoint = default_checkpoint or self.configured_checkpoint_path
-        try:
-            self._runtime.load_tokenizer_if_present(self.vocab_path)
-        except Exception as exc:
-            logger.warning("Chưa thể nạp tokenizer từ %s: %s", self.vocab_path, exc)
-
-        if self._runtime.path_exists(checkpoint):
-            try:
-                self.load_checkpoint(checkpoint)
-            except Exception as exc:
-                logger.warning("Chưa thể nạp checkpoint mặc định %s: %s", checkpoint, exc)
+        self._config_service = config_service
+        # default_checkpoint stored but not eagerly loaded; use prepare() for explicit bootstrap
+        self._default_checkpoint = default_checkpoint
 
     @classmethod
     def from_engine_config(
@@ -80,10 +73,6 @@ class InferenceService:
             engine_config=config,
             accelerator=accelerator,
             config_service=config_service,
-            default_checkpoint=runtime.join_path(
-                config.training.checkpoint_dir,
-                config.training.checkpoint_name,
-            ),
         )
 
     @property
@@ -175,6 +164,48 @@ class InferenceService:
     @property
     def configured_checkpoint_path(self) -> str:
         return self._runtime.join_path(self.checkpoint_dir, self.checkpoint_name)
+
+    def prepare(self, command: InferencePreparationCommand) -> InferencePreparationResult:
+        """Explicit Application transaction for inference preparation."""
+        if self._config_service is not None:
+            config = self._config_service.resolve(command.config_request)
+        else:
+            config = self.get_engine_config()
+        if command.vocab_path:
+            config = config.copy(data=config.data.copy(vocab_file=command.vocab_path))
+        self.apply_engine_config(config)
+
+        checkpoint = command.checkpoint_path or self.resolve_checkpoint_path(
+            self.checkpoint_name,
+            filename_only=True,
+        )
+        backend = command.backend or self.current_backend
+        try:
+            self.load_checkpoint(
+                checkpoint,
+                backend=backend,
+                require_managed=command.require_managed_checkpoint,
+                requested_device=command.requested_device,
+            )
+        except Exception as exc:
+            if command.strict:
+                raise
+            logger.warning("Default inference preparation failed: %s", exc)
+            return InferencePreparationResult(
+                ready=False,
+                checkpoint_path=self.current_checkpoint_path,
+                backend=self.current_backend,
+                configured_device=self.configured_device,
+                active_device=self.device_str,
+                warning=str(exc),
+            )
+        return InferencePreparationResult(
+            ready=True,
+            checkpoint_path=self.current_checkpoint_path,
+            backend=self.current_backend,
+            configured_device=self.configured_device,
+            active_device=self.device_str,
+        )
 
     def resolve_checkpoint_path(self, path: str, *, filename_only: bool = False) -> str:
         return self._runtime.resolve_checkpoint_path_for_dir(
@@ -284,6 +315,7 @@ class InferenceService:
         backend: Optional[str] = None,
         *,
         require_managed: bool = False,
+        requested_device: Optional[str] = None,
     ) -> None:
         """Coordinate resource ownership around one atomic capability checkpoint swap."""
         with self._synchronization.section():
@@ -295,7 +327,8 @@ class InferenceService:
             self._admission.ensure_idle(operation="load_checkpoint")
             target_backend = self.current_backend if backend is None else backend.lower().strip()
             target_backend = self._runtime.validate_backend(target_backend)
-            target_device = self._runtime.resolve_device_name(self.configured_device)
+            effective_device = requested_device or self.configured_device
+            target_device = self._runtime.resolve_device_name(effective_device)
             previous_residency = self._residency_device
 
             reserved_operation = False
@@ -309,7 +342,7 @@ class InferenceService:
                 self._runtime.load_checkpoint(
                     checkpoint_path,
                     vocab_path=self.vocab_path,
-                    configured_device=self.configured_device,
+                    configured_device=effective_device,
                     backend=target_backend,
                 )
 

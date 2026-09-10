@@ -118,3 +118,147 @@ def make_training_service(
         synchronization=ThreadSynchronization(),
         accelerator=accelerator_coordinator,
     )
+
+
+class SpyInferenceRuntime:
+    """Spy runtime that records calls and raises on any actual runtime operation."""
+
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+        self._current_checkpoint_path: Optional[str] = None
+        self._current_checkpoint_identity: Optional[tuple[int, int, int, int]] = None
+        self._device: str = "cpu"
+        self._backend: str = "local"
+        self._ready: bool = False
+
+    @property
+    def current_checkpoint_path(self) -> Optional[str]:
+        return self._current_checkpoint_path
+
+    @property
+    def current_checkpoint_identity(self) -> Optional[tuple[int, int, int, int]]:
+        return self._current_checkpoint_identity
+
+    @property
+    def device(self) -> str:
+        return self._device
+
+    @property
+    def backend(self) -> str:
+        return self._backend
+
+    @property
+    def ready(self) -> bool:
+        return self._ready
+
+    def path_exists(self, path: str) -> bool:
+        self.calls.append(f"path_exists:{path}")
+        return False
+
+    def join_path(self, *parts: str) -> str:
+        return "/".join(parts)
+
+    def load_tokenizer_if_present(self, vocab_path: str) -> bool:
+        self.calls.append(f"load_tokenizer_if_present:{vocab_path}")
+        return False
+
+    def resolve_checkpoint_path_for_dir(
+        self, checkpoint_dir: str, path: str, *, filename_only: bool = False
+    ) -> str:
+        return path
+
+    def list_checkpoints(self, *, checkpoint_dir: str, checkpoint_name: str) -> list:
+        return []
+
+    def delete_checkpoint(self, *, checkpoint_dir: str, checkpoint_name: str, filename: str) -> str:
+        return filename
+
+    def list_generators(self) -> list[str]:
+        return []
+
+    def list_models(self) -> list[str]:
+        return []
+
+    def validate_backend(self, backend: str) -> str:
+        return backend
+
+    def resolve_device_name(self, device: str) -> str:
+        return device
+
+    def set_backend(self, backend: str) -> str:
+        return backend
+
+    def load_checkpoint(
+        self,
+        checkpoint_path: str,
+        *,
+        vocab_path: str,
+        configured_device: str,
+        backend: str,
+    ) -> tuple[int, int, int, int]:
+        self.calls.append(f"load_checkpoint:{checkpoint_path}")
+        raise FileNotFoundError(f"Spy: checkpoint not found: {checkpoint_path}")
+
+    def prepare_training_handoff(self):
+        return None
+
+    def begin_generation(self, *, prompt, config, requested_backend, stop_words, release_admission):
+        raise RuntimeError("Spy: begin_generation not expected")
+
+
+class FakeAdmission:
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    @property
+    def active_sessions(self) -> int:
+        return 0
+
+    def ensure_idle(self, *, operation: str) -> None:
+        self.calls.append(f"ensure_idle:{operation}")
+
+    def acquire(self, *, prompt: str, config, device: str):
+        self.calls.append(f"acquire:{device}")
+        return lambda: None
+
+
+class FakeSynchronization:
+    from contextlib import contextmanager
+
+    @contextmanager  # type: ignore[misc]
+    def section(self):
+        yield
+
+
+class FakeAccelerator:
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    def same_family(self, first: str, second: str) -> bool:
+        return True
+
+    def reserve_generation(self, device: str, *, operation: str) -> None:
+        self.calls.append(f"reserve_generation:{device}:{operation}")
+
+    def release_generation(self, device: str) -> None:
+        self.calls.append(f"release_generation:{device}")
+
+    def reserve_inference_residency(self, device: str) -> None:
+        self.calls.append(f"reserve_inference_residency:{device}")
+
+    def release_inference_residency(self, device: str) -> None:
+        self.calls.append(f"release_inference_residency:{device}")
+
+    def transfer_inference_to_training(self, device: str) -> None:
+        self.calls.append(f"transfer_inference_to_training:{device}")
+
+    def transfer_training_to_inference(self, device: str) -> None:
+        self.calls.append(f"transfer_training_to_inference:{device}")
+
+    def reserve_training(self, device: str) -> None:
+        self.calls.append(f"reserve_training:{device}")
+
+    def release_training(self, device: str) -> None:
+        self.calls.append(f"release_training:{device}")
+
+

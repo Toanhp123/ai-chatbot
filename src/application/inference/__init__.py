@@ -1,4 +1,10 @@
-from .contracts import GenerationCommand, GenerationOverrides, GenerationStream
+from .contracts import (
+    GenerationCommand,
+    GenerationOverrides,
+    GenerationStream,
+    InferencePreparationCommand,
+    InferencePreparationResult,
+)
 from .gateway import InferenceGateway
 
 __all__ = [
@@ -6,4 +12,6 @@ __all__ = [
     "GenerationOverrides",
     "GenerationStream",
     "InferenceGateway",
+    "InferencePreparationCommand",
+    "InferencePreparationResult",
 ]
