@@ -1195,3 +1195,32 @@ def test_architecture_guardian_blocks_outer_imports_of_application_service_inter
     assert "src.adapters.good_config_contract" not in offending
     assert "src.adapters.good_training_contract" not in offending
     assert "src.ui.good_inference_api" not in offending
+
+
+def test_build_application_services_does_not_resolve_or_activate_config(monkeypatch):
+    from src.adapters.config import YamlConfigProvider
+    from src.composition import build_application_services
+
+    def fail_load(*args, **kwargs):
+        raise AssertionError("composition must not read config documents")
+
+    monkeypatch.setattr(YamlConfigProvider, "load_mapping", fail_load)
+    services = build_application_services()
+
+    assert services.config.default_path.endswith("configs/truyen_kieu.yaml")
+
+
+def test_config_gateway_logging_settings_resolves_request_without_activation(tmp_path):
+    from src.adapters.config import YamlConfigProvider
+    from src.application.config import ConfigGateway, ConfigRequest
+    from src.application.config.service import ConfigurationService
+
+    path = tmp_path / "engine.yaml"
+    path.write_text("system:\n  log_level: WARNING\n  log_file: logs/x.log\n", encoding="utf-8")
+    service = ConfigurationService(YamlConfigProvider(default_path=str(path)))
+    gateway = ConfigGateway(service)
+
+    settings = gateway.logging_settings(ConfigRequest())
+
+    assert settings.level == "WARNING"
+    assert service._active is None

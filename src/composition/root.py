@@ -6,12 +6,12 @@ and concrete inner runtime implementations at the same time.
 
 from __future__ import annotations
 
-from typing import Optional, Sequence
+from typing import Optional
 
 from src.adapters.config import YamlConfigProvider
 from src.adapters.diagnostics import DiagnosticsRuntimeAdapter
 from src.adapters.filesystem import FilesystemResumeCheckpointAdapter
-from src.application.config import ConfigGateway, ConfigRequest
+from src.application.config import ConfigGateway
 from src.application.config.service import ConfigurationService
 from src.application.diagnostics import DiagnosticsApplicationService
 from src.application.explorer import ExplorerApplicationService
@@ -148,21 +148,16 @@ def _build_training_service(
 
 def build_application_services(
     *,
-    config_path: Optional[str] = None,
-    overrides: Optional[Sequence[str]] = None,
     backend: str = "local",
     max_generation_sessions: int = 2,
 ) -> ApplicationServices:
     """Build the complete application graph for CLI or HTTP adapters."""
     provider = YamlConfigProvider()
     configuration = ConfigurationService(provider)
-    boot_config = configuration.activate(
-        configuration.resolve(ConfigRequest.from_values(config_path, overrides))
-    )
 
     accelerator = AcceleratorCoordinator()
     inference_service = _build_inference_service(
-        engine_config=boot_config,
+        engine_config=EngineConfig(),
         backend=backend,
         max_generation_sessions=max_generation_sessions,
         accelerator_coordinator=accelerator,

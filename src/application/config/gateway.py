@@ -27,8 +27,8 @@ class ConfigGateway:
     def resolve_mapping(self, request: Optional[ConfigRequest] = None) -> dict[str, object]:
         return self._service.resolve(request).to_dict()
 
-    def logging_settings(self) -> LoggingSettings:
-        system = self._service.current().system
+    def logging_settings(self, request: Optional[ConfigRequest] = None) -> LoggingSettings:
+        system = self._service.resolve(request).system
         return LoggingSettings(level=str(system.log_level), file=str(system.log_file))
 
     def read_raw(self, source: Optional[str] = None) -> tuple[str, str]:

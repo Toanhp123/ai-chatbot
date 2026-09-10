@@ -26,7 +26,7 @@ class InferencePreferences:
         self._device_override: Optional[str] = None
 
     def snapshot(self) -> EngineConfig:
-        if self._config_service is not None:
+        if self._config_service is not None and self._config_service._active is not None:
             return self._config_service.current()
         return ConfigurationService.snapshot(self._private_config)
 

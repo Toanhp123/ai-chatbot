@@ -1,3 +1,4 @@
+import inspect
 import os
 
 import pytest
@@ -231,3 +232,11 @@ def test_architecture_guardian_keeps_ui_adapters_out_of_inner_modules(tmp_path):
         violation["rule_scope"] == "src.ui" and violation["forbidden_rule"] == "src.core"
         for violation in violations
     )
+
+
+def test_production_builder_has_no_command_config_parameters():
+    from src.composition import build_application_services
+
+    signature = inspect.signature(build_application_services)
+    assert "config_path" not in signature.parameters
+    assert "overrides" not in signature.parameters
