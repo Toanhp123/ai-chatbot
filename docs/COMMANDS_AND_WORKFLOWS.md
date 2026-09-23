@@ -40,7 +40,7 @@ The command parser resolves syntax and arguments, then dispatches an application
 
 ## 3. Plugin commands
 
-Plugins may register commands through the extension manifest/registry. Plugin commands inherit plugin trust/permission constraints and cannot create privileged action handlers outside declared capabilities.
+Plugins may register **command descriptors** through the extension manifest/registry. The descriptor resolves to an approved application action/use case; it is subject to the plugin revision active in that scope and normal runtime policy, and cannot register an arbitrary privileged in-process callback.
 
 ## 4. Product modes
 

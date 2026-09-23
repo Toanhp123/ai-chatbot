@@ -11,7 +11,7 @@ Keep data classes distinguishable:
 - product DB: conversations, projects, settings, agent metadata, usage and references;
 - secret store: API keys/tokens/credentials;
 - rebuildable caches/indexes: repository maps, embeddings, thumbnails, extracted text caches;
-- logs/audit events;
+- durable audit/lifecycle events plus optional bounded transient diagnostics;
 - user artifacts/exports;
 - downloaded local models;
 - Model Lab datasets/checkpoints/adapters/metrics;
@@ -41,7 +41,7 @@ Persistent schema upgrades must be transactional/recoverable where possible, ver
 
 ## 6. Crash recovery
 
-On startup distinguish clean shutdown from interrupted work when useful. Long-running task state must not be resurrected blindly after a process crash: reconcile persisted task records with provider/process/tool reality and move unrecoverable in-flight operations into an interrupted/failed state with safe diagnostics.
+On startup distinguish clean shutdown from interrupted work when useful. Long-running execution state must not be resurrected blindly after a process crash: reconcile persisted Run/model/tool/process evidence with external reality, mark the old Run `interrupted` when no durable reattach protocol exists, stale/close its pending approvals, and create a new Run for explicit resume/retry. Never replay an ambiguous non-idempotent side effect merely because a completion event is missing. A tool attempt whose dispatch may have crossed the external boundary but lacks trustworthy terminal evidence is reconciled or retained as unknown outcome.
 
 Use atomic/temp-file replacement for important file-based config and artifact metadata. Avoid partially written configuration.
 
@@ -67,9 +67,11 @@ Local-first does not mean offline-only; it means local ownership/default storage
 
 ## 10. Local models and storage pressure
 
-Model downloads and checkpoints can be very large. Track expected/actual size, destination, partial download state, checksum/version metadata when available, resumability and cleanup. Warn before operations that can materially consume disk space.
+Model downloads and training artifacts can be very large. Track expected/actual size, destination, partial state, immutable source/revision/checksum/integrity metadata, resumability and cleanup. Training checkpoints, adapters and merged models are distinct artifact classes with different retention rules. Record whether custom repository code/unsafe serialization is required and keep that execution outside Electron host processes. Warn before operations that can materially consume disk space.
 
-Deleting a model/checkpoint is destructive and should verify references/jobs before removal. Do not conflate deleting registry metadata with deleting files.
+Model Lab writes into staging locations and exposes an artifact/checkpoint as complete only after manifest/integrity finalization. Retention prefers rebuildable caches/raw diagnostics first and must not delete artifacts referenced by resume, evaluation, promotion or export.
+
+Deleting a model/checkpoint is destructive and should verify references/jobs before removal. Do not conflate deleting registry metadata with deleting files, deleting a TrainingCheckpoint with deleting a promoted ModelArtifactRevision, or deleting an adapter with deleting its required base model.
 
 ## 11. Privacy controls
 
@@ -79,7 +81,8 @@ Users should be able to understand and eventually control:
 - whether a route permits cloud fallback;
 - what project/file context was attached;
 - which memories are active;
-- which MCP/extensions have access;
+- which workspace roots are trusted for repository-controlled instructions/extensions;
+- which MCP/extensions/Product Skill revisions are activated, their origin/trust class, and which runtime permissions concrete operations actually receive;
 - what diagnostic data can leave the machine;
 - whether local model/training data leaves the machine (default: no unless explicitly configured).
 
@@ -102,4 +105,5 @@ Test at least:
 - import rejects malformed/unsupported versions;
 - redaction/support bundle behavior;
 - interrupted task reconciliation;
-- model/download cleanup boundaries when those phases arrive.
+- model/download cleanup boundaries when those phases arrive;
+- Model Lab staging/finalization, interrupted-attempt reconciliation, checkpoint/artifact retention references, and no external tracker/upload by default.

@@ -174,31 +174,31 @@ Do not turn `contracts` into a miscellaneous utilities package.
 
 ### `application`
 
-Owns user-facing use cases and orchestration between the desktop shell and runtime subsystems: conversation/project/settings operations, lifecycle coordination, profile/data-root handling, and presentation-safe DTO projection.
+Owns user-facing use cases and orchestration between the desktop shell and runtime subsystems: conversation/project/settings operations, lifecycle coordination, canonical workspace/root trust state, physical-workspace mutation ownership/lease issuance, local-runtime management orchestration through injected ports, profile/data-root handling, and presentation-safe DTO projection.
 
 It does not contain provider transport logic, SQL, shell execution, or React components.
 
 ### `agent-core`
 
-Owns Agent Task orchestration, bounded loops, task state/events, cancellation, subagent coordination, and sequencing of Context Engine → Prompt Runtime → Provider Core → Tool Runtime.
+Owns Agent Task/Run/Turn orchestration, bounded loops, lifecycle/events, cancellation, subagent coordination, and sequencing of Context Engine → Prompt Runtime → Provider Core → Tool Runtime.
 
 It does not own provider HTTP payloads, persistence implementation, Electron, React, or direct shell/filesystem effects.
 
 ### `prompt-runtime`
 
-Owns trusted instruction layering, provenance-aware context/tool packing, provider-neutral request assembly, compaction representation, and safe request diagnostics.
+Owns trusted instruction layering, provenance-aware context/tool packing, immutable provider-neutral prepared-request snapshots/fingerprints, compaction representation, and safe request diagnostics.
 
 It does not retrieve repository evidence itself and does not translate to vendor wire formats.
 
 ### `context-engine`
 
-Owns repository inventory/ignore handling, structural parsing, lexical search, optional semantic retrieval, repository maps, context planning, token budgeting, and compaction inputs.
+Owns repository inventory/ignore handling, structural parsing, lexical search, optional semantic retrieval, repository maps, context planning, token budgeting, evidence freshness/versioning, and compaction inputs.
 
-It produces bounded evidence/context packages; it does not decide instruction precedence or provider payload format.
+It produces immutable bounded evidence/context packages; it does not decide instruction precedence or provider payload format.
 
 ### `provider-core`
 
-Owns provider/model registry, capability normalization, provider adapters, wire transport, normalized streaming/events/errors/usage, and deterministic route/fallback policy.
+Owns provider/model registry, provenance/freshness-aware capability normalization, provider adapters, wire transport, model-attempt lifecycle, normalized streaming/events/errors/usage, and deterministic route/retry/fallback policy.
 
 Only this boundary speaks provider-specific transport/protocols.
 
@@ -210,13 +210,13 @@ It does not execute operations and does not depend on UI, Application, or Storag
 
 ### `tool-runtime`
 
-Owns tool registry, input validation, permission request construction, invocation lifecycle, timeout/cancel, execution adapter dispatch, output normalization, and audit events.
+Owns tool registry, input validation, normalized-operation/fingerprint construction, permission request construction, invocation/idempotency lifecycle, required workspace-lease enforcement on supplied execution context, resource preconditions, timeout/cancel, execution adapter dispatch, output normalization, and audit events.
 
 Every effectful agent/MCP/plugin tool action must pass through Tool Runtime and Policy Core unless it is an explicitly documented non-effectful pure computation.
 
 ### `storage`
 
-Owns SQLite connection, migrations, transactions, repositories, persistence mapping, backup/recovery primitives, and storage health. Raw SQL/driver access stays inside this package.
+Owns SQLite connection, migrations, bounded transactions, repositories, runtime state/event consistency, persistence mapping, backup/recovery primitives, and storage health. Raw SQL/driver access stays inside this package.
 
 Secrets are represented by opaque references only; secret values belong to `SecretStore`/platform secure storage.
 
@@ -228,7 +228,7 @@ MCP tool execution does not bypass Tool Runtime/Policy Core.
 
 ### `extension-core`
 
-Owns product Skill/plugin/agent manifests, validation, trust metadata, activation state, scope, lifecycle/version metadata, and extension contribution descriptors.
+Owns product Skill/plugin/agent manifests, immutable extension/Skill revision snapshots, validation, provenance/trust metadata, activation state, scope, lifecycle/version metadata, and contribution descriptors. MCP-delivered Skills normalize into this same Product Skill revision model before Prompt Runtime use, while preserving remote origin/trust class rather than inheriting local Skill instruction authority; MCP activation binds the server revision + Skill URI + held manifest/frontmatter revision rather than only a display name.
 
 Installation/activation is not permission grant. Executable effects route through the same central tool/policy boundary.
 
@@ -250,7 +250,7 @@ It consumes presentation-safe application contracts through preload and cannot i
 
 ### `services/model-lab`
 
-Owns Python training/evaluation environment and maintained training backends. Electron only controls it through a versioned worker protocol. No PyTorch/Transformers/MLX training dependency belongs inside Electron application packages.
+Owns Python training/evaluation environment, backend adapters, immutable TrainingPlan execution, TrainingAttempt/checkpoint/artifact production and evaluation. Electron only controls it through a versioned worker protocol. The worker never reads product SQLite/SecretStore directly, and no PyTorch/Transformers/MLX training dependency belongs inside Electron application packages. ADR-0005 owns Model Lab lineage/resume/promotion invariants.
 
 ## 7. Allowed dependency DAG
 
@@ -359,45 +359,61 @@ sequenceDiagram
 
     U->>UI: submit task
     UI->>APP: typed use-case request
-    APP->>A: create/run Agent Task
-    A->>C: planContext(task)
-    C-->>A: bounded provenance-aware evidence
-    A->>PR: assemble(task, context, relevant tools)
-    PR-->>A: normalized model request
-    A->>P: stream(request)
-    P-->>A: normalized events
-    A->>T: invoke(toolCall)
-    T->>PE: evaluate(operation, scope, grantSnapshot)
+    APP->>A: create Task + Run identity
+    A->>P: resolve RoutePlan(turn requirements)
+    P-->>A: candidates + shared request envelope
+    A->>C: planContext(turn, workspace snapshot, envelope)
+    C-->>A: immutable provenance-aware ContextPackage
+    A->>PR: prepare(turn, route envelope, context, relevant tools)
+    PR-->>A: immutable PreparedModelRequest + fingerprint
+    A->>P: start modelAttempt(request)
+    P-->>A: normalized attempt events
+    A->>T: invoke normalized toolCall
+    T->>PE: evaluate(operation fingerprint, resources, grant snapshot)
     PE-->>T: allow / deny / require approval
     alt approval required
-      T-->>A: approval-required event
+      T-->>A: approvalRequestId + bound operation
       A-->>APP: typed approval event
       APP-->>UI: presentation-safe approval request
       U->>UI: approve / deny
       UI->>APP: scoped user decision
-      APP-->>A: scoped approval decision
-      A->>T: retry with scoped user decision
-      T->>PE: evaluate(operation, scope, updated grant snapshot)
-      PE-->>T: allow / deny
+      APP-->>A: recorded approval decision
+      A->>T: continue same toolCall
+      T->>T: re-resolve targets + verify bound expected preconditions
+      T->>PE: re-evaluate same operation fingerprint/current facts
+      PE-->>T: allow / deny / stale
     end
-    T-->>A: normalized tool result
-    A->>PR: assemble continuation
-    A->>P: continue
-    A-->>APP: typed task events/result
+    T-->>A: normalized tool result / conflict / unknown outcome
+    A->>P: resolve RoutePlan(next turn)
+    P-->>A: next-turn candidates + request envelope
+    A->>C: refresh/plan affected evidence within next-turn envelope
+    C-->>A: immutable next-turn ContextPackage
+    A->>PR: prepare next-turn request snapshot
+    PR-->>A: immutable next-turn PreparedModelRequest
+    A->>P: start next modelAttempt
+    A-->>APP: typed run/task events/result
     APP-->>UI: presentation DTO/events
 ```
 
+Execution identity is explicit: `taskId` identifies the durable goal, `runId` one execution/resume, `turnId` one agent decision cycle, and `modelAttemptId` one concrete provider attempt. `toolCallId` identifies one logical requested operation, while `toolAttemptId` identifies a concrete dispatch/retry; approval IDs correlate human decisions. Provider-native request/tool/session IDs remain metadata. Retries, fallbacks and resumes create new child identities rather than rewriting prior evidence.
+
 ## 10. Provider boundary
 
-The route resolver chooses eligible candidates from explicit capabilities/policies. Provider adapters translate normalized requests to/from vendor wire formats. Tool execution remains outside Provider Core.
+The route resolver chooses eligible candidates from explicit capability facts/policies and produces an immutable per-turn `RoutePlan` before context/prompt packing. Transparent fallback candidates share a request/context envelope that the prepared request must satisfy. Provider adapters translate prepared normalized requests to/from vendor wire formats. Tool execution remains outside Provider Core.
 
-No React/application/agent file may construct vendor-specific request payloads. No provider adapter may decide tool permissions.
+No React/application/agent file may construct vendor-specific request payloads. No provider adapter may decide local tool permissions. Provider request/session/response/tool-use IDs and opaque continuation state are optional vendor-scoped transport metadata; canonical application conversation/run semantics and application tool identity remain local.
+
+`application` may call Provider Core directly for provider/model registry, discovery, health/config validation and other non-conversational administration. **User-visible model generation uses the Agent Core → Prompt Runtime → Provider Core execution spine**, including ordinary Phase 1 chat, so chat and later coding-agent turns do not evolve separate retry/event/persistence semantics.
+
+Provider-hosted/server-executed capabilities are a separate class from application Tool Runtime tools. They are disabled unless explicitly modeled/configured and may not be used to bypass Tool Runtime + Policy Core for local filesystem/shell/Git/credential effects. The same rule applies to opaque capabilities executed by local inference runtimes, including runtime-managed MCP/tool integrations.
 
 ## 11. Context and prompt boundary
 
-The Context Engine discovers/ranks evidence. Prompt Runtime owns trusted instruction precedence, provenance framing, token packing, compaction representation, relevant tool-schema inclusion, and normalized request assembly.
+Context Engine discovers/ranks evidence and returns an immutable versioned context package. Prompt Runtime owns trusted instruction precedence, provenance framing, token packing, compaction representation, relevant tool-schema inclusion, deterministic ordering, and immutable prepared-request identity/fingerprint.
 
-Retrieved files, MCP resources, web pages, tool output, plugin text, and model-generated content are untrusted data. They cannot become higher-priority instructions merely because they contain imperative text.
+Retrieved files, MCP resources, web pages, tool output, plugin text, model-generated summaries, and generated content are untrusted/derived data. They cannot become higher-priority instructions merely because they contain imperative text.
+
+A prepared request is not mutated after a provider attempt starts. New user input, changed context/tool exposure, or refreshed workspace evidence creates a new turn/request snapshot.
 
 ## 12. MCP and extension boundary
 
@@ -405,26 +421,42 @@ Install → validate → trust review → activate is separate from runtime perm
 
 MCP/extension contributions are converted to internal descriptors. Effectful execution still travels through Tool Runtime + Policy Core. Product Skills may contribute instructions/resources, but they do not grant filesystem, shell, credential, or network permission.
 
+Repository-controlled instructions/extensions are trusted only after workspace/root trust or explicit source approval; otherwise they remain untrusted/inert. Extension installation is inert, activation binds an immutable reviewed revision, and arbitrary third-party executable code is never dynamically imported into Electron renderer/preload/main/core processes. Future executable plugin hooks/workers require an isolated capability-mediated execution boundary.
+
+MCP-delivered Skills are a discovery/distribution source, not a second instruction runtime: explicit per-Skill activation may produce an Extension-Core-owned immutable Product Skill revision bound to MCP server revision + Skill URI + held manifest/frontmatter revision while preserving MCP remote-untrusted instruction provenance. Changed/dynamic content does not silently inherit persistent activation, nested Skills require separate activation, and Skill `allowed-tools`/hooks/scripts cannot grant host capability. Prompt Runtime may use an activated revision as bounded instructional context but never promotes it above user/project/local-trusted instruction authority; any resulting host effect still requires Tool Runtime/Policy Core authorization with the causal Skill revision/origin preserved. MCP durable Tasks/remote async work keep their own protocol identity and are correlated to, not conflated with, local Agent Task/Run identities. MCP elicitation/MRTR input is not local permission.
+
 ## 13. Data ownership
 
 - renderer state: ephemeral presentation state only;
-- durable product state: Storage/SQLite;
+- durable product/runtime state: Storage/SQLite, including task/run/turn/attempt/tool/approval evidence;
 - secrets: `SecretStore`/platform secure storage; DB stores references/metadata only;
 - workspace files: user filesystem mediated through context/tool services;
-- indexes/caches: rebuildable local state with version metadata;
+- immutable large payloads/artifacts: file/blob storage with durable metadata and integrity identity;
+- indexes/caches: rebuildable local state with version/content-address metadata;
 - model downloads/training artifacts: explicit local paths with metadata and cleanup rules;
 - diagnostics/audit: structured, redacted, bounded retention.
 
-## 14. Long-running work contract
+State projection plus corresponding durable lifecycle evidence is committed consistently through Storage. External/network/process waits never hold open a database transaction.
+
+## 14. Long-running work and side-effect contract
 
 All long-running operations expose, where applicable:
 
 - typed state/events;
-- correlation IDs (`taskId`, `requestId`, `toolCallId`, `jobId`);
+- correlation IDs appropriate to the owning subsystem (`taskId`, `runId`, `turnId`, `modelAttemptId`, `toolCallId`, `approvalRequestId`, and Model Lab `trainingJobId`/`trainingAttemptId` where applicable);
 - cancellation (`AbortSignal`/equivalent);
 - bounded timeout/retry;
 - safe redacted diagnostics;
 - durable reconciliation/recovery state when interruption matters.
+
+V1 side-effect rules:
+
+- do not claim exactly-once execution across ambiguous OS/network failures;
+- do not auto-replay non-idempotent operations after dispatch may have occurred;
+- approvals bind to normalized operation identity and bound expected preconditions; current target/resource state is re-resolved and those preconditions are re-checked before execution rather than rewritten;
+- each concrete tool dispatch/retry has separate attempt evidence; ambiguous dispatched non-idempotent effects are reconciled or remain unknown instead of being replayed;
+- at most one mutating run owns a physical workspace root at a time unless work occurs in explicitly isolated roots/worktrees; the lease coordinates app Runs, not external editors/processes;
+- crash/interruption ends the current run unless a subsystem has an explicit durable reattach protocol; resume creates new execution identity and preserves prior evidence.
 
 ## 15. Architecture fitness functions
 
@@ -437,7 +469,10 @@ Architecture is enforced in code/tests. Phase 0 must add automated checks that f
 5. SQLite driver/raw SQL use outside Storage;
 6. raw shell/filesystem/Git mutation paths that bypass Tool Runtime/Policy Core;
 7. preload exposure of raw Node/Electron primitives;
-8. fake-provider production registration/import leakage.
+8. fake-provider production registration/import leakage;
+9. workspace-mutating built-in adapters that can execute without the Tool Runtime/Policy Core path or required mutation-lease contract;
+10. installed third-party extension code dynamically imported/executed inside Electron renderer, preload, main, or core package processes;
+11. Python/ML training dependencies or direct Model Lab backend execution imported into Electron renderer/preload/main or ordinary core packages instead of the versioned Model Lab worker boundary.
 
 The exact checker (for example a dependency graph linter, ESLint rule set, or architecture test) is an IMPLEMENTATION CHOICE. The assertions above are FROZEN.
 
@@ -459,17 +494,19 @@ Preference, novelty, or “this library usually uses another pattern” is not s
 
 Do not:
 
-- call providers directly from React/application code;
+- call provider generation directly from React or bypass Agent Core/Prompt Runtime for user-visible conversation turns;
 - expose raw Node/Electron objects through preload;
 - access SQLite outside Storage;
 - let MCP/plugins/hooks bypass Tool Runtime/Policy Core;
+- dynamically import installed third-party extension code into Electron renderer/preload/main/core processes;
 - store credentials in normal DB columns;
 - make Agent Core import Electron/React;
 - send entire repositories/tool catalogs to models by default;
 - perform repository parsing, inference, Git operations, or training on the renderer thread;
 - introduce a generic Service Locator that hides dependency direction;
 - create parallel implementations of permission, prompt assembly, provider normalization, or persistence in separate features;
-- weaken a frozen boundary because a test is inconvenient.
+- weaken a frozen boundary because a test is inconvenient;
+- treat a Model Lab backend config/path/process ID as sufficient experiment identity or auto-promote a training output without finalized lineage/evaluation.
 
 ## 18. Performance guardrails
 

@@ -77,10 +77,10 @@ Do not permanently reserve space for empty panels.
 
 ## 3. Agent task UX
 
-Represent an agent task with a compact state header:
+Represent an agent task with a compact state header. The user-facing Task is the durable goal; when execution is active, status comes from the current Run and prior interrupted/retried Runs remain inspectable rather than being overwritten.
 
 - task title;
-- status;
+- task status + active run state;
 - selected model/route;
 - elapsed time;
 - cancellation control;
@@ -100,6 +100,10 @@ Approval dialogs must answer:
 - **risk class**;
 - **scope of approval** (once/session/project policy);
 - material arguments such as command/path/domain while redacting secrets.
+
+If the bound operation materially changes while the dialog is pending (tool version, arguments, canonical target, workspace/expected precondition), or the owning Run ends/interruption invalidates the request, expire the old prompt and re-evaluate the new operation. If it still requires approval, show a fresh request instead of applying the old answer to the changed action.
+
+When a side-effecting tool times out/crashes/cancels after dispatch and the runtime cannot prove the outcome, show an explicit **unknown outcome / needs inspection** state. Do not present cancellation or missing completion evidence as if the action definitely did not happen.
 
 Dangerous operations require stronger friction than ordinary workspace writes.
 
@@ -142,13 +146,14 @@ MCP connection detail should show:
 - last error/health;
 - provenance.
 
-Plugin install review should show declared executable hooks/commands/MCP definitions and requested permissions before activation.
+Plugin install/update review should show exact source/revision, contribution classes, executable components, MCP definitions, capability/permission deltas and integrity metadata before activation. Activation UI names the target scope (for example global vs project); revoking one scoped activation does not imply uninstalling the revision or revoking another scope. Installation itself remains inert; activation and runtime authorization are separate.
 
 ## 8. Local AI UX
 
-Local model/runtime screens should emphasize practical fit:
+Local model/runtime screens should emphasize practical fit **and trust/exposure**:
 
-- runtime;
+- runtime + canonical endpoint class (loopback/LAN/remote);
+- process ownership (external/app-managed/unknown) and auth/exposure warning;
 - model ID/family;
 - quantization;
 - size;
@@ -156,7 +161,8 @@ Local model/runtime screens should emphasize practical fit:
 - loaded state;
 - estimated RAM/VRAM/unified-memory fit;
 - supported capabilities;
-- warnings where capability is model/template dependent.
+- source/revision/integrity/custom-code requirement where known;
+- warnings where capability is model/template dependent or runtime-hosted capabilities cannot provide app-level per-call authorization.
 
 Avoid presenting estimated “quality scores” as universal truth.
 

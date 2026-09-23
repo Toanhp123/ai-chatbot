@@ -1,98 +1,161 @@
-# MCP, Skills, Plugins, Hooks, and Marketplace
+# MCP, Product Skills, Plugins, Hooks, and Marketplace
 
-> Scope note: every Skill/agent/plugin in this document is a **feature of the application being built**. It is unrelated to the external development capabilities used by Antigravity while implementing this repository (Superpowers, `ui-ux-pro-max`, Graphify, and optional refinement Skills). See `DEVELOPMENT_TOOLING.md`.
-
+> Scope note: every Skill/agent/plugin in this document is a **feature of the application being built**. External development capabilities are governed only by `DEVELOPMENT_TOOLING.md`.
 
 ## 1. Unifying principle
 
-Extensibility is layered:
+Extensibility is layered, but trust is not inherited across layers:
 
-- **MCP** connects remote/local protocol servers exposing tools/resources/prompts.
-- **Skills** are focused instruction/resource packages loaded progressively.
-- **Agents** are reusable configurations of instructions/model/tools/Skills/permissions.
-- **Plugins** are installable bundles that may contain Skills, agents, commands, hooks, MCP definitions, and optional UI metadata.
-- **Marketplace** distributes metadata/packages; it is not a security authority.
+- **MCP** connects protocol servers exposing tools/resources/prompts and optional negotiated extensions.
+- **Product Skills** are focused instruction/resource packages loaded progressively from an immutable revision activated in an explicit scope.
+- **Agents** are reusable configurations of instructions/model route/tools/Skills/permissions/budgets.
+- **Plugins** are versioned contribution bundles; installation is inert and does not authorize execution.
+- **Marketplace** distributes metadata/packages; it is never a security authority.
 
-## 2. MCP architecture
+All external contributions are normalized into app-owned descriptors before use. Protocol metadata, publisher claims, signatures, popularity and model-generated descriptions may inform UX, but none grants runtime permission.
 
-### Internal components
+## 2. Trust and lifecycle states
 
-- server registry;
-- transport adapters;
-- protocol-version compatibility profiles;
-- authorization coordinator;
-- capability/tool/resource/prompt catalog;
-- health/log state;
-- internal descriptor mapper;
-- permission/provenance bridge to Tool Runtime.
+Keep these states separate:
 
-### Transports
+1. **discovered** — metadata is visible but nothing is installed or trusted;
+2. **installed** — package/config is stored and validated structurally, but executable/effectful contributions remain inert;
+3. **reviewed** — source/revision/components/capability requests have been presented or policy-reviewed;
+4. **activated** — a specific immutable revision contributes descriptors/instructions within a scope;
+5. **authorized at runtime** — Policy Core allows a concrete normalized operation.
 
-Support:
+Activation never means blanket permission. Activation is a scoped association to a specific immutable revision, not a mutation of that revision; one revision may be active in more than one supported scope. Updating source, command, endpoint, package bytes, executable component, requested capability or canonical target creates a new revision/review surface instead of silently inheriting trust.
 
-- stdio;
-- current Streamable HTTP;
-- legacy HTTP compatibility only if ecosystem need justifies tested support.
+## 3. MCP Host ownership
 
-Do not mix transport mechanics with tool semantics.
+`mcp-host` owns:
 
-## 3. MCP protocol compatibility
+- server registry and local server identity;
+- transport/profile adapters;
+- protocol-era/version negotiation;
+- authorization handoff and secret references;
+- server lifecycle/health;
+- capability, tool, resource, prompt and extension discovery;
+- descriptor/schema normalization and cache freshness;
+- MCP Task / multi-round-trip correlation;
+- conversion to internal Tool/Context/Skill descriptors.
 
-Research baseline: `2026-07-28`.
+MCP Host does **not** decide local execution permission and does not promote server content into trusted instructions by itself.
 
-Current Streamable HTTP differs materially from 2025-era revisions. Therefore:
+## 4. MCP protocol compatibility baseline
 
-- do not hard-code one handshake/session assumption;
-- associate every connection/profile with protocol revision/capability metadata;
-- test compatibility matrices with fixtures/servers;
-- prefer current per-request POST semantics for new HTTP integrations;
-- cancellation behavior depends on transport/profile;
-- protocol downgrade must be explicit/observable.
+Research baseline: `2026-07-28` plus independently versioned extensions supported by the selected SDK/profile.
 
-## 3.1 Current extension model
+For the modern protocol era:
 
-The `2026-07-28` generation also formalizes an extension mechanism. Treat extensions as explicitly negotiated capabilities, not as assumptions attached to every MCP server.
+- do not assume `initialize`, `initialized` or `Mcp-Session-Id` exists;
+- requests are self-describing and protocol/client capability metadata is per request;
+- `server/discover` may be used for up-front discovery but is not application identity;
+- Streamable HTTP routing/version/header rules are validated by the protocol adapter;
+- list/read TTL metadata is a **freshness hint**, not integrity proof;
+- extension capability negotiation is explicit and version/profile aware;
+- cancellation semantics are transport/profile specific;
+- server/client implementation info is self-reported display/diagnostic metadata, never a trust or authorization input.
 
-In particular, the Tasks extension can represent long-running server work with durable task handles and polling/cancellation semantics. This is useful for future integrations, but it must remain distinct from the app's own `AgentTask` model:
+Legacy profiles may be supported only behind explicit compatibility fixtures. Do not implement deprecated Roots/Sampling/Logging as new product dependencies for the modern profile; compatibility support, if needed, stays isolated in the legacy adapter.
 
-- MCP Task = protocol/server execution state;
-- app AgentTask = user-visible orchestration state owned by this application.
+SDK support may lag a finalized protocol/extension. Product behavior is gated by tested capability/profile support rather than by assuming an SDK version implements every current SEP.
 
-An adapter may correlate the two, but must not collapse them into one persistence model. V1 does not require Tasks support unless a selected SDK/server dependency makes it necessary; reserve capability metadata and add conformance fixtures before enabling it.
+## 5. Stable MCP server identity
 
-## 4. MCP authorization
+A local `mcpServerId` is app-owned. Its trust/activation revision binds to the connection definition that matters for authority:
+
+- transport kind;
+- canonical HTTP origin or executable identity;
+- command/arguments/cwd for stdio;
+- bounded environment/secret-reference policy;
+- selected protocol/profile policy;
+- source/project scope.
+
+Server-provided names/versions do not define identity. A material connection-definition change invalidates the old activation review and produces a new revision.
+
+## 6. Transport security
+
+### HTTP / Streamable HTTP
+
+- canonicalize endpoint/origin before credential resolution;
+- bind credentials/tokens to the intended resource/audience/origin;
+- do not forward authorization across untrusted redirects or to a different MCP resource;
+- validate current MCP/OAuth issuer/resource semantics where supported;
+- bound response/body/schema sizes and timeouts;
+- treat loopback, LAN and remote endpoints distinctly in UI/policy;
+- do not use server-supplied implementation metadata as security evidence.
+
+### stdio
+
+Activating a stdio server is equivalent to authorizing local process launch.
+
+- store command and args as structured fields; do not build a shell string;
+- use an explicit cwd;
+- pass a minimal environment rather than inheriting all application secrets;
+- inject only named secret references required by that server;
+- track the child process as app-owned and terminate only processes the app actually owns;
+- stdout is protocol traffic; diagnostics belong on the appropriate side channel and remain bounded/redacted.
+
+Installing/importing an stdio definition must never spawn the process automatically.
+
+## 7. MCP authorization
 
 For HTTP servers that implement authorization:
 
-- follow current MCP/OAuth discovery semantics;
-- store tokens in SecretStore, not server config JSON;
-- bind tokens to target resource/audience;
+- follow the active profile's OAuth/discovery requirements;
+- store tokens only through `SecretStore` references;
+- bind credentials to the correct issuer/resource/audience;
 - request least-privilege scopes;
-- support bounded step-up authorization when server challenges scopes;
-- never forward bearer tokens to a different MCP resource;
-- redact tokens from logs/tool context.
+- bounded step-up authorization may request additional scopes, but never broadens silently;
+- expiry/revocation/reauth state is explicit;
+- redact auth material from context/logs/diagnostics.
 
-For stdio, credentials generally come from a controlled launch environment/secret injection policy rather than pretending HTTP OAuth applies.
+MCP authorization proves access to the remote server. It does **not** replace local Tool Runtime/Policy Core authorization for effectful operations surfaced to the app.
 
-## 5. MCP tool catalog
+## 8. Catalog, schema, and cache rules
 
-Do not expose every connected tool schema to every model call.
+Do not expose every connected MCP tool schema to every model request.
 
-Maintain metadata index containing:
+Maintain normalized catalog metadata including:
 
-- server ID/provenance;
-- tool name/title/description;
-- input/output schema fingerprints;
-- trust/permission hints;
-- tags/keywords;
+- local server/revision/provenance;
+- tool/resource/prompt identity;
+- title/description/tags;
+- input/output schema fingerprint;
+- locally classified effect/risk metadata;
+- server-declared annotations retained as untrusted hints;
 - health/availability;
-- protocol profile.
+- protocol/extension profile;
+- fetched-at/TTL/cache-scope metadata.
 
-Context planner/tool router selects a small relevant set. User can pin tools/servers.
+Tool name collisions use app-owned stable IDs such as `serverRevisionId/toolName`; names are not globally unique.
 
-Tool name collisions are disambiguated using stable internal IDs such as `serverId/toolName`; never assume MCP server names are globally unique.
+Schema handling:
 
-## 6. Skills
+- validate the JSON Schema dialect/profile expected by the negotiated MCP revision;
+- bound schema depth/size/validation work;
+- do not automatically dereference arbitrary external `$ref` URLs;
+- a schema/content fingerprint change creates a new descriptor revision and invalidates pending approvals tied to the prior revision.
+
+Catalog TTL controls re-fetch timing only. It does not prove bytes are unchanged or trusted.
+
+## 9. Multi-round-trip input and remote Tasks
+
+Modern MCP may return input-required/multi-round-trip state or an extension-owned Task handle.
+
+Rules:
+
+- correlate remote state to the owning `toolCallId`/`toolAttemptId` without reusing app IDs;
+- persist only the bounded remote handle/state required for reattach/poll/cancel;
+- remote input requests are untrusted schemas/messages and must be rendered through an app-owned safe UI;
+- a user's response to MCP elicitation supplies **input**, not local operation approval;
+- if the resumed operation still needs local permission, Tool Runtime/Policy Core evaluates it normally;
+- cancellation or terminal state remains explicit and auditable.
+
+MCP Task is remote server execution state. Agent Task/Run is local application execution state. Never collapse them.
+
+## 10. Product Skills
 
 Canonical package shape:
 
@@ -100,31 +163,71 @@ Canonical package shape:
 skill-name/
   SKILL.md
   references/   # optional
-  scripts/      # optional
+  scripts/      # optional resources, never auto-executed
   assets/       # optional
 ```
 
-Skill metadata should make discovery possible without loading full instructions.
+Skill metadata supports cheap discovery without loading the entire body.
 
 Scopes:
 
 - global;
 - project;
-- optionally path-scoped via project rule mechanisms.
+- optionally path-scoped within a trusted project.
 
-Activation modes may include explicit, auto-discovered by task relevance, or always-on by user configuration. Always-on skills must remain rare because they consume persistent context.
+Activation may be explicit or relevance-based according to user configuration. Always-on Skills stay rare.
 
-A Skill guides behavior; it does not grant permissions.
+A Product Skill contributes instructions/resources only. It does not grant filesystem, shell, network, credential, MCP or plugin execution permission. A script shipped inside a Skill is merely a resource until invoked through an authorized Tool Runtime path. Security-relevant Skill revision/source provenance survives into Prompt Runtime and any causally resulting Tool Call when it can change policy.
 
-## 7. Project rules / instruction files
+## 11. Skills delivered over MCP
 
-Recognize project instruction files such as `AGENTS.md` and optionally `CLAUDE.md` as repository context according to configured precedence. More-specific path rules refine broader project rules.
+When the finalized `io.modelcontextprotocol/skills` extension is supported, MCP is a **distribution/discovery source**, not a second Skill runtime. The extension transport is versioned independently from the Product Skill runtime and must be feature-gated by tested SDK/profile support. MCP-served Skill content remains remote-origin instructional input: a connected server, successful authentication or matching digest does not make it authoritative.
 
-Repository content is not allowed to override app security policy.
+V1 activation flow:
 
-## 8. Plugin manifest
+1. discover or explicitly resolve a Skill by `(mcpServerRevisionId, skillUri)`; name/URI alone is never global identity;
+2. preserve the originating server identity, URI, verbatim frontmatter, complete static resource manifest, digests/sizes and cache metadata;
+3. require explicit per-Skill user activation approval bound to the server revision + Skill URI + manifest/frontmatter revision; nested Skills require independent approval;
+4. fetch `SKILL.md` through the Skill-loading path, verify size/digest and frontmatter against the held entry, then lazily fetch supporting files and verify each against that same held manifest;
+5. create an app-owned immutable Product Skill revision/snapshot with MCP origin/trust class preserved;
+6. route the revision active in that scope through Extension Core and Prompt Runtime using the MCP-origin instruction rules, never as an indistinguishable local/package Skill.
 
-Conceptual fields:
+Additional V1 rules:
+
+- same-name Skills are origin-namespaced and cannot silently shadow/replace a local Skill or a Skill from another MCP server;
+- supporting/relative resource reads stay bound to the originating MCP server revision; V1 denies cross-server Skill reads rather than acting as a confused deputy;
+- digest/size agreement proves consistency with the held entry, **not publisher/server trust**, because the same origin supplies both manifest and bytes;
+- a held manifest defines the acting revision: an unlisted file, changed digest/size/frontmatter, or refreshed manifest invalidates the prior content-bound activation approval and creates a new review surface;
+- retrieval is lazy and bounded by the negotiated/current extension contract; for the current stable Skills extension profile, support at least 512 resources and 16 MiB total file bytes per Skill, with those limits kept profile/version-aware rather than scattered as business-logic magic numbers; do not prefetch every Skill/file on connection;
+- V1 does not persistently activate `dynamic`/not-content-bindable MCP Skills; they may be previewed/read only as ordinary untrusted MCP context;
+- `allowed-tools`, hooks, scripts or equivalent Skill metadata are requests/hints, never host permission grants;
+- Skill scripts/assets never execute during discovery, fetch, verification or activation;
+- host-side shell/process/code execution causally requested while acting on an MCP Skill requires explicit user authorization scoped to that Skill revision **plus** the normal concrete Tool Runtime/Policy Core operation decision. One approval UI may satisfy both only when it names the Skill origin/revision and exact operation;
+- Skill origin/revision remains visible in UI, diagnostics, Prompt Runtime provenance and causally resulting Tool Calls while the Skill is active.
+
+## 12. Repository instructions and workspace trust
+
+Repository-controlled instruction files such as `AGENTS.md` are only a trusted project-instruction layer when the attached workspace/root is in the app's **trusted** state or the user explicitly approves that instruction source.
+
+In restricted/untrusted state:
+
+- repository files can still be indexed/read as untrusted evidence;
+- repository-controlled project Skills/plugins/hooks/commands are not automatically activated;
+- repository settings cannot silently enable process/network/credential behavior;
+- user-entered Project instructions stored by the app remain distinct from repository-supplied instructions.
+
+Trust is scoped to the canonical workspace/root identity and is revocable. Trust admits only designated repository instruction/configuration sources defined by the product contract; it does **not** turn arbitrary README/source/issues/artifacts into trusted instructions. Trust does not bypass per-operation Tool Runtime permission.
+
+## 13. Plugin contribution classes
+
+A plugin manifest may describe contributions such as:
+
+- data-only Skills/agent profiles/commands/configuration;
+- MCP server definitions;
+- declarative UI metadata;
+- executable scripts/hooks/workers in later phases.
+
+Conceptual manifest fields:
 
 ```json
 {
@@ -132,7 +235,6 @@ Conceptual fields:
   "name": "Example",
   "version": "1.0.0",
   "publisher": "example",
-  "description": "...",
   "minAppVersion": "...",
   "permissions": [],
   "components": {
@@ -140,49 +242,77 @@ Conceptual fields:
     "agents": [],
     "commands": [],
     "hooks": [],
-    "mcpServers": []
+    "mcpServers": [],
+    "ui": []
   },
   "source": {},
   "integrity": {}
 }
 ```
 
-Validate manifests against a versioned schema.
+Validate against a versioned schema. Preserve package/revision identity and requested capabilities separately from granted runtime operations.
 
-## 9. Install vs activate
+## 14. Executable extension policy
+
+V1/Phase 4 is declarative/protocol-based. Arbitrary third-party JavaScript/Python/native code must **not** be dynamically imported into Electron renderer, preload, main, or core package processes.
+
+When Phase 5 introduces executable plugin hooks/workers, use an explicit isolated extension execution boundary with a narrow versioned capability-mediated message bridge. The worker receives no ambient Electron/Node host objects, raw SQLite/SecretStore handles, inherited full environment, or blanket filesystem/network authority; requested effects flow through explicit capabilities and the normal Tool Runtime/Policy Core path where applicable. Worker crash/timeout/restart is bounded and cannot take down the desktop host. Until that boundary and sandbox/permission tests exist, executable hooks remain disabled/reserved.
+
+Commands contributed by a plugin are descriptors that resolve to approved application use cases/tools; they are not arbitrary in-process callbacks.
+
+## 15. Extension UI policy
+
+Do not allow a plugin to inject arbitrary React/DOM code into the host renderer.
+
+Supported directions are:
+
+- host-rendered declarative metadata/components; or
+- a later explicitly supported MCP Apps / equivalent sandboxed-view boundary.
+
+If MCP Apps is supported later, treat it as progressive enhancement: sandboxed iframe/view, declarative CSP/network domains, explicit browser-capability permissions, validated `postMessage`/bridge source, and all host/tool actions mediated by app policy. An extension UI never receives direct Electron/Node/secret/storage access.
+
+## 16. Install, update, activate, rollback
 
 Installation:
 
-- fetch/copy package;
-- verify manifest/integrity metadata where available;
-- record source/version;
-- inspect requested permissions/components;
-- no executable hooks/scripts automatically run.
+- stage package/config through an app-owned data/archive reader, not by executing an untrusted package manager install lifecycle;
+- validate manifest/schema and bound archive/file count/expanded size;
+- reject absolute paths, `..` traversal, symlink/hardlink escapes or any extraction outside the staging root;
+- never run package `preinstall`/`install`/`postinstall` or equivalent hooks as part of product installation;
+- compute/verify integrity metadata where available;
+- record source/version/revision;
+- inspect contribution classes/capability requests;
+- perform **no executable side effect**.
 
 Activation:
 
-- user/project enables components;
-- effective permissions are resolved;
-- executable capability may require approval/review;
-- lifecycle events become eligible.
+- bind a specific immutable revision to global/project scope;
+- apply workspace-trust rules;
+- expose only allowed contribution descriptors;
+- runtime operations still require normal policy.
 
-## 10. Hooks
+Update:
 
-Potential lifecycle events:
+- stage as a new revision;
+- show permission/capability/executable/source changes;
+- do not silently preserve activation when the security-relevant surface changed;
+- keep enough previous metadata/package state for safe rollback when practical.
 
-- session/task start/end;
-- user prompt submit;
-- before/after model request;
-- pre/post tool use;
-- tool error;
-- before/after compaction;
-- subagent start/stop.
+Uninstall removes activation first, then package metadata/files subject to reference/cleanup rules; it never silently deletes user artifacts.
 
-Hooks have explicit capability classes: observe, enrich, transform, block. They cannot bypass permission policy or access arbitrary secrets.
+## 17. Hooks
 
-V1 can omit general executable hooks while keeping manifest boundary reserved.
+Potential lifecycle events include task/session/model/tool/compaction/subagent events.
 
-## 11. Marketplace
+Capability classes may include observe, enrich, transform and block, but:
+
+- hooks cannot bypass Policy Core;
+- hooks cannot obtain arbitrary secrets;
+- transform/block hooks are more privileged than observation and require explicit review;
+- executable hooks wait for the isolated extension runtime in Phase 5+;
+- hook failure/timeout is bounded and cannot deadlock the main runtime.
+
+## 18. Marketplace
 
 Registry operations:
 
@@ -190,29 +320,10 @@ Registry operations:
 - inspect versions/source/components/permissions;
 - install/update/disable/enable/uninstall.
 
-Before activation show:
+Before activation show source/publisher, exact revision/version, capability/permission requests, executable components, MCP definitions, bundled Skills/agents, integrity/signature metadata where available, and trust warnings.
 
-- publisher/source;
-- version;
-- requested permissions;
-- executable hooks/scripts;
-- MCP definitions;
-- bundled Skills/agents;
-- integrity/signature info where available;
-- trust warnings.
+Popularity, stars, download count, publisher text and signature presence are not proof that behavior is safe.
 
-Popularity/download count is not security evidence.
+## 19. Verification ownership
 
-## 12. Security tests
-
-Test:
-
-- malicious prompt/tool descriptions do not alter instruction precedence;
-- MCP tool results cannot grant permission;
-- token/resource binding;
-- plugin install has no execution side effect;
-- path traversal inside packaged assets;
-- manifest schema rejection;
-- tool-name collision handling;
-- bounded tool catalog/context size;
-- server disconnect/auth expiry and recovery.
+`TEST_STRATEGY.md` is the canonical owner of MCP/extension security, protocol and lifecycle tests. This document defines the subsystem contract; do not duplicate the test matrix here.

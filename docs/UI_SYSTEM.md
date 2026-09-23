@@ -1,14 +1,12 @@
 # UI System and Frontend Implementation Contract
 
 > **Authority:** normative UI implementation contract
-> **Required development Skill:** external **`ui-ux-pro-max`** for substantial UI work
+> **Development capability:** follow the substantial-UI route in `DEVELOPMENT_TOOLING.md`
 > **Architecture owner:** `ARCHITECTURE.md` remains authoritative for renderer/application/runtime boundaries.
 
 ## 1. Purpose
 
-This document turns `UX_SPEC.md` into repeatable frontend implementation rules. `ui-ux-pro-max` supplies UI/UX design intelligence and stack-specific guidance; this document supplies product-specific constraints, states, architecture, accessibility, and validation gates. Optional `frontend-design` may add a visual/taste refinement pass, but it never replaces the required UI/UX workflow.
-
-Substantial UI work is blocked if the required `ui-ux-pro-max` Skill is unavailable. Tiny local fixes such as copy correction or an obvious one-line style defect do not need a full design pass.
+This document turns `UX_SPEC.md` into repeatable frontend implementation rules. External UI capabilities supply design intelligence; this document supplies product-specific constraints, states, architecture, accessibility, and validation gates. Capability selection and blocking are owned only by `DEVELOPMENT_TOOLING.md`.
 
 ## 2. Design intent
 
@@ -22,12 +20,12 @@ Avoid generic generated-UI tells: decorative gradient/glow by default, identical
 
 For a new shell, screen, major flow, redesign, or design-system change:
 
-1. use `ui-ux-pro-max` and follow its current design-system/UX workflow;
+1. activate the substantial-UI route from `DEVELOPMENT_TOOLING.md`;
 2. read the relevant UX/product/runtime states before drawing the screen;
 3. define a short design direction for this product surface: audience/job, hierarchy, layout idea, typography, semantic color intent, density, and the one distinctive visual idea worth spending emphasis on;
 4. use realistic product content/states, not lorem ipsum or generic SaaS metrics;
 5. implement within the frozen renderer/application/runtime boundaries;
-6. if the surface benefits from an additional visual/taste pass, optionally use `frontend-design` to refine the chosen direction without replacing product/UX constraints;
+6. use any optional refinement capability selected by the route only after product/UX constraints are satisfied;
 7. render and inspect at multiple realistic desktop sizes;
 8. use screenshot/visual critique when the environment supports it, then simplify/refine visible problems;
 9. validate keyboard/focus, reduced motion, contrast, error/empty/loading/approval states;
@@ -163,7 +161,7 @@ A visually polished screen that violates accessibility, runtime boundaries, or r
 
 Phase 0/1 must establish:
 
-- intentional app-shell direction created with `ui-ux-pro-max`;
+- intentional app-shell direction created through the required UI capability route;
 - semantic tokens/primitives;
 - secure typed preload/application access pattern;
 - keyboard/focus foundation;

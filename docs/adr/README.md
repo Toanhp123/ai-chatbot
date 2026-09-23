@@ -15,6 +15,7 @@ Lean template:
 - Date: YYYY-MM-DD
 - Class: FROZEN change | cross-cutting implementation | compatibility | security | other
 - Supersedes: D-xxx / ADR-NNNN / none
+- Clarifies: ADR-NNNN / none (optional; use when narrowing/repairing a detail without replacing the whole prior ADR)
 - Superseded by: none
 
 ## Context

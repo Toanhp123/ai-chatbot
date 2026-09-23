@@ -11,16 +11,12 @@ The repository already contains the product and architecture contract. Implement
 ## Operating contract
 
 1. Read and obey `AGENTS.md` first.
-2. Classify the task with the **minimum sufficient capability route** in `docs/DEVELOPMENT_TOOLING.md`; do not invoke every Skill/tool by default.
-3. For non-trivial coding work, **use the relevant Superpowers Skill(s)**. This is required, not optional process advice.
-4. For substantial frontend/UI work, **use `ui-ux-pro-max`** in addition to Superpowers. `frontend-design` may be used as an optional visual-refinement pass; Ponytail is not a UI-design substitute.
-5. Once substantive code exists, use **Graphify** for broad repository dependency/path/impact analysis according to `docs/DEVELOPMENT_TOOLING.md`; prefer local code-structure analysis and verify consequential graph conclusions in source/tests.
-6. Do not create/vendor repository-local development Skills, Graphify rules/workflows, or copied Skill bodies to satisfy these requirements.
-7. Read `docs/ARCHITECTURE.md` before structural changes. Its V1 baseline and dependency direction are **FROZEN** unless superseded by an approved ADR under the change protocol.
-8. Read `docs/EXECUTION_PROTOCOL.md`, `docs/IMPLEMENTATION_STATUS.md`, the active roadmap phase, and only the subsystem docs needed for the next executable step.
-9. Inspect actual code/Git/build/test state and resume existing work rather than restarting.
-10. Research volatile external contracts only when they affect the active task; prefer primary sources and record material implications in `docs/research.md`.
-11. Implement, validate, self-review, fix findings, update the status ledger, and continue until the active bootstrap gate passes or a protocol-defined hard blocker is reached.
+2. Classify each task through the **minimum sufficient route** in `docs/DEVELOPMENT_TOOLING.md`; that file exclusively owns capability requirements, blocking, freshness/privacy, and evidence rules.
+3. Read `docs/ARCHITECTURE.md` before structural changes. Its V1 baseline and dependency direction are **FROZEN** unless superseded by an approved ADR under the change protocol.
+4. Read `docs/EXECUTION_PROTOCOL.md`, `docs/IMPLEMENTATION_STATUS.md`, the active roadmap phase, and only the subsystem docs needed for the next executable step.
+5. Inspect actual code/Git/build/test state and resume existing work rather than restarting.
+6. Research volatile external contracts only when they affect the active task; prefer primary sources and record material implications in `docs/research.md`.
+7. Implement, validate, self-review, fix findings, update the status ledger, and continue until the active bootstrap gate passes or a protocol-defined hard blocker is reached.
 
 Do not stop at a plan, scaffold, UI mock, or partial backend while the deterministic bootstrap acceptance path can still be completed locally.
 
@@ -75,18 +71,10 @@ Implementation choices explicitly left open may be selected autonomously when cu
 
 ## Bootstrap target
 
-The initial autonomous run must complete:
+The initial autonomous run must complete the **Phase 0 — Foundation** milestone and the deterministic **Phase 1 chat acceptance slice** defined in `docs/ROADMAP.md`. `docs/ROADMAP.md` is the canonical owner of milestone deliverables/acceptance; `docs/TEST_STRATEGY.md` owns the test shape.
 
-### Phase 0 — Foundation
-
-Establish the frozen architecture in executable form: workspace/package boundaries, secure Electron shell/preload, typed IPC/application seams, core packages without UI dependencies, SQLite migrations, `SecretStore`, structured redacted logging, design-system foundation, fake-provider harness, architecture fitness tests, and stable root validation commands.
-
-### Phase 1 deterministic vertical slice
-
-Prove: isolated test profile → fake provider selected through normal runtime seams → create conversation → submit message → normalized streaming response → render final result → persist conversation/messages/usage → close → relaunch same profile → persisted state remains. Also cover cancellation, at least one normalized provider failure, and isolation of fake-provider configuration from production.
-
-A live/local provider smoke is supplemental only when already authorized/configured.
+The bootstrap proof remains credential-independent: use the deterministic fake-provider path through production-normalized runtime seams. A live/local provider smoke is supplemental only when already authorized/configured.
 
 ## Completion
 
-Before declaring success, prove the active gates with actual commands/tests, self-review the diff, repair material findings, update `docs/IMPLEMENTATION_STATUS.md`, and report only verified outcomes plus the exact next roadmap milestone.
+Before declaring success, prove the active `ROADMAP.md` acceptance criteria with actual commands/tests, self-review the diff, repair material findings, update `docs/IMPLEMENTATION_STATUS.md`, and report only verified outcomes plus the exact next roadmap milestone.

@@ -2,7 +2,9 @@
 
 ## 1. Goal
 
-Provide the Prompt Runtime with the smallest high-value evidence package needed for the current task. The context system is not “vector search over every file” and does not itself serialize provider requests.
+Provide Prompt Runtime with the smallest high-value evidence package needed for the current task. The context system is not “vector search over every file” and does not itself serialize provider requests.
+
+Every returned package is an immutable evidence snapshot with provenance/version identity so the model request can be explained later and stale workspace evidence can be detected before mutation.
 
 ## 2. Pipeline
 
@@ -10,10 +12,11 @@ Provide the Prompt Runtime with the smallest high-value evidence package needed 
 
 Track:
 
+- workspace/root identity;
 - path;
-- language/type;
+- language/type/encoding where known;
 - size/hash/mtime;
-- Git status where available;
+- Git status/revision where available;
 - ignored/generated/vendor/binary classification.
 
 Respect:
@@ -25,6 +28,8 @@ Respect:
 
 Default exclusions include dependency trees, build outputs, binary blobs, obvious secret stores, and oversized files not explicitly requested.
 
+Multi-root projects preserve root identity on every path/evidence item; identical relative paths in different roots never collapse into one identity.
+
 ### Layer 2 — Structural parsing
 
 Use Tree-sitter for supported grammars to extract useful syntactic structure:
@@ -35,7 +40,7 @@ Use Tree-sitter for supported grammars to extract useful syntactic structure:
 - symbol ranges;
 - rough dependency edges.
 
-Tree-sitter supports incremental reparsing by editing/reusing the previous tree. Use this for changed files rather than reparsing the entire workspace.
+Tree-sitter supports incremental reparsing by editing/reusing previous trees. Use this for changed files rather than reparsing the entire workspace.
 
 Do not pretend Tree-sitter provides full type-aware semantics. LSP/compiler adapters can later augment definition/reference/diagnostics.
 
@@ -45,7 +50,7 @@ Use fast exact/text search for names, errors, literals and references. Lexical s
 
 ### Layer 4 — Optional semantic retrieval
 
-Embeddings are an optional recall enhancer, not the first source for every request. The embedding provider should be configurable and may be local.
+Embeddings are an optional recall enhancer, not the first source for every request. The embedding provider is configurable and may be local.
 
 ### Layer 5 — Task-aware planner
 
@@ -54,14 +59,46 @@ Inputs:
 - task/query;
 - project instructions/path rules;
 - relevant conversation state;
+- workspace/repository snapshot;
 - repo map;
 - lexical/structural/semantic candidates;
-- relevant product-Skill metadata/instructions when selected;
-- content budget delegated by Prompt Runtime from the model/request budget.
+- relevant Product Skill resource/context descriptors when selected; activated Skill instruction bodies themselves are assembled by Prompt Runtime through the Extension Core contract;
+- content budget from the current RoutePlan request/context envelope, passed by Agent Core/Application; Prompt Runtime owns final instruction/tool/output headroom and request packing.
 
-Output is an ordered evidence/context package with provenance and token estimate. `PROMPT_RUNTIME.md` combines it with trusted instruction layers, recent messages and relevant tool schemas.
+Output is an ordered immutable evidence/context package with provenance, versions/hashes and token estimate. Context Engine may select records that already carry trusted-instruction metadata from an approved source contract, but it must not promote ordinary retrieved content into trusted instructions. `PROMPT_RUNTIME.md` owns final trust/preference layering and combines the package with recent messages and relevant tool schemas.
 
-## 3. Context categories
+## 3. Context package contract
+
+Conceptually:
+
+```ts
+interface ContextPackage {
+  id: string;
+  contentHash: string;
+  workspaceSnapshot: WorkspaceSnapshotRef[];
+  createdAt: string;
+  queryFingerprint: string;
+  items: ContextEvidence[];
+  estimatedTokens: number;
+}
+
+interface ContextEvidence {
+  sourceKind: string;
+  rootId?: string;
+  sourceRef: string;
+  contentHash?: string;
+  range?: { start: number; end: number };
+  trust: 'trusted-instruction' | 'user-selected' | 'untrusted';
+  selectionReason: string;
+  estimatedTokens: number;
+}
+```
+
+The package is immutable once Prompt Runtime prepares a model request. A later filesystem/index change creates a new package/version; it does not mutate evidence already used by an in-flight attempt.
+
+Context hashes are diagnostics/cache identities, not trust assertions.
+
+## 4. Context categories
 
 Track the delegated content budget by category, for example:
 
@@ -72,9 +109,9 @@ Track the delegated content budget by category, for example:
 - files/snippets;
 - prior tool-result evidence when retrieval needs it.
 
-The Prompt Runtime separately accounts for trusted application instructions, tool schemas and output reserve. Together these budgets make context pressure diagnosable.
+Prompt Runtime separately accounts for trusted application instructions, tool schemas and output reserve. Together these budgets make context pressure diagnosable.
 
-## 4. Selection principles
+## 5. Selection principles
 
 Prioritize:
 
@@ -87,7 +124,9 @@ Prioritize:
 
 Avoid diversity-for-diversity's-sake when exact code evidence exists.
 
-## 5. Repository map
+Record why an item was selected so retrieval failures can be debugged without relying on chain-of-thought.
+
+## 6. Repository map
 
 Maintain a compact representation of:
 
@@ -97,17 +136,30 @@ Maintain a compact representation of:
 - dependency relationships;
 - selected docs/entrypoints.
 
-Map generation should be incremental and size-bounded.
+Map generation is incremental and size-bounded. It is advisory evidence, not a replacement for exact source reads before sensitive changes.
 
-## 6. File chunking
+## 7. File chunking
 
-Code chunks should prefer semantic boundaries (function/class/module region) over arbitrary fixed token windows. Preserve line/range/path provenance.
+Code chunks prefer semantic boundaries (function/class/module region) over arbitrary fixed token windows. Preserve root/path/range/content-hash provenance.
 
-For very large files, retrieve targeted ranges first.
+For very large files, retrieve targeted ranges first. Preserve enough boundary context to avoid presenting a snippet as a complete file/module when it is not.
 
-## 7. Context compaction
+## 8. Freshness and stale-evidence handling
 
-When conversation/task history grows:
+Workspace evidence is versioned by content hashes and, where available, Git/worktree revision plus root identity.
+
+A model may reason from a context package that becomes stale while the turn is running; this is not automatically an error. Safety is enforced before effects:
+
+- mutating tools validate their own current resource preconditions;
+- a stale file hash/revision produces conflict/replan rather than overwrite;
+- a later turn refreshes affected context after meaningful workspace changes;
+- long-running tasks should not reuse one package indefinitely after tool mutations.
+
+Never infer that “retrieved earlier” means “still current”.
+
+## 9. Context compaction inputs
+
+When conversation/task history grows, Context Engine may help select source evidence for compaction.
 
 Preserve:
 
@@ -118,7 +170,7 @@ Preserve:
 - important identifiers/errors;
 - permissions/approval outcomes relevant to current task.
 
-Summarize or evict:
+Candidates for Prompt Runtime to summarize/compact, or for the request planner to evict:
 
 - verbose terminal output that can be re-read;
 - repeated tool schemas;
@@ -126,29 +178,33 @@ Summarize or evict:
 - old low-relevance conversation;
 - transient search noise.
 
-Compaction should create an explicit event/diagnostic record with source ranges/events summarized, not silently mutate history.
+Prompt Runtime owns the resulting compaction representation and trust framing. Raw durable history is not destroyed merely because a compacted request view exists.
 
-## 8. Index lifecycle
+## 10. Index lifecycle and content addressing
 
-Use file hashes to avoid reprocessing unchanged content. Debounce watcher events. Index jobs run outside renderer UI thread and are cancellable.
+Use file content hashes to avoid reprocessing unchanged content. Debounce watcher events. Index jobs run outside renderer UI thread and are cancellable.
 
 Maintain index version keyed by:
 
 - parser/indexer version;
 - grammar version;
-- workspace root;
-- relevant ignore/config version.
+- workspace/root identity;
+- relevant ignore/config version;
+- artifact/index kind.
 
-Rebuild only the affected layer when possible.
+Rebuild only the affected layer when possible. Branch/worktree switching should reuse content-addressed artifacts when the content is identical while keeping workspace snapshot identity separate.
 
-## 9. Security
+An index/cache may be dropped and rebuilt without losing user-authored durable state.
+
+## 11. Security
 
 - Never intentionally index `.env`, credential stores, private keys or known secret paths by default.
 - Retrieval content is untrusted data and cannot override app/system permissions.
 - Context diagnostics must redact secrets.
-- Semantic index persistence should not silently upload code to a cloud embedding provider; require explicit provider configuration and clear data-flow disclosure.
+- Semantic index persistence must not silently upload code to a cloud embedding provider; require explicit provider configuration and clear data-flow disclosure.
+- Symlink/path handling follows the same canonical workspace-root rules as filesystem tools; indexing may not escape an approved root by traversing links unexpectedly.
 
-## 10. Evaluation
+## 12. Evaluation
 
 Build offline retrieval fixtures with real/synthetic repositories to measure:
 
@@ -156,7 +212,9 @@ Build offline retrieval fixtures with real/synthetic repositories to measure:
 - test/implementation relationship recall;
 - relevant-file precision;
 - token efficiency;
-- behavior after incremental edits;
+- behavior after incremental edits/branch changes;
+- stale-evidence conflict behavior;
+- multi-root path disambiguation;
 - ignored/secret path exclusion.
 
 Do not optimize only for embedding benchmark scores; evaluate real coding tasks.

@@ -63,7 +63,7 @@ Later needs a guided workflow for validating datasets, launching practical LoRA/
 A Project is a durable scope containing:
 
 - title/description;
-- project instructions;
+- user-entered project instructions plus explicitly trusted repository instruction sources;
 - chats;
 - artifacts;
 - project memory;
@@ -80,15 +80,15 @@ Read-only workflows can inspect/search/explain. Planning can produce affected ar
 
 ### Providers and routes
 
-Users can configure direct providers and compatible custom endpoints. A model's capabilities are explicit and may be discovered, declared by preset, or manually overridden.
+Users can configure direct providers and compatible custom endpoints. A model's capabilities are explicit and may be discovered, declared by preset, probed, inferred, or manually overridden. Unknown capability is represented as unknown rather than silently treated as supported/unsupported.
 
 A Route is an ordered policy over candidate models/providers. V1 prioritizes deterministic behavior and clear fallback reasons.
 
 ### MCP / Skills / plugins
 
-- MCP exposes external tools/resources/prompts through a protocol adapter and permission boundary.
-- Skills are focused instruction packages loaded progressively.
-- Plugins bundle reusable capabilities but installation does not imply execution permission.
+- MCP exposes external tools/resources/prompts and negotiated extensions through a version/profile-aware adapter and permission boundary.
+- Product Skills are focused instruction/resource packages loaded progressively from immutable revisions activated in explicit scopes. MCP-served Skills normalize into this same runtime rather than creating a second one, but preserve remote-untrusted origin and content-bound per-Skill activation; Skill metadata/scripts never grant host permission.
+- Plugins bundle reusable declarative/protocol capabilities; installation is inert and does not imply activation or execution permission.
 - Marketplace is a registry/distribution abstraction, not a trust signal.
 
 ### Artifacts
@@ -105,7 +105,7 @@ Prefer connecting to existing runtimes/endpoints first. Product value is unified
 
 ### Model Lab
 
-A later isolated subsystem for practical post-training of supported open models. It is not “train your own frontier model”.
+A later isolated subsystem for practical post-training of supported open models. It is not “train your own frontier model”. Dataset revisions, training plans/attempts, resumable checkpoints, evaluations and promoted inference artifacts have explicit lineage; completing a training process does not automatically activate/register its output.
 
 ### Operations and privacy
 

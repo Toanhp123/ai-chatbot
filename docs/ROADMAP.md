@@ -13,12 +13,12 @@ Deliver:
 - SQLite storage + reproducible migrations;
 - `SecretStore` abstraction with security-health/degraded state;
 - structured logging/redaction foundation;
-- semantic design tokens/basic shell UI designed with the required external `ui-ux-pro-max` Skill;
+- semantic design tokens/basic shell UI produced through the required substantial-UI capability route;
 - normalized provider request/event types and Prompt Runtime boundary;
 - explicit profile/data-root abstraction for production vs tests;
 - deterministic fake-provider skeleton behind Provider Core;
 - architecture fitness tests for frozen dependency/trust rules;
-- developer-tooling setup consistent with `DEVELOPMENT_TOOLING.md`, including task routing and a local Graphify code-only repository graph for the final structural review once substantive source exists;
+- developer-tooling behavior consistent with `DEVELOPMENT_TOOLING.md`, including the required route for final structural review once substantive source exists;
 - stable root validation commands;
 - canonical docs/ADRs/contract inventory aligned with scaffold.
 
@@ -31,7 +31,7 @@ Acceptance criteria:
 - DB migrates from empty schema and reopens cleanly;
 - secret round-trip works on supported secure backend, with degraded state detectable;
 - architecture-fitness command catches representative forbidden imports/edges;
-- Graphify can provide local source-graph evidence for Phase 0 structural review without committed project-local skill/rule/workflow artifacts; if the capability is unavailable, the gate remains explicitly blocked rather than silently substituted;
+- final Phase 0 structural review satisfies the evidence/blocking rules owned by `DEVELOPMENT_TOOLING.md`;
 - fake provider is reachable only through Provider Core and excluded from production registration;
 - shell UI has real empty/loading/error/degraded states required by Phase 1, keyboard/focus basics, and validation at multiple desktop sizes;
 - `format:check`, `lint`, `typecheck`, `test`, `test:integration`, `test:architecture`, `test:e2e`, and `build` (or documented equivalents) are available;
@@ -41,23 +41,27 @@ Acceptance criteria:
 
 Deliver:
 
-- provider/model registry and capability model;
+- provider/model registry and provenance/freshness-aware capability model;
+- minimal Agent Core execution spine for ordinary chat using Task → Run → Turn → ModelAttempt identity/event contracts (no coding tools required yet);
+- immutable Context/PreparedModelRequest snapshots for each turn;
 - OpenAI-family adapter;
 - Anthropic adapter;
 - Gemini adapter or explicit documented deferral after the first two if active scope requires;
 - custom compatible endpoints;
 - normalized prompt assembly + streaming/errors/usage;
-- persisted conversations/messages;
+- persisted conversations/messages plus task/run/turn/model-attempt evidence and per-attempt usage;
 - attachment metadata foundation;
 - provider test harness;
 - deterministic chat UI slice using real runtime/application contracts.
 
 Acceptance criteria:
 
-App launches in an isolated test profile → fake provider selected through normal application/provider seams → deterministic model streams through normalized runtime/events → UI renders final result → conversation/messages/usage persist → app restarts with same profile → persisted state remains.
+App launches in an isolated test profile → fake provider selected through normal application/provider administration seams → user turn enters Application → Agent Core resolves a RoutePlan through Provider Core → Context Engine builds the bounded evidence package → Prompt Runtime prepares the immutable provider-neutral request → Provider Core executes the concrete Model Attempt → normalized runtime/events reach the UI → conversation/messages/task-run-turn-attempt evidence and usage persist → app restarts with the same profile → persisted state remains.
 
 Also:
 
+- retry/fallback produces distinct attempt records, reuses one immutable provider-neutral semantic request only across compatible candidates, and never erases failed-attempt usage;
+- disconnect after partial committed output is surfaced without silently concatenating a restarted attempt;
 - cancellation stops a stream;
 - at least one provider failure is normalized and rendered safely;
 - UI contains no vendor stream parsing/payload construction;
@@ -89,12 +93,14 @@ Open a real repository → ask about a symbol/feature → diagnostics show a bou
 
 Deliver:
 
-- `AgentTask` state/events;
+- expand the Phase 1 Agent Task/Run/Turn runtime into the coding-agent loop;
 - planning workflow;
 - filesystem patch tools;
 - command/process tools;
 - read Git tools then scoped mutation tools;
-- Policy Core + Tool Runtime approval path;
+- Policy Core + Tool Runtime approval path with operation-fingerprint binding/re-evaluation;
+- stale-write resource preconditions, logical tool-call vs concrete tool-attempt identity, and explicit ambiguous-side-effect handling/reconciliation;
+- one mutating run per physical workspace root unless using an explicitly isolated workspace/worktree;
 - diff/checkpoint UI;
 - optional isolated worktree/workspace execution for suitable tasks;
 - test/lint/fix loop;
@@ -102,7 +108,7 @@ Deliver:
 
 Acceptance criteria:
 
-Request a small code change → agent inspects first → plans where appropriate → requests only necessary approval → patches files through Tool Runtime → runs validation → displays diff → user can restore checkpoint without losing unrelated pre-existing work.
+Request a small code change → agent inspects first → plans where appropriate → acquires mutation ownership → requests only necessary approval bound to the exact operation → patches files through Tool Runtime with stale-write preconditions → runs validation → displays diff → user can restore checkpoint without losing unrelated pre-existing work. A changed target/precondition or interrupted owning Run invalidates the pending approval rather than silently executing the modified action. A dispatched non-idempotent tool with ambiguous completion is surfaced/reconciled and is not auto-replayed.
 
 ## Phase 4 — MCP + Product Skills
 
@@ -112,14 +118,16 @@ Deliver:
 - stdio + current Streamable HTTP implementation;
 - version/profile compatibility layer;
 - HTTP auth foundation;
-- tool/resource/prompt discovery;
+- tool/resource/prompt discovery with schema/cache/provenance revisions;
 - relevance-based tool catalog exposure;
-- global/project product Skills;
-- progressive Skill loading.
+- workspace-trust state for repository-controlled instructions/contributions;
+- global/project Product Skills with immutable revisions + scoped activation records;
+- MCP Skills extension support when the selected SDK/profile is proven compatible, normalized into the same Product Skill runtime;
+- progressive Skill loading with no script auto-execution.
 
 Acceptance criteria:
 
-Connect a fixture/real MCP server → inspect provenance/capabilities → expose only selected relevant tool schemas → invoke through Tool Runtime/Policy Core → disconnect/reconnect cleanly. A product Skill is discovered without loading all Skill bodies into every request.
+Connect a fixture/real MCP server → inspect app-owned server revision/provenance/capabilities → expose only selected relevant tool schemas → invoke through Tool Runtime/Policy Core → disconnect/reconnect cleanly. Repository instructions stay untrusted in a restricted workspace. A local Product Skill can activate an immutable reviewed revision in an explicit scope without mutating revision identity. An MCP-delivered Skill can be discovered lazily, then explicitly activated **per Skill** against its server revision + Skill URI + held manifest/frontmatter revision while preserving remote-untrusted origin; changed/dynamic content does not silently inherit persistent activation, nested Skills need separate activation, `allowed-tools`/scripts grant no capability, and bundled scripts never auto-execute.
 
 ## V1 release gate
 
@@ -147,8 +155,10 @@ Deliver only after the product Skill/MCP trust model is proven:
 - install vs activation separation;
 - trust/permission review;
 - registry abstraction/UI;
-- bundled product Skills/agents/MCP definitions;
-- executable hooks only after sandbox/permission design is proven;
+- bundled Product Skills/agents/MCP definitions;
+- staged revision update + capability/permission diff + rollback metadata;
+- declarative contributions first; no arbitrary host-process code loading;
+- executable hooks/workers only after isolated capability-mediated extension runtime + sandbox/permission tests are proven;
 - public plugin SDK only when third-party compatibility requires it.
 
 ## Phase 6 — Advanced agent platform
@@ -173,20 +183,32 @@ Deliver:
 - LM Studio compatible;
 - optional vLLM/custom runtime;
 - hardware inventory/fit estimates;
-- local model metadata/management hooks.
+- endpoint class/process-ownership visibility;
+- local model source/revision/integrity/custom-code metadata;
+- local model metadata/management hooks without opaque runtime-hosted tool bypass.
+
+Acceptance criteria:
+
+Configure at least one supported local runtime through a canonical endpoint identity → classify endpoint as loopback/LAN/remote/unknown and surface auth/exposure state → list or manually configure a model with source/capability provenance → stream chat through the normal Agent/Prompt/Provider spine → surface capability mismatch instead of silently dropping requirements. Runtime stop/restart must not corrupt conversation state; app cleanup must not kill externally owned/unknown processes; connecting must not silently widen bind/CORS/network exposure; opaque runtime-hosted tools/MCP must not masquerade as Tool Runtime-authorized operations; model artifact metadata must preserve source/revision/integrity/custom-code risk; unsafe/custom model code must remain outside Electron host processes.
 
 ## Phase 8 — Model Lab
 
 Deliver:
 
-- dataset manager/validation;
-- isolated worker environment;
-- SFT/LoRA/QLoRA;
+- immutable DatasetRevision import/validation/transform/split lineage;
+- immutable TrainingPlan + TrainingJob/TrainingAttempt lifecycle;
+- versioned isolated worker protocol/environment with local/offline-by-default compute;
+- backend capability resolution for SFT/LoRA/QLoRA;
 - NVIDIA backend path;
 - Apple Silicon MLX-LM path;
-- metrics/checkpoints;
-- evaluations/base-vs-adapted comparison;
-- export/register result.
+- device resource lease + disk/hardware preflight;
+- structured metrics and staged/finalized resumable checkpoints/artifacts;
+- pinned evaluation suites and base-vs-candidate comparison;
+- explicit candidate validation/export/Local Models promotion with append-only Model Promotion Record.
+
+Acceptance criteria:
+
+Import a dataset into an immutable revision → validate/dedupe and create reproducible non-overlapping splits → resolve immutable base model, tokenizer/template, backend capability/environment and resource fit into a TrainingPlan → acquire the declared device lease → launch one TrainingAttempt through the versioned worker protocol with external trackers/upload disabled by default → stream structured metrics → finalize a resumable checkpoint and/or inference adapter with manifest/integrity → run the same pinned evaluation suite against base and candidate → verify lineage/loadability/license metadata → explicitly register the candidate as a Local Model and append a Model Promotion Record. Retry/resume must create a new attempt, incompatible/partial checkpoints must not resume, OOM/failure must not silently mutate the plan, and TrainingAttempt completion alone must not promote a model.
 
 ## Phase discipline
 

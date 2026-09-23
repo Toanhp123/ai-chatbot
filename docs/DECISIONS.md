@@ -36,7 +36,13 @@ This file is the compact current-decision index. Detailed rationale belongs in `
 | D-021 | FROZEN | accepted | `contracts` is the only dependency-base package; `application` is the use-case boundary; `policy-core` is explicit and separate from execution. |
 | D-022 | OPERATING | accepted | Substantial UI must use `ui-ux-pro-max` plus `UX_SPEC.md`/`UI_SYSTEM.md`; rendered self-critique is required where possible. `frontend-design` is an optional visual-taste companion, not the required baseline. |
 | D-023 | OPERATING | accepted | Architecture documentation is governed by canonical ownership, a glossary, a contract inventory, ADR history, and executable fitness checks rather than prose alone. |
-| D-024 | OPERATING | accepted | Development capabilities use a minimum-sufficient task-routing policy: Superpowers for non-trivial engineering, `ui-ux-pro-max` for substantial UI, Graphify for broad structural repository analysis after substantive source exists; external capability instructions cannot override canonical product/architecture contracts. |
+| D-024 | OPERATING | accepted | Development capabilities use a minimum-sufficient task-routing policy owned by `DEVELOPMENT_TOOLING.md`; external capability instructions cannot override canonical product/architecture contracts. |
+| D-025 | FROZEN | accepted | Runtime consistency follows ADR-0003: task/run/turn/attempt identities are distinct, prepared requests/context are immutable snapshots, approvals bind to normalized operations, non-idempotent side effects are never blindly replayed, and V1 serializes mutations per physical workspace root unless isolated. |
+| D-026 | FROZEN | accepted | Workspace trust gates repository-controlled instruction/extension authority; opening/indexing a root does not automatically trust its `AGENTS.md`, Skills, hooks, commands or plugin config. |
+| D-027 | FROZEN | accepted | Extension/MCP trust follows ADR-0004: install is inert, activation binds immutable reviewed revisions; MCP-delivered Skills preserve remote-untrusted origin and require content-bound per-Skill activation; Skill metadata/`allowed-tools` cannot grant host permission; arbitrary third-party code is never dynamically imported into Electron/core processes. |
+| D-028 | FROZEN | accepted | Local AI endpoints/models carry explicit endpoint class, process ownership and artifact provenance; opaque runtime-hosted tools and model custom code never inherit app Tool Runtime/host-process trust. |
+| D-029 | FROZEN | accepted | Model Lab follows ADR-0005: immutable dataset/plan/attempt/artifact lineage, explicit resume compatibility, local/offline-by-default compute, accelerator leases, staged artifact finalization, and evaluation before model promotion. |
+| D-030 | FROZEN | accepted | Cross-system consistency follows ADR-0006: Task-scoped durable event ordering across Runs, Tool Call vs Tool Attempt event separation, canonical PreparedModelRequest/ContextPackage ownership, exposure-not-permission agent allowlists, immutable revision + scoped activation separation, TrainingJob projection semantics, and append-only Model Promotion Records. |
 
 ## Implementation choices still open
 
@@ -52,7 +58,8 @@ These are intentionally left to current implementation evidence. Selecting one d
 - sandbox backend/fallback mechanism when Phase 3 requires it;
 - exact MCP SDK/version support matrix compatible with the frozen protocol-profile boundary;
 - extension package distribution/integrity mechanism when Phase 5 begins;
-- telemetry mechanism only if/when an explicit opt-in policy is accepted.
+- telemetry mechanism only if/when an explicit opt-in policy is accepted;
+- exact Model Lab backend adapter mix, environment manager and hardware-specific launch mechanism within ADR-0005.
 
 Record an ADR when the choice is consequential, hard to reverse, compatibility-sensitive, or changes a cross-cutting contract. Routine reversible library selection within the frozen boundaries does not require an ADR.
 
